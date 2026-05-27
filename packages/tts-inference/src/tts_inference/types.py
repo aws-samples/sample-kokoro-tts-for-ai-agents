@@ -14,6 +14,7 @@ class TTSModelName(StrEnum):
     KOKORO_82M = "kokoro-82m"
     MAYA_VEENA = "maya-veena"
     CHATTERBOX_TURBO = "chatterbox-turbo"
+    ORPHEUS_3B = "orpheus-3b"
 
 
 class ExecutionMode(StrEnum):

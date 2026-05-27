@@ -46,11 +46,7 @@ outputs/
 .mypy_cache/
 
 # Audio data (binary, downloaded locally)
-data/audio/*.wav
-data/audio/*.mp3
-data/audio/*.flac
-data/audio/*.ogg
-data/audio/*.m4a
+data/audio/**
 
 # IDE files
 .vscode/

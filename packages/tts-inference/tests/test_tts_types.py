@@ -15,11 +15,13 @@ class TestTTSModelName:
         assert TTSModelName.KOKORO_82M == "kokoro-82m"
         assert TTSModelName.MAYA_VEENA == "maya-veena"
         assert TTSModelName.CHATTERBOX_TURBO == "chatterbox-turbo"
+        assert TTSModelName.ORPHEUS_3B == "orpheus-3b"
 
     def test_from_string(self) -> None:
         assert TTSModelName("kokoro-82m") == TTSModelName.KOKORO_82M
         assert TTSModelName("maya-veena") == TTSModelName.MAYA_VEENA
         assert TTSModelName("chatterbox-turbo") == TTSModelName.CHATTERBOX_TURBO
+        assert TTSModelName("orpheus-3b") == TTSModelName.ORPHEUS_3B
 
 
 class TestExecutionMode:

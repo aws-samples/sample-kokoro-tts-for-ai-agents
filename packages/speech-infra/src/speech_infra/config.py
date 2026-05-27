@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from pydantic import BaseModel, ConfigDict
 
 
-@dataclass(frozen=True)
-class ModelEndpointConfig:
-    """Configuration for a SageMaker model endpoint."""
+class ModelEndpointConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
 
     model_name: str
     hf_model_id: str
@@ -46,5 +45,10 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         model_name="chatterbox-turbo",
         hf_model_id="ResembleAI/chatterbox-turbo",
         instance_type="ml.g4dn.xlarge",
+    ),
+    "orpheus-3b": ModelEndpointConfig(
+        model_name="orpheus-3b",
+        hf_model_id="canopylabs/orpheus-3b-0.1-ft",
+        instance_type="ml.g5.xlarge",
     ),
 }
