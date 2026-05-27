@@ -1,0 +1,186 @@
+{
+  "version": "1.0.0",
+  "description": "Sample texts for TTS model evaluation and benchmarking",
+  "samples": [
+    {
+      "id": "short-conversational-01",
+      "text": "Hey, are you coming to the party tonight, or should I just go without you?",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": ["question"],
+      "expected_duration_range_seconds": [2.0, 4.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "short-conversational-02",
+      "text": "Oh my goodness, I can't believe they actually won the championship!",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": ["exclamation"],
+      "expected_duration_range_seconds": [2.0, 4.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "short-conversational-03",
+      "text": "Wait, so you're telling me the flight got cancelled and nobody called us?",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": ["question", "exclamation"],
+      "expected_duration_range_seconds": [2.5, 4.5],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "short-formal-01",
+      "text": "Ladies and gentlemen, please welcome the Honorable Justice Margaret Whitfield.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["proper_nouns"],
+      "expected_duration_range_seconds": [3.0, 5.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "short-technical-01",
+      "text": "The API returns a 403 error when the OAuth2 token expires after 24 hours.",
+      "category": "short",
+      "style": "technical",
+      "linguistic_features": ["abbreviations", "acronyms", "numbers"],
+      "expected_duration_range_seconds": [2.5, 4.5],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "medium-narrative-01",
+      "text": "Dr. Elizabeth Harrington stood at the edge of the cliff, gazing out over the churning Atlantic. The lighthouse behind her had guided ships since 1847, but tonight its beam felt inadequate against the gathering storm.",
+      "category": "medium",
+      "style": "narrative",
+      "linguistic_features": ["proper_nouns", "numbers", "mixed_punctuation"],
+      "expected_duration_range_seconds": [8.0, 14.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "medium-narrative-02",
+      "text": "\"You can't be serious,\" Thomas whispered, stepping back from the door. The hallway stretched endlessly before him, each flickering bulb casting shadows that seemed to reach toward his ankles.",
+      "category": "medium",
+      "style": "narrative",
+      "linguistic_features": ["dialogue", "exclamation", "mixed_punctuation"],
+      "expected_duration_range_seconds": [7.0, 13.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "medium-technical-01",
+      "text": "The GPU cluster processes approximately 2.4 million tokens per second, achieving 97.3% utilization across all 8 NVIDIA A100 nodes. Memory bandwidth peaks at 3.2 terabytes per second during the forward pass.",
+      "category": "medium",
+      "style": "technical",
+      "linguistic_features": ["technical_terms", "numbers", "acronyms"],
+      "expected_duration_range_seconds": [9.0, 15.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "medium-technical-02",
+      "text": "Configure the DNS records by adding a CNAME entry pointing to the AWS CloudFront distribution. The TTL should be set to 300 seconds, and ensure HTTPS is enforced via the ACM certificate in us-east-1.",
+      "category": "medium",
+      "style": "technical",
+      "linguistic_features": ["acronyms", "abbreviations", "numbers"],
+      "expected_duration_range_seconds": [9.0, 15.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "medium-formal-01",
+      "text": "On behalf of the Board of Directors, I am pleased to announce that Mr. James Chen has been appointed as Chief Executive Officer, effective January 15th, 2025. His compensation package totals $4.2 million annually.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": ["dates", "numbers", "proper_nouns", "abbreviations"],
+      "expected_duration_range_seconds": [9.0, 15.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "medium-instructional-01",
+      "text": "First, preheat your oven to 375 degrees Fahrenheit. While it heats, combine 2 cups of flour, 1 and a half teaspoons of baking powder, and a quarter teaspoon of salt in a large mixing bowl.",
+      "category": "medium",
+      "style": "instructional",
+      "linguistic_features": ["numbers", "mixed_punctuation"],
+      "expected_duration_range_seconds": [8.0, 14.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "long-narrative-01",
+      "text": "The village of Ashworth had not seen rain in forty-seven days. Mrs. Pemberton, the postmistress, kept a tally on the chalkboard behind her counter, each mark a small act of defiance against the relentless sun. \"Forty-seven,\" she muttered to herself that Tuesday morning, adding another careful line. The bell above the door chimed, and young Oliver Blackwood stepped inside, his boots raising tiny clouds of dust on the wooden floor. \"Any letters for Grandpa?\" he asked, his voice carrying the careful politeness his mother had drilled into him.",
+      "category": "long",
+      "style": "narrative",
+      "linguistic_features": ["mixed_punctuation", "proper_nouns", "dialogue", "numbers"],
+      "expected_duration_range_seconds": [22.0, 35.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "long-technical-01",
+      "text": "The microservices architecture consists of 14 independent services communicating via gRPC and Apache Kafka. The authentication service handles approximately 12,000 requests per minute during peak hours, with a P99 latency of 23 milliseconds. Database sharding is implemented across 6 PostgreSQL instances, each managing roughly 500 gigabytes of data. The CI/CD pipeline runs 847 unit tests and 132 integration tests before deploying to the staging environment on AWS EKS.",
+      "category": "long",
+      "style": "technical",
+      "linguistic_features": ["technical_terms", "numbers", "acronyms", "abbreviations"],
+      "expected_duration_range_seconds": [20.0, 32.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "long-formal-01",
+      "text": "Distinguished members of the International Conference on Sustainable Development, it is my honor to address you today from Geneva, Switzerland. Since our last gathering in Nairobi on September 12th, 2024, significant progress has been made across all seventeen Sustainable Development Goals. The collaborative efforts between the European Union, the African Union, and the Association of Southeast Asian Nations have resulted in a 14% reduction in carbon emissions across participating nations.",
+      "category": "long",
+      "style": "formal",
+      "linguistic_features": ["proper_nouns", "dates", "numbers", "foreign_words"],
+      "expected_duration_range_seconds": [22.0, 35.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "long-instructional-01",
+      "text": "To configure multi-factor authentication for your organization, navigate to Settings, then Security, and select the MFA tab. You will need to choose between SMS verification, which sends a 6-digit code to the user's registered phone number, or an authenticator app such as Google Authenticator or Microsoft Authenticator. Note that SMS-based MFA is being deprecated as of March 2026 due to known vulnerabilities in the SS7 protocol.",
+      "category": "long",
+      "style": "instructional",
+      "linguistic_features": ["numbers", "abbreviations", "technical_terms", "dates"],
+      "expected_duration_range_seconds": [20.0, 32.0],
+      "language": "en",
+      "notes": null
+    },
+    {
+      "id": "special-numbers-01",
+      "text": "The meeting is scheduled for March 3rd, 2025 at 2:30 PM. There will be 14 attendees, the room capacity is 20, and the catering budget is $1,250.00 per person.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["numbers", "dates", "mixed_punctuation"],
+      "expected_duration_range_seconds": [5.0, 9.0],
+      "language": "en",
+      "notes": "Tests handling of dates, times, currency, and numerical quantities"
+    },
+    {
+      "id": "special-abbreviations-01",
+      "text": "Dr. Smith from the U.S. Department of Health and Human Services met with Prof. Nakamura, who holds a Ph.D. in molecular biology from MIT, to discuss the WHO's latest guidelines on mRNA vaccine efficacy.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": ["abbreviations", "acronyms", "proper_nouns"],
+      "expected_duration_range_seconds": [9.0, 15.0],
+      "language": "en",
+      "notes": "Tests pronunciation of abbreviations, honorifics, and acronyms"
+    },
+    {
+      "id": "special-phonetic-01",
+      "text": "The Worcestershire sauce sat next to Colonel Beauchamp's quinoa salad at the Taoiseach's soiree in Reykjavik, where Mr. Featherstonehaugh discussed the Edinburgh festival with Siobhan.",
+      "category": "medium",
+      "style": "narrative",
+      "linguistic_features": ["phonetically_tricky", "proper_nouns", "foreign_words"],
+      "expected_duration_range_seconds": [8.0, 14.0],
+      "language": "en",
+      "notes": "Tests pronunciation of notoriously difficult English and foreign proper nouns"
+    }
+  ]
+}

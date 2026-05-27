@@ -1,0 +1,23 @@
+[project]
+name = "tts-eval"
+version = "0.1.0"
+description = "Quality evaluation for TTS models — PESQ, STOI, speaker similarity"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1.0",
+    "pydantic>=2.5.0",
+    "tts-inference",
+    "loguru>=0.7.0",
+    "numpy>=1.26.0",
+    "scipy>=1.12.0",
+]
+
+[tool.uv.sources]
+tts-inference = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tts_eval"]

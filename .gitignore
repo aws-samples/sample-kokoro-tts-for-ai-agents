@@ -1,0 +1,71 @@
+# Claude Code
+.claude/
+
+# Credentials and secrets
+Credentials
+*.env
+.env*
+awscred.sh
+
+# General logs
+*.log
+logs/
+nohup.out
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+.temp/
+
+# CDK output
+cdk.out/
+
+# Node modules
+node_modules/
+
+# Virtual environments
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Generated caches and outputs
+data/cache/
+data/results/
+outputs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Audio data (binary, downloaded locally)
+data/audio/*.wav
+data/audio/*.mp3
+data/audio/*.flac
+data/audio/*.ogg
+data/audio/*.m4a
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Scratch
+scratch/*
+
+# Model weights (download on demand)
+*.bin
+*.safetensors
+*.onnx
+*.pt
+
+# UV lock files for model packages (isolated, not workspace)
+packages/models/*/uv.lock
