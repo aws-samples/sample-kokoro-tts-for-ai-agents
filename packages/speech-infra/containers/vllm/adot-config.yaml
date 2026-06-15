@@ -1,0 +1,41 @@
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: vllm
+          scrape_interval: 30s
+          static_configs:
+            - targets: ['localhost:8000']
+
+processors:
+  resource:
+    attributes:
+      - key: EndpointName
+        value: ${env:ENDPOINT_NAME}
+        action: upsert
+      - key: ModelName
+        value: ${env:MODEL_NAME}
+        action: upsert
+
+exporters:
+  awsemf:
+    namespace: Speech/vLLM
+    log_group_name: /speech/vllm-metrics
+    dimension_rollup_option: NoDimensionRollup
+    metric_declarations:
+      - dimensions: [[EndpointName, ModelName]]
+        metric_name_selectors:
+          - "^vllm:num_requests_running$"
+          - "^vllm:num_requests_waiting$"
+          - "^vllm:gpu_cache_usage_perc$"
+          - "^vllm:e2e_request_latency_seconds_sum$"
+          - "^vllm:e2e_request_latency_seconds_count$"
+          - "^vllm:time_to_first_token_seconds_sum$"
+          - "^vllm:time_to_first_token_seconds_count$"
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [resource]
+      exporters: [awsemf]

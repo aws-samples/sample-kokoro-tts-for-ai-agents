@@ -37,9 +37,7 @@ class OrpheusHandler:
 
         request_id = f"req-{uuid.uuid4().hex[:8]}"
         audio_chunks: list[bytes] = []
-        for chunk in model.generate_speech(
-            prompt=text, voice=voice, request_id=request_id
-        ):
+        for chunk in model.generate_speech(prompt=text, voice=voice, request_id=request_id):
             audio_chunks.append(chunk)
 
         if not audio_chunks:

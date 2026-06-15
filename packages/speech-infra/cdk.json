@@ -1,0 +1,6 @@
+{
+  "app": "python -m speech_infra.app",
+  "context": {
+    "@aws-cdk/core:stackRelativeExports": true
+  }
+}

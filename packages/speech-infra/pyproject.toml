@@ -8,7 +8,11 @@ dependencies = [
     "aws-cdk-lib>=2.100.0",
     "constructs>=10.0.0",
     "loguru>=0.7.0",
+    "click>=8.1.0",
 ]
+
+[project.scripts]
+speech-infra = "speech_infra.cli:cli"
 
 [build-system]
 requires = ["hatchling"]
