@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from tts_eval.runner import EvalResult
@@ -45,7 +45,7 @@ def _build_report_data(
     human_scores: dict | None = None,
 ) -> dict:
     """Build structured report data."""
-    models = sorted(set(r.model for r in results))
+    models = sorted({r.model for r in results})
 
     per_model: dict[str, dict] = {}
     for model in models:
@@ -78,7 +78,7 @@ def _build_report_data(
         }
 
     report = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "models": models,
         "summary": per_model,
     }
@@ -111,7 +111,9 @@ def _render_markdown(data: dict) -> str:
         wer_val = f"{s['wer']['mean']:.3f}" if s["wer"]["mean"] else "N/A"
         lines.append(f"| {model} | {utmos} | {wer_val} | {s['successful']}/{s['total_samples']} |")
 
-    lines.extend(["", "## Latency", "", "| Model | Mean Latency (ms) |", "|-------|-------------------|"])
+    lines.extend(
+        ["", "## Latency", "", "| Model | Mean Latency (ms) |", "|-------|-------------------|"]
+    )
     for model in data["models"]:
         s = data["summary"][model]
         lat = f"{s['latency_ms']['mean']:.0f}" if s["latency_ms"]["mean"] else "N/A"
@@ -122,12 +124,30 @@ def _render_markdown(data: dict) -> str:
         bench = data["benchmarks"]
 
         if "cost" in bench:
-            lines.extend(["### Cost per Million Characters", "", "| Model | $/M chars | Throughput (chars/min) | Instance |", "|-------|-----------|-----------------------|----------|"])
+            lines.extend(
+                [
+                    "### Cost per Million Characters",
+                    "",
+                    "| Model | $/M chars | Throughput (chars/min) | Instance |",
+                    "|-------|-----------|-----------------------|----------|",
+                ]
+            )
             for entry in bench["cost"]:
-                lines.append(f"| {entry['model']} | ${entry['cost_per_m_chars']:.2f} | {entry['chars_per_min']:.0f} | {entry['instance_type']} |")
+                cost = entry["cost_per_m_chars"]
+                cpm = entry["chars_per_min"]
+                inst = entry["instance_type"]
+                lines.append(f"| {entry['model']} | ${cost:.2f} | {cpm:.0f} | {inst} |")
 
         if "scalability" in bench:
-            lines.extend(["", "### Scalability", "", "| Model | Concurrency | Success Rate | P50 (ms) | P99 (ms) |", "|-------|-------------|--------------|----------|----------|"])
+            lines.extend(
+                [
+                    "",
+                    "### Scalability",
+                    "",
+                    "| Model | Concurrency | Success Rate | P50 (ms) | P99 (ms) |",
+                    "|-------|-------------|--------------|----------|----------|",
+                ]
+            )
             for entry in bench["scalability"]:
                 lines.append(
                     f"| {entry['model']} | {entry['concurrency']} | "
@@ -136,22 +156,47 @@ def _render_markdown(data: dict) -> str:
                 )
 
     if "human_panel" in data:
-        lines.extend(["", "## Human Panel Scores", "", "| Model | Naturalness | Clarity | Pacing | Consistency | Overall |", "|-------|-------------|---------|--------|-------------|---------|"])
+        lines.extend(
+            [
+                "",
+                "## Human Panel Scores",
+                "",
+                "| Model | Naturalness | Clarity | Pacing | Consistency | Overall |",
+                "|-------|-------------|---------|--------|-------------|---------|",
+            ]
+        )
         hp = data["human_panel"].get("model_scores", {})
         for model, scores in hp.items():
-            nat = f"{scores['naturalness']['mean']:.1f}" if scores.get("naturalness", {}).get("mean") else "N/A"
-            cla = f"{scores['clarity']['mean']:.1f}" if scores.get("clarity", {}).get("mean") else "N/A"
-            pac = f"{scores['pacing']['mean']:.1f}" if scores.get("pacing", {}).get("mean") else "N/A"
-            con = f"{scores['consistency']['mean']:.1f}" if scores.get("consistency", {}).get("mean") else "N/A"
-            ovr = f"{scores['overall']['mean']:.1f}" if scores.get("overall", {}).get("mean") else "N/A"
+            nat = (
+                f"{scores['naturalness']['mean']:.1f}"
+                if scores.get("naturalness", {}).get("mean")
+                else "N/A"
+            )
+            cla = (
+                f"{scores['clarity']['mean']:.1f}"
+                if scores.get("clarity", {}).get("mean")
+                else "N/A"
+            )
+            pac = (
+                f"{scores['pacing']['mean']:.1f}" if scores.get("pacing", {}).get("mean") else "N/A"
+            )
+            con = (
+                f"{scores['consistency']['mean']:.1f}"
+                if scores.get("consistency", {}).get("mean")
+                else "N/A"
+            )
+            ovr = (
+                f"{scores['overall']['mean']:.1f}"
+                if scores.get("overall", {}).get("mean")
+                else "N/A"
+            )
             lines.append(f"| {model} | {nat} | {cla} | {pac} | {con} | {ovr} |")
 
-    lines.extend(["", "---", f"*Report generated by tts-eval*", ""])
+    lines.extend(["", "---", "*Report generated by tts-eval*", ""])
     return "\n".join(lines)
 
 
-def _mean(values: list[float | None]) -> float | None:
-    filtered = [v for v in values if v is not None]
-    if not filtered:
+def _mean(values: list[float]) -> float | None:
+    if not values:
         return None
-    return round(sum(filtered) / len(filtered), 4)
+    return round(sum(values) / len(values), 4)

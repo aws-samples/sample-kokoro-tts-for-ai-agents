@@ -32,11 +32,11 @@ def wav_duration(data: bytes) -> float:
     """Calculate WAV audio duration from RIFF header."""
     if len(data) < 44 or data[:4] != b"RIFF":
         return 0.0
-    sr = struct.unpack_from("<I", data, 24)[0]
-    bits = struct.unpack_from("<H", data, 34)[0]
-    channels = struct.unpack_from("<H", data, 22)[0]
+    sr: int = struct.unpack_from("<I", data, 24)[0]
+    bits: int = struct.unpack_from("<H", data, 34)[0]
+    channels: int = struct.unpack_from("<H", data, 22)[0]
     data_size = len(data) - 44
-    return data_size / (sr * channels * (bits // 8))
+    return float(data_size / (sr * channels * (bits // 8)))
 
 
 class SynthesisClient:
@@ -77,16 +77,16 @@ class SynthesisClient:
         duration = wav_duration(audio_bytes)
 
         if not audio_bytes or audio_bytes[:4] != b"RIFF":
-            logger.warning(
-                "Invalid WAV response from {} ({}B)", endpoint, len(audio_bytes)
-            )
+            logger.warning("Invalid WAV response from {} ({}B)", endpoint, len(audio_bytes))
 
         return {
             "audio_bytes": audio_bytes,
             "duration_s": duration,
             "latency_ms": latency_ms,
             "chars": len(text),
-            "sample_rate": struct.unpack_from("<I", audio_bytes, 24)[0] if len(audio_bytes) >= 28 else 24000,
+            "sample_rate": struct.unpack_from("<I", audio_bytes, 24)[0]
+            if len(audio_bytes) >= 28
+            else 24000,
             "voice": voice,
             "model": model,
         }

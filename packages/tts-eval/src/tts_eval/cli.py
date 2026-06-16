@@ -38,6 +38,8 @@ def main() -> None:
 )
 @click.option("--max-samples", default=None, type=int, help="Limit number of samples")
 @click.option("--skip-wer", is_flag=True, help="Skip WER scoring (faster)")
+@click.option("--skip-bench", is_flag=True, help="Skip cost/scalability benchmarks")
+@click.option("--concurrency", default="10,50,100", help="Scalability concurrency levels")
 @click.option("--region", default="us-east-1")
 def run(
     models: str,
@@ -45,9 +47,11 @@ def run(
     output_dir: str | None,
     max_samples: int | None,
     skip_wer: bool,
+    skip_bench: bool,
+    concurrency: str,
     region: str,
 ) -> None:
-    """Run automated evaluation (UTMOS + WER) across models."""
+    """Run full evaluation (quality + benchmarks) across models."""
     from shared.loader import get_data_dir, load_tts_samples
     from tts_eval.report import generate_report
     from tts_eval.runner import EvalRunner
@@ -70,9 +74,7 @@ def run(
     else:
         out = Path(output_dir)
 
-    logger.info(
-        "Starting evaluation: {} models x {} samples", len(model_list), len(sample_list)
-    )
+    logger.info("Starting evaluation: {} models x {} samples", len(model_list), len(sample_list))
 
     runner = EvalRunner(
         models=model_list,
@@ -83,11 +85,56 @@ def run(
     )
     results = runner.run()
 
-    json_path, md_path = generate_report(results, out)
+    bench_results = None
+    if not skip_bench:
+        bench_results = _run_benchmarks(
+            model_list, [s.text for s in sample_list], concurrency, region
+        )
+
+    json_path, md_path = generate_report(results, out, bench_results=bench_results)
     logger.info("Results written to {}", out)
     click.echo(f"\nReport: {md_path}")
     click.echo(f"Data:   {json_path}")
     click.echo(f"Audio:  {out / 'samples'}/")
+
+
+def _run_benchmarks(
+    model_list: list[str],
+    texts: list[str],
+    concurrency: str,
+    region: str,
+) -> dict:
+    """Run cost and scalability benchmarks for all models."""
+    from tts_bench.cost import calculate_cost
+    from tts_bench.scalability import measure_scalability
+
+    levels = [int(c.strip()) for c in concurrency.split(",")]
+    bench_text = texts[0] if texts else "The birch canoe slid on the smooth planks."
+
+    cost_results = []
+    scalability_results = []
+
+    for model in model_list:
+        logger.info("Running cost benchmark for {}", model)
+        try:
+            cost = calculate_cost(model, texts[:20], region=region)
+            cost_results.append(cost)
+        except Exception as e:
+            logger.warning("Cost benchmark failed for {}: {}", model, e)
+
+        logger.info("Running scalability benchmark for {}", model)
+        try:
+            scale = measure_scalability(model, bench_text, levels, region=region)
+            scalability_results.extend(scale)
+        except Exception as e:
+            logger.warning("Scalability benchmark failed for {}: {}", model, e)
+
+    bench: dict = {}
+    if cost_results:
+        bench["cost"] = cost_results
+    if scalability_results:
+        bench["scalability"] = scalability_results
+    return bench
 
 
 @main.group("human-panel")

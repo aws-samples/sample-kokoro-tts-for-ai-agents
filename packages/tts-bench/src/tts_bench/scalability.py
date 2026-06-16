@@ -55,7 +55,7 @@ def _run_concurrent(
     def _invoke() -> float | None:
         try:
             result = client.synthesize(model, text)
-            return result["latency_ms"]
+            return float(result["latency_ms"])
         except Exception:
             return None
 

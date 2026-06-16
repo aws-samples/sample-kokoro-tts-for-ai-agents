@@ -62,5 +62,5 @@ class TestEndpointMap:
             assert model in ENDPOINT_MAP, f"Missing endpoint for {model.value}"
 
     def test_endpoint_names_follow_convention(self) -> None:
-        for model, endpoint in ENDPOINT_MAP.items():
+        for _model, endpoint in ENDPOINT_MAP.items():
             assert endpoint.startswith("speech-"), f"{endpoint} should start with 'speech-'"

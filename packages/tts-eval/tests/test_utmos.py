@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import struct
 
 import numpy as np
 import soundfile as sf
@@ -55,7 +54,7 @@ class TestUTMOSScorer:
         audio = 0.3 * np.sin(2 * np.pi * 300 * t)
 
         paths = []
-        for i in range(2):
+        for _ in range(2):
             p = Path(tempfile.mktemp(suffix=".wav"))
             sf.write(str(p), audio, 16000, format="WAV", subtype="PCM_16")
             paths.append(p)

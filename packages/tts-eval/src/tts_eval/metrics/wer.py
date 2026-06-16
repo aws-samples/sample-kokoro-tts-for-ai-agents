@@ -6,7 +6,6 @@ Measures intelligibility: how accurately the synthesized speech can be understoo
 
 from __future__ import annotations
 
-import io
 import json
 import time
 import uuid
@@ -102,7 +101,7 @@ class WERScorer:
                 with urllib.request.urlopen(uri) as response:
                     result = json.loads(response.read().decode())
                 transcripts = result["results"]["transcripts"]
-                return transcripts[0]["transcript"] if transcripts else ""
+                return str(transcripts[0]["transcript"]) if transcripts else ""
 
             if status == "FAILED":
                 reason = resp["TranscriptionJob"].get("FailureReason", "Unknown")

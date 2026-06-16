@@ -14,8 +14,6 @@ from pathlib import Path
 
 from loguru import logger
 
-from tts_inference.types import TTSModelName
-
 
 def generate_listening_test(
     samples_dir: Path,
@@ -70,11 +68,13 @@ def generate_listening_test(
             label = model_labels[model]
             dest_name = f"{sample_id}_model-{label}.wav"
             shutil.copy2(src, audio_dir / dest_name)
-            items.append({
-                "sample_id": sample_id,
-                "model_label": label,
-                "filename": dest_name,
-            })
+            items.append(
+                {
+                    "sample_id": sample_id,
+                    "model_label": label,
+                    "filename": dest_name,
+                }
+            )
 
     rng.shuffle(items)
 
@@ -95,29 +95,33 @@ def _write_scoresheet(test_dir: Path, items: list[dict]) -> None:
     scoresheet = test_dir / "scoresheet.csv"
     with scoresheet.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "filename",
-            "sample_id",
-            "model_label",
-            "naturalness_1_5",
-            "clarity_1_5",
-            "pacing_1_5",
-            "consistency_1_5",
-            "overall_1_5",
-            "notes",
-        ])
+        writer.writerow(
+            [
+                "filename",
+                "sample_id",
+                "model_label",
+                "naturalness_1_5",
+                "clarity_1_5",
+                "pacing_1_5",
+                "consistency_1_5",
+                "overall_1_5",
+                "notes",
+            ]
+        )
         for item in items:
-            writer.writerow([
-                item["filename"],
-                item["sample_id"],
-                item["model_label"],
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-            ])
+            writer.writerow(
+                [
+                    item["filename"],
+                    item["sample_id"],
+                    item["model_label"],
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]
+            )
 
 
 def _write_mapping(test_dir: Path, model_labels: dict[str, str]) -> None:
@@ -125,7 +129,10 @@ def _write_mapping(test_dir: Path, model_labels: dict[str, str]) -> None:
     mapping = test_dir / "mapping.json"
     mapping.write_text(
         json.dumps(
-            {"model_labels": model_labels, "label_to_model": {v: k for k, v in model_labels.items()}},
+            {
+                "model_labels": model_labels,
+                "label_to_model": {v: k for k, v in model_labels.items()},
+            },
             indent=2,
         )
     )
@@ -164,7 +171,7 @@ def ingest_scores(
                 if val:
                     model_scores[model][dim].append(float(val))
 
-    results = {}
+    results: dict[str, dict] = {}
     for model, scores in model_scores.items():
         results[model] = {}
         for dim, values in scores.items():

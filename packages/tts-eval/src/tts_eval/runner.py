@@ -5,7 +5,6 @@ For each model x sample: synthesize -> score UTMOS -> score WER -> collect resul
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 from loguru import logger
@@ -143,8 +142,8 @@ class EvalRunner:
                     audio_bytes=synthesis["audio_bytes"],
                     sample_rate=synthesis["sample_rate"],
                 )
-                wer_score = wer_result["wer"]
-                transcript = wer_result["transcript"]
+                wer_score = float(wer_result["wer"])
+                transcript = str(wer_result["transcript"])
             except Exception as e:
                 logger.warning("WER scoring failed for {}/{}: {}", model.value, sample.id, e)
 
