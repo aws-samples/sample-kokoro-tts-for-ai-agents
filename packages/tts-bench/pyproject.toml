@@ -1,17 +1,26 @@
 [project]
 name = "tts-bench"
 version = "0.1.0"
-description = "Performance benchmarking for TTS models — throughput, latency, RTF"
+description = "Performance benchmarking for TTS models — latency, scalability, cost"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.1.0",
     "pydantic>=2.5.0",
     "tts-inference",
+    "tts-eval",
+    "shared",
     "loguru>=0.7.0",
+    "numpy>=1.26.0",
+    "boto3>=1.34.0",
 ]
+
+[project.scripts]
+tts-bench = "tts_bench.cli:main"
 
 [tool.uv.sources]
 tts-inference = { workspace = true }
+tts-eval = { workspace = true }
+shared = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

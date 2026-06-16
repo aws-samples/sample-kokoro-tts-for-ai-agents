@@ -1,0 +1,806 @@
+{
+  "version": "1.0.0",
+  "description": "Harvard sentences - phonetically balanced sentences for TTS intelligibility evaluation",
+  "samples": [
+    {
+      "id": "harvard-001",
+      "text": "The birch canoe slid on the smooth planks.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-002",
+      "text": "Glue the sheet to the dark blue background.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-003",
+      "text": "It's easy to tell the depth of a well.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-004",
+      "text": "These days a chicken leg is a rare dish.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-005",
+      "text": "Rice is often served in round bowls.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-006",
+      "text": "The juice of lemons makes fine punch.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-007",
+      "text": "The box was thrown beside the parked truck.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-008",
+      "text": "The hogs were fed chopped corn and garbage.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-009",
+      "text": "Four hours of steady work faced us.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["numbers"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-010",
+      "text": "A large size in stockings is hard to sell.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-011",
+      "text": "The boy was there when the sun rose.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-012",
+      "text": "A rod is used to catch pink salmon.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-013",
+      "text": "The source of the huge river is the clear spring.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-014",
+      "text": "Kick the ball straight and follow through.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-015",
+      "text": "Help the woman get back to her feet.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-016",
+      "text": "A pot of tea helps to pass the evening.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-017",
+      "text": "Smoky fires lack flame and heat.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-018",
+      "text": "The soft cushion broke the man's fall.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-019",
+      "text": "The salt breeze came across from the sea.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-020",
+      "text": "The girl at the booth sold fifty bonds.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": ["numbers"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-021",
+      "text": "The small pup gnawed a hole in the sock.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-022",
+      "text": "The fish twisted and turned on the bent hook.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-023",
+      "text": "Press the pants and sew a button on the vest.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-024",
+      "text": "The swan dived into the lake of crystal water.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-025",
+      "text": "The beauty of the view stunned the young boy.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-026",
+      "text": "Two blue fish swam in the tank.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["numbers"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-027",
+      "text": "Her purse was full of useless trash.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-028",
+      "text": "The colt reared and threw the tall rider.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-029",
+      "text": "It snowed, rained, and hailed the same morning.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-030",
+      "text": "Read verse out loud for pleasure.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-031",
+      "text": "Hoist the load to your left shoulder.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-032",
+      "text": "Take the winding path to reach the lake.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-033",
+      "text": "Note closely the size of the gas tank.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-034",
+      "text": "Wipe the grease off his dirty face.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-035",
+      "text": "Mend the coat before you go out.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-036",
+      "text": "The wrist was badly strained and hung limp.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-037",
+      "text": "The stray cat gave birth to kittens.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-038",
+      "text": "The young girl gave no clear response.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-039",
+      "text": "The meal was cooked before the bell rang.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-040",
+      "text": "What joy there is in living.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["exclamation"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-041",
+      "text": "A king ruled the state in the early days.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-042",
+      "text": "The ship was torn apart on the sharp reef.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-043",
+      "text": "Sickness kept him home the third week.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["numbers"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-044",
+      "text": "The wide road shimmered in the hot sun.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-045",
+      "text": "The lazy man sat in the sun and slept.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-046",
+      "text": "Mesh wire keeps chicks inside.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-047",
+      "text": "The frosty air passed through the coat.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-048",
+      "text": "The crooked maze failed to fool the mouse.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-049",
+      "text": "Adding fast leads to wrong sums.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-050",
+      "text": "The show was a flop from the very start.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-051",
+      "text": "A saw is a tool used for making boards.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-052",
+      "text": "The wagon moved on well oiled wheels.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-053",
+      "text": "March the soldiers past the tent.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-054",
+      "text": "A cup of sugar makes sweet fudge.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-055",
+      "text": "Place a rosebush near the porch steps.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-056",
+      "text": "Both lost their lives in the raging storm.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-057",
+      "text": "We talked of the side show in the circus.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-058",
+      "text": "Use a pencil to write the first draft.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-059",
+      "text": "He ran half way to the hardware store.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-060",
+      "text": "The clock struck to mark the third period.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": ["numbers"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-061",
+      "text": "A hot cup of tea is a fine pick-me-up.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["mixed_punctuation"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-062",
+      "text": "The damp air makes the cold feel worse.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-063",
+      "text": "An icy blast swept over the frozen field.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-064",
+      "text": "Drop the ashes on the worn old rug.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-065",
+      "text": "The child crawled into the dense grass.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-066",
+      "text": "Lift the square stone over the fence.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-067",
+      "text": "The rope will bind the seven books at once.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": ["numbers"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-068",
+      "text": "Hop over the fence and plunge in.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-069",
+      "text": "The friendly gang left the drug store.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-070",
+      "text": "Mesh mends the break in the wall.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["phonetically_tricky"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-071",
+      "text": "The plan was to build a raft to cross the river.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-072",
+      "text": "The raft slid over the smooth planks.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-073",
+      "text": "We find joy in the simplest things.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-074",
+      "text": "The bark of the pine filled the air with fragrance.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-075",
+      "text": "Leaves turn brown and yellow in the fall.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-076",
+      "text": "The pennant waved when the wind blew.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["phonetically_tricky"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-077",
+      "text": "Split the log with a quick firm stroke.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-078",
+      "text": "Burn peat after the logs give out.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-079",
+      "text": "He ordered peach pie with ice cream.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-080",
+      "text": "Weave the carpet on the right hand side.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-081",
+      "text": "Hemp is a weed found in parts of the tropics.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-082",
+      "text": "A lame back kept his score low.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-083",
+      "text": "We admire and love a good cook.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-084",
+      "text": "Her purse was full of coins and seldom used bills.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-085",
+      "text": "Dig a hole three feet deep and plant the tree.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": ["numbers"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-086",
+      "text": "The cork drifted along with the slow current.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-087",
+      "text": "Get the trust fund to pay the bill.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-088",
+      "text": "A thick coat of black paint covered all.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-089",
+      "text": "Move the vat over the hot fire.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-090",
+      "text": "The plant grew large and green in the window.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-091",
+      "text": "The dusty bench stood by the stone wall.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-092",
+      "text": "The man went to the woods and gathered sticks.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-093",
+      "text": "The hard crust on the bread was dark.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-094",
+      "text": "Hedge the path to the old cider press.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": ["phonetically_tricky"],
+      "language": "en"
+    },
+    {
+      "id": "harvard-095",
+      "text": "The shelf was full of gold and silver coins.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-096",
+      "text": "The night shift hours were long and boring.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-097",
+      "text": "She danced with a grace that held the crowd breathless.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-098",
+      "text": "The tin box held priceless stones and seldom worn rings.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-099",
+      "text": "Dimes showered down from all sides.",
+      "category": "short",
+      "style": "formal",
+      "linguistic_features": [],
+      "language": "en"
+    },
+    {
+      "id": "harvard-100",
+      "text": "The pearl was worn in a thin silver ring.",
+      "category": "medium",
+      "style": "formal",
+      "linguistic_features": ["phonetically_tricky"],
+      "language": "en"
+    }
+  ]
+}

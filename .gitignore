@@ -41,6 +41,7 @@ build/
 data/cache/
 data/results/
 outputs/
+results/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
