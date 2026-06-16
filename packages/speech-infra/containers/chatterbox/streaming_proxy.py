@@ -14,6 +14,8 @@ import logging
 import os
 import struct
 import time
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
@@ -201,10 +203,12 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
             pass
 
 
-async def startup():
+@asynccontextmanager
+async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     _logger.info("Preloading model at startup...")
     _get_model()
     _logger.info("Model preloaded and ready for inference")
+    yield
 
 
 app = Starlette(
@@ -213,7 +217,7 @@ app = Starlette(
         Route("/invocations", invocations, methods=["POST"]),
         WebSocketRoute("/invocations-bidirectional-stream", bidirectional_stream),
     ],
-    on_startup=[startup],
+    lifespan=lifespan,
 )
 
 if __name__ == "__main__":
