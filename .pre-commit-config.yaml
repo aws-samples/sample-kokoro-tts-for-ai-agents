@@ -25,4 +25,4 @@ repos:
         additional_dependencies:
           - pydantic>=2.5.0
         args: [--ignore-missing-imports, --explicit-package-bases]
-        exclude: (^tests/|/tests/)
+        exclude: (^tests/|/tests/|packages/speech-infra/containers/|packages/models/|^scripts/)

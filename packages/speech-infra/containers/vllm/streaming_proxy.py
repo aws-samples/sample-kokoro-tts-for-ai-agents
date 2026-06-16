@@ -24,7 +24,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
-
 from tts_orpheus.prompt import STOP_TOKEN_ID, build_prompt, token_ids_to_snac_codes
 from tts_orpheus.snac_decode import SnacDecoder
 
@@ -39,12 +38,8 @@ SAMPLE_RATE = 24000
 
 _logger = logging.getLogger("streaming_proxy")
 
-_NUM_WAITING_RE = re.compile(
-    r"^vllm:num_requests_waiting\{.*?\}\s+(\d+(?:\.\d+)?)", re.MULTILINE
-)
-_NUM_RUNNING_RE = re.compile(
-    r"^vllm:num_requests_running\{.*?\}\s+(\d+(?:\.\d+)?)", re.MULTILINE
-)
+_NUM_WAITING_RE = re.compile(r"^vllm:num_requests_waiting\{.*?\}\s+(\d+(?:\.\d+)?)", re.MULTILINE)
+_NUM_RUNNING_RE = re.compile(r"^vllm:num_requests_running\{.*?\}\s+(\d+(?:\.\d+)?)", re.MULTILINE)
 
 _client = httpx.AsyncClient(base_url=VLLM_BACKEND, timeout=120.0)
 _snac_decoder: SnacDecoder | None = None
@@ -228,14 +223,18 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
 
             if not text:
                 await websocket.send_text(
-                    json.dumps({"type": "error", "request_id": request_id, "message": "text required"})
+                    json.dumps(
+                        {"type": "error", "request_id": request_id, "message": "text required"}
+                    )
                 )
                 continue
 
             should_reject, _ = await _check_backpressure()
             if should_reject:
                 await websocket.send_text(
-                    json.dumps({"type": "error", "request_id": request_id, "message": "queue_saturated"})
+                    json.dumps(
+                        {"type": "error", "request_id": request_id, "message": "queue_saturated"}
+                    )
                 )
                 continue
 
@@ -243,7 +242,9 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
             t0 = time.monotonic()
 
             await websocket.send_text(
-                json.dumps({"type": "synthesis_start", "request_id": request_id, "segments": len(segments)})
+                json.dumps(
+                    {"type": "synthesis_start", "request_id": request_id, "segments": len(segments)}
+                )
             )
 
             decoder = _get_snac_decoder()
@@ -252,13 +253,15 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
 
             for seq, segment_text in enumerate(segments):
                 await websocket.send_text(
-                    json.dumps({
-                        "type": "segment_start",
-                        "request_id": request_id,
-                        "seq": seq,
-                        "offset_ms": round(cumulative_audio_ms),
-                        "text": segment_text,
-                    })
+                    json.dumps(
+                        {
+                            "type": "segment_start",
+                            "request_id": request_id,
+                            "seq": seq,
+                            "offset_ms": round(cumulative_audio_ms),
+                            "text": segment_text,
+                        }
+                    )
                 )
 
                 prompt = build_prompt(segment_text, voice)
@@ -302,24 +305,28 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
                 total_audio_bytes += segment_audio_bytes
 
                 await websocket.send_text(
-                    json.dumps({
-                        "type": "segment_complete",
-                        "request_id": request_id,
-                        "seq": seq,
-                        "duration_ms": round(segment_duration_ms),
-                    })
+                    json.dumps(
+                        {
+                            "type": "segment_complete",
+                            "request_id": request_id,
+                            "seq": seq,
+                            "duration_ms": round(segment_duration_ms),
+                        }
+                    )
                 )
 
             elapsed = time.monotonic() - t0
 
             await websocket.send_text(
-                json.dumps({
-                    "type": "synthesis_complete",
-                    "request_id": request_id,
-                    "total_duration_s": round(cumulative_audio_ms / 1000, 3),
-                    "elapsed_s": round(elapsed, 3),
-                    "segments": len(segments),
-                })
+                json.dumps(
+                    {
+                        "type": "synthesis_complete",
+                        "request_id": request_id,
+                        "total_duration_s": round(cumulative_audio_ms / 1000, 3),
+                        "elapsed_s": round(elapsed, 3),
+                        "segments": len(segments),
+                    }
+                )
             )
 
     except WebSocketDisconnect:

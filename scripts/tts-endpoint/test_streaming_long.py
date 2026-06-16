@@ -115,7 +115,9 @@ def test_sync(client: object, sample: dict) -> dict:
 
     audio_duration = _wav_duration(body)
     print(f"  [{sample['id']}] {len(sample['text'])} chars")
-    print(f"    Latency: {elapsed*1000:.0f}ms | Audio: {audio_duration:.2f}s | RTF: {elapsed/audio_duration:.2f}x")
+    print(
+        f"    Latency: {elapsed*1000:.0f}ms | Audio: {audio_duration:.2f}s | RTF: {elapsed/audio_duration:.2f}x"
+    )
     print(f"    Saved: {out_path}")
 
     return {

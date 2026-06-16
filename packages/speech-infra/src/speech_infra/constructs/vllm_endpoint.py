@@ -46,7 +46,7 @@ class VllmStreamingEndpoint(Construct):
                     variant_name="primary",
                     model_name=self.model.attr_model_name,
                     instance_type=model_config.instance_type,
-                    initial_instance_count=model_config.min_instances,
+                    initial_instance_count=max(model_config.min_instances, 1),
                     container_startup_health_check_timeout_in_seconds=600,
                     routing_config=sagemaker.CfnEndpointConfig.RoutingConfigProperty(
                         routing_strategy="LEAST_OUTSTANDING_REQUESTS",

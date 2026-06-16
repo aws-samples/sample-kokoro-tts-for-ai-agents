@@ -20,7 +20,6 @@ import json
 import struct
 import sys
 import time
-from io import BytesIO
 from pathlib import Path
 
 import boto3
@@ -263,8 +262,10 @@ def print_results(results: list[dict]) -> None:
         return
 
     print("\n" + "=" * 90)
-    print(f"{'Mode':<10} {'Sample':<15} {'Chars':<6} {'1st Chunk':<10} "
-          f"{'Total ms':<10} {'Chunks':<8} {'Audio s':<8} {'RTF':<6}")
+    print(
+        f"{'Mode':<10} {'Sample':<15} {'Chars':<6} {'1st Chunk':<10} "
+        f"{'Total ms':<10} {'Chunks':<8} {'Audio s':<8} {'RTF':<6}"
+    )
     print("-" * 90)
 
     for r in results:
@@ -292,12 +293,8 @@ def print_results(results: list[dict]) -> None:
         mode_results = [r for r in results if r["mode"] == mode]
         if not mode_results:
             continue
-        latencies = [
-            r.get("total_latency_ms") or r.get("latency_ms", 0) for r in mode_results
-        ]
-        first_chunks = [
-            r.get("first_chunk_ms") or r.get("first_audio_ms") for r in mode_results
-        ]
+        latencies = [r.get("total_latency_ms") or r.get("latency_ms", 0) for r in mode_results]
+        first_chunks = [r.get("first_chunk_ms") or r.get("first_audio_ms") for r in mode_results]
         first_chunks = [f for f in first_chunks if f is not None]
         avg_latency = sum(latencies) / len(latencies) if latencies else 0
         avg_first = sum(first_chunks) / len(first_chunks) if first_chunks else None
@@ -358,8 +355,10 @@ def main() -> None:
                     client, args.endpoint, text, args.voice, sample_id, output_dir
                 )
                 results.append(result)
-                print(f"    sync: {result['latency_ms']:.0f}ms, "
-                      f"{result['audio_duration_s']}s audio")
+                print(
+                    f"    sync: {result['latency_ms']:.0f}ms, "
+                    f"{result['audio_duration_s']}s audio"
+                )
             except Exception as e:
                 print(f"    sync FAILED: {e}")
 
@@ -370,8 +369,10 @@ def main() -> None:
                 )
                 results.append(result)
                 fc = result.get("first_chunk_ms", "?")
-                print(f"    stream: first_chunk={fc}ms, total={result['total_latency_ms']:.0f}ms, "
-                      f"{result['chunk_count']} chunks, {result['audio_duration_s']}s audio")
+                print(
+                    f"    stream: first_chunk={fc}ms, total={result['total_latency_ms']:.0f}ms, "
+                    f"{result['chunk_count']} chunks, {result['audio_duration_s']}s audio"
+                )
             except Exception as e:
                 print(f"    stream FAILED: {e}")
 
@@ -382,8 +383,10 @@ def main() -> None:
                 )
                 results.append(result)
                 fa = result.get("first_audio_ms", "?")
-                print(f"    websocket: first_audio={fa}ms, total={result['total_latency_ms']:.0f}ms, "
-                      f"{result['chunk_count']} chunks, {result['audio_duration_s']}s audio")
+                print(
+                    f"    websocket: first_audio={fa}ms, total={result['total_latency_ms']:.0f}ms, "
+                    f"{result['chunk_count']} chunks, {result['audio_duration_s']}s audio"
+                )
             except Exception as e:
                 print(f"    websocket FAILED: {e}")
 

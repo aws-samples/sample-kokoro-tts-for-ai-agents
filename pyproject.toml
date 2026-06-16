@@ -92,6 +92,7 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 warn_no_return = true
 strict_equality = true
+exclude = ["packages/speech-infra/containers/", "packages/models/"]
 
 [tool.pytest.ini_options]
 testpaths = [

@@ -34,6 +34,8 @@ class ModelEndpointConfig(BaseModel):
     scaling_metric_name: str = "vllm:num_requests_running"
     scaling_target_value: int = 8
 
+    cache_model_weights: bool = False
+
     container_env: dict[str, str] = Field(default_factory=dict)
     codec_model_ids: list[str] = Field(default_factory=list)
 
@@ -87,12 +89,16 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
     "kokoro-82m": ModelEndpointConfig(
         model_name="kokoro-82m",
         hf_model_id="hexgrad/Kokoro-82M",
-        instance_type="ml.g4dn.xlarge",
+        instance_type="ml.g5.xlarge",
         container_type=ContainerType.PYTORCH_CUSTOM,
-        streaming_mode=StreamingMode.RESPONSE_STREAM,
+        streaming_mode=StreamingMode.BIDIRECTIONAL,
         min_instances=0,
         max_instances=2,
         scaling_target_value=4,
+        container_env={
+            "BATCH_MAX_WAIT_MS": "100",
+            "BATCH_MAX_SIZE": "8",
+        },
     ),
     "maya-veena": ModelEndpointConfig(
         model_name="maya-veena",
@@ -100,6 +106,7 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         instance_type="ml.g5.xlarge",
         container_type=ContainerType.VLLM,
         streaming_mode=StreamingMode.BIDIRECTIONAL,
+        cache_model_weights=True,
         codec_model_ids=["hubertsiuzdak/snac_24khz"],
         container_env={
             "SM_VLLM_PORT": "8000",
@@ -110,13 +117,19 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
     ),
     "chatterbox-turbo": ModelEndpointConfig(
         model_name="chatterbox-turbo",
-        hf_model_id="ResembleAI/chatterbox-turbo",
+        hf_model_id="ResembleAI/chatterbox",
         instance_type="ml.g5.xlarge",
         container_type=ContainerType.PYTORCH_CUSTOM,
         streaming_mode=StreamingMode.BIDIRECTIONAL,
+        cache_model_weights=True,
         min_instances=0,
         max_instances=2,
         scaling_target_value=4,
+        container_env={
+            "GPU_MEMORY_UTILIZATION": "0.7",
+            "MAX_MODEL_LEN": "1000",
+            "DEFAULT_VOICE": "female_shadowheart4",
+        },
     ),
     "orpheus-3b": ModelEndpointConfig(
         model_name="orpheus-3b",
@@ -124,6 +137,7 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         instance_type="ml.g5.xlarge",
         container_type=ContainerType.VLLM,
         streaming_mode=StreamingMode.BIDIRECTIONAL,
+        cache_model_weights=True,
         min_instances=1,
         max_instances=4,
         scaling_target_value=8,

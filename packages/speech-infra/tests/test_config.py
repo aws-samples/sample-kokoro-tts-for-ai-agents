@@ -1,6 +1,7 @@
 """Tests for speech-infra configuration."""
 
 import pytest
+from pydantic import ValidationError
 
 from speech_infra.config import (
     STT_MODEL_CONFIGS,
@@ -55,7 +56,7 @@ class TestModelEndpointConfig:
 
     def test_frozen_config(self) -> None:
         cfg = TTS_MODEL_CONFIGS["orpheus-3b"]
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             cfg.model_name = "changed"
 
 
@@ -91,6 +92,13 @@ class TestConfigRegistry:
     def test_vllm_models_have_codec_ids(self) -> None:
         for name, cfg in TTS_MODEL_CONFIGS.items():
             if cfg.container_type == ContainerType.VLLM:
-                assert len(cfg.codec_model_ids) > 0, (
-                    f"vLLM model {name} should have codec_model_ids"
-                )
+                assert (
+                    len(cfg.codec_model_ids) > 0
+                ), f"vLLM model {name} should have codec_model_ids"
+
+    def test_models_with_codec_ids_cache_weights(self) -> None:
+        for name, cfg in TTS_MODEL_CONFIGS.items():
+            if cfg.codec_model_ids:
+                assert (
+                    cfg.cache_model_weights
+                ), f"{name} has codec_model_ids but cache_model_weights=False"

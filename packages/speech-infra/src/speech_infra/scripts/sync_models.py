@@ -52,16 +52,16 @@ def get_hf_token() -> str | None:
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            f"HF_TOKEN_SECRET '{HF_TOKEN_SECRET}' could not be retrieved from Secrets Manager "
-            f"(exit code {result.returncode}). "
-            f"Create the secret: aws secretsmanager create-secret "
-            f"--name {HF_TOKEN_SECRET} --secret-string 'hf_YOUR_TOKEN'"
+        log(
+            f"WARN: HF_TOKEN_SECRET '{HF_TOKEN_SECRET}' not found in Secrets Manager "
+            f"(exit code {result.returncode}). Proceeding without token (public models only)."
         )
+        return None
     secret = json.loads(result.stdout)
     token = secret.get("SecretString", "")
     if not token:
-        raise RuntimeError(f"HF_TOKEN_SECRET '{HF_TOKEN_SECRET}' exists but SecretString is empty")
+        log(f"WARN: HF_TOKEN_SECRET '{HF_TOKEN_SECRET}' exists but SecretString is empty")
+        return None
     log("HuggingFace token retrieved from Secrets Manager")
     return str(token)
 

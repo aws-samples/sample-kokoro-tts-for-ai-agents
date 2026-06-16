@@ -18,7 +18,8 @@ from constructs import Construct
 
 from speech_infra.config import ModelEndpointConfig
 
-ON_EVENT_CODE = textwrap.dedent("""\
+ON_EVENT_CODE = textwrap.dedent(
+    """\
     import boto3
     import os
 
@@ -37,9 +38,11 @@ ON_EVENT_CODE = textwrap.dedent("""\
             "PhysicalResourceId": event.get("PhysicalResourceId", build_id),
             "Data": {"BuildId": build_id},
         }
-""")
+"""
+)
 
-IS_COMPLETE_CODE = textwrap.dedent("""\
+IS_COMPLETE_CODE = textwrap.dedent(
+    """\
     import boto3
     import os
 
@@ -65,7 +68,8 @@ IS_COMPLETE_CODE = textwrap.dedent("""\
                 f"CodeBuild failed with status: {status}. "
                 f"Check CloudWatch logs for project: {os.environ['PROJECT_NAME']}"
             )
-""")
+"""
+)
 
 
 class ModelCache(Construct):

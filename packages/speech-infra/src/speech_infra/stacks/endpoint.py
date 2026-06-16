@@ -7,7 +7,7 @@ import aws_cdk.aws_ecr_assets as ecr_assets
 import aws_cdk.aws_iam as iam
 from constructs import Construct
 
-from speech_infra.config import ContainerType, ModelEndpointConfig
+from speech_infra.config import ModelEndpointConfig
 from speech_infra.constructs.scaling import EndpointAutoscaling
 from speech_infra.constructs.vllm_endpoint import VllmStreamingEndpoint
 
@@ -29,12 +29,6 @@ class SpeechEndpointStack(cdk.Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        if model_config.container_type == ContainerType.PYTORCH_CUSTOM:
-            raise NotImplementedError(
-                f"PyTorch custom container not yet implemented for {model_config.model_name}. "
-                "Only vLLM-based models are currently deployable."
-            )
-
         if image_uri_override:
             image_uri = image_uri_override
         else:
@@ -47,7 +41,7 @@ class SpeechEndpointStack(cdk.Stack):
 
         env_overrides: dict[str, str] = dict(model_config.container_env)
         env_overrides["ENDPOINT_NAME"] = model_config.endpoint_name
-        env_overrides["MODEL_NAME"] = model_config.model_name
+        env_overrides["SM_MODEL_ID"] = model_config.model_name
         env_overrides["AWS_REGION"] = self.region
         env_overrides["AWS_DEFAULT_REGION"] = self.region
 
@@ -57,9 +51,7 @@ class SpeechEndpointStack(cdk.Stack):
 
             if model_config.codec_model_ids:
                 codec_id = model_config.codec_model_ids[0]
-                env_overrides["SNAC_S3_URI"] = (
-                    f"s3://{model_bucket_name}/models/{codec_id}/"
-                )
+                env_overrides["SNAC_S3_URI"] = f"s3://{model_bucket_name}/models/{codec_id}/"
 
         endpoint = VllmStreamingEndpoint(
             self,

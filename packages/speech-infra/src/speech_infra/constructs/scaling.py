@@ -32,7 +32,7 @@ class EndpointAutoscaling(Construct):
             service_namespace=appscaling.ServiceNamespace.SAGEMAKER,
             scalable_dimension="sagemaker:variant:DesiredInstanceCount",
             resource_id=resource_id,
-            min_capacity=model_config.min_instances,
+            min_capacity=max(model_config.min_instances, 1),
             max_capacity=model_config.max_instances,
         )
 
