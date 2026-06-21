@@ -30,6 +30,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 VOICES_DIR = os.environ.get("VOICES_DIR", "/app/voices")
 DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "female_shadowheart4")
 MODEL_DIR = os.environ.get("MODEL_DIR", "/app/model")
+MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "51"))
 SAMPLE_RATE = 24000
 
 _logger = logging.getLogger("chatterbox_proxy")
@@ -105,6 +106,10 @@ async def invocations(request: Request) -> Response:
     body = json.loads(await request.body())
     text = body.get("text", "")
     voice_id = body.get("voice", DEFAULT_VOICE)
+
+    request_ts = body.get("request_timestamp")
+    if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
+        return JSONResponse(status_code=408, content={"error": "request_stale"})
 
     if not text:
         return JSONResponse(status_code=400, content={"error": "text is required"})

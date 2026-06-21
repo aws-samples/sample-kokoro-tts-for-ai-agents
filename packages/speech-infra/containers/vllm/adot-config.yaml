@@ -14,7 +14,7 @@ processors:
         value: ${env:ENDPOINT_NAME}
         action: upsert
       - key: ModelName
-        value: ${env:MODEL_NAME}
+        value: ${env:SM_MODEL_ID}
         action: upsert
 
 exporters:

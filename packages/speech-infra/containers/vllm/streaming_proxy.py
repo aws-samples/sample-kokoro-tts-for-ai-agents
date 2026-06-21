@@ -33,6 +33,7 @@ _CLAUSE_RE = re.compile(r"(?<=[,;:])\s+")
 
 VLLM_BACKEND = "http://localhost:8000"
 MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "24"))
+MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "52"))
 SNAC_MODEL_PATH = os.environ.get("SNAC_MODEL_PATH", "hubertsiuzdak/snac_24khz")
 SAMPLE_RATE = 24000
 
@@ -159,6 +160,10 @@ async def invocations(request: Request) -> Response:
     body = json.loads(await request.body())
     text = body.get("text", "")
     voice = body.get("voice", "tara")
+
+    request_ts = body.get("request_timestamp")
+    if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
+        return JSONResponse(status_code=408, content={"error": "request_stale"})
 
     if not text:
         return JSONResponse(status_code=400, content={"error": "text is required"})
