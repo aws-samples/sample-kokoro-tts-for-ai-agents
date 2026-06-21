@@ -38,7 +38,9 @@ def measure_latency(
                 result = client.synthesize(model, text)
                 latencies.append(result["latency_ms"])
             except Exception as e:
-                logger.warning("Latency run failed ({}/{}): {}", i * runs_per_text + run + 1, total, e)
+                logger.warning(
+                    "Latency run failed ({}/{}): {}", i * runs_per_text + run + 1, total, e
+                )
 
     if not latencies:
         raise RuntimeError(f"All latency measurements failed for {model}")

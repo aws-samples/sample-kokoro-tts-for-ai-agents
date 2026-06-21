@@ -128,15 +128,16 @@ def _render_markdown(data: dict) -> str:
                 [
                     "### Cost per Million Characters",
                     "",
-                    "| Model | $/M chars | Throughput (chars/min) | Instance |",
-                    "|-------|-----------|-----------------------|----------|",
+                    "| Model | $/M chars | Throughput (chars/min) | Sat. C | Instance |",
+                    "|-------|-----------|-----------------------|--------|----------|",
                 ]
             )
             for entry in bench["cost"]:
                 cost = entry["cost_per_m_chars"]
                 cpm = entry["chars_per_min"]
+                sat_c = entry.get("saturation_concurrency", "N/A")
                 inst = entry["instance_type"]
-                lines.append(f"| {entry['model']} | ${cost:.2f} | {cpm:.0f} | {inst} |")
+                lines.append(f"| {entry['model']} | ${cost:.2f} | {cpm:.0f} | {sat_c} | {inst} |")
 
         if "scalability" in bench:
             lines.extend(
@@ -144,15 +145,18 @@ def _render_markdown(data: dict) -> str:
                     "",
                     "### Scalability",
                     "",
-                    "| Model | Concurrency | Success Rate | P50 (ms) | P99 (ms) |",
-                    "|-------|-------------|--------------|----------|----------|",
+                    "| Model | Concurrency | Throughput (chars/s) | P50 (ms) | P99 (ms) | TTFAB P50 (ms) |",
+                    "|-------|-------------|----------------------|----------|----------|----------------|",
                 ]
             )
             for entry in bench["scalability"]:
+                ttfab = entry.get("ttfab_p50_ms", "N/A")
+                ttfab_str = f"{ttfab:.0f}" if isinstance(ttfab, int | float) else ttfab
+                throughput = entry.get("throughput_chars_per_s", 0)
                 lines.append(
                     f"| {entry['model']} | {entry['concurrency']} | "
-                    f"{entry['success_rate']*100:.0f}% | "
-                    f"{entry['p50_ms']:.0f} | {entry['p99_ms']:.0f} |"
+                    f"{throughput:.0f} | "
+                    f"{entry['p50_ms']:.0f} | {entry['p99_ms']:.0f} | {ttfab_str} |"
                 )
 
     if "human_panel" in data:

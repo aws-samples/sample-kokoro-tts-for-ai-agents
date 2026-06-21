@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import click
@@ -58,10 +57,13 @@ def latency(models: str, runs: int, max_samples: int, region: str, output: str |
 
 @main.command()
 @click.option("--models", default="all", help="Comma-separated model names or 'all'")
-@click.option("--concurrency", default="10,50,100", help="Comma-separated concurrency levels")
+@click.option("--concurrency", default="5,10,20", help="Comma-separated concurrency levels")
+@click.option("--window", default=15.0, type=float, help="Seconds per concurrency level")
 @click.option("--region", default="us-east-1")
 @click.option("--output", default=None, type=click.Path())
-def scalability(models: str, concurrency: str, region: str, output: str | None) -> None:
+def scalability(
+    models: str, concurrency: str, window: float, region: str, output: str | None
+) -> None:
     """Test scalability under concurrent load."""
     from tts_bench.scalability import measure_scalability
 
@@ -73,12 +75,12 @@ def scalability(models: str, concurrency: str, region: str, output: str | None) 
     for model in model_list:
         logger.info("Scalability test for {}", model)
         try:
-            results = measure_scalability(model, text, levels, region=region)
+            results = measure_scalability(model, text, levels, region=region, window_s=window)
             all_results.extend(results)
             for r in results:
                 click.echo(
                     f"  {model} @{r['concurrency']}: "
-                    f"success={r['success_rate']*100:.0f}% "
+                    f"{r['throughput_chars_per_s']:.0f} chars/s "
                     f"P50={r['p50_ms']:.0f}ms P99={r['p99_ms']:.0f}ms"
                 )
         except Exception as e:
