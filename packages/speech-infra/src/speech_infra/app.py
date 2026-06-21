@@ -21,6 +21,7 @@ CONTAINER_DIR_MAP: dict[str, str] = {
     "orpheus-3b": str(CONTAINERS_ROOT / "vllm"),
     "maya-veena": str(CONTAINERS_ROOT / "vllm"),
     "kokoro-82m": str(CONTAINERS_ROOT / "kokoro"),
+    "kokoro-82m-cpu": str(CONTAINERS_ROOT / "kokoro-cpu"),
     "chatterbox-turbo": str(CONTAINERS_ROOT / "chatterbox"),
 }
 

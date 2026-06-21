@@ -95,10 +95,16 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         min_instances=0,
         max_instances=2,
         scaling_target_value=4,
-        container_env={
-            "BATCH_MAX_WAIT_MS": "100",
-            "BATCH_MAX_SIZE": "8",
-        },
+    ),
+    "kokoro-82m-cpu": ModelEndpointConfig(
+        model_name="kokoro-82m-cpu",
+        hf_model_id="hexgrad/Kokoro-82M",
+        instance_type="ml.c5.2xlarge",
+        container_type=ContainerType.PYTORCH_CUSTOM,
+        streaming_mode=StreamingMode.BIDIRECTIONAL,
+        min_instances=0,
+        max_instances=2,
+        scaling_target_value=4,
     ),
     "maya-veena": ModelEndpointConfig(
         model_name="maya-veena",

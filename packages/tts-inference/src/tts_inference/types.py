@@ -12,6 +12,7 @@ class TTSModelName(StrEnum):
     """Supported TTS model identifiers."""
 
     KOKORO_82M = "kokoro-82m"
+    KOKORO_82M_CPU = "kokoro-82m-cpu"
     MAYA_VEENA = "maya-veena"
     CHATTERBOX_TURBO = "chatterbox-turbo"
     ORPHEUS_3B = "orpheus-3b"
