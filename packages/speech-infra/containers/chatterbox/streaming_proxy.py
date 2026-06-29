@@ -1,7 +1,9 @@
-"""Streaming proxy for Chatterbox-Turbo TTS via chatterbox-vllm.
+"""Streaming proxy for Chatterbox Turbo TTS.
 
-Uses the chatterbox-vllm library which runs the T3 autoregressive stage
-through vLLM (continuous batching) and S3Gen+HiFiGAN as post-processing.
+Uses the standard chatterbox-tts library with AlignmentStreamAnalyzer for
+repetition-free generation. Single model instance with asyncio.Lock
+serialization — the model uses ~18GB VRAM on A10G, so only one instance
+fits and parallelism provides no benefit.
 
 Provides:
 - GET /ping: health check
@@ -9,6 +11,7 @@ Provides:
 - WS /invocations-bidirectional-stream: streaming TTS over WebSocket
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -21,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import uvicorn
+from chatterbox.tts_turbo import ChatterboxTurboTTS, Conditionals
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -28,43 +32,64 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 VOICES_DIR = os.environ.get("VOICES_DIR", "/app/voices")
-DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "female_shadowheart4")
+DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "ENG_US_F_KimW")
 MODEL_DIR = os.environ.get("MODEL_DIR", "/app/model")
 MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "51"))
 SAMPLE_RATE = 24000
 
 _logger = logging.getLogger("chatterbox_proxy")
-_model = None
+_model: ChatterboxTurboTTS | None = None
+_inference_lock: asyncio.Lock | None = None
+_voice_cache: dict[str, Conditionals] = {}
 
 
-def _get_model():
+def _patch_float64():
+    """Fix chatterbox dtype bug: librosa returns float64, model expects float32."""
+    try:
+        from chatterbox.models.s3tokenizer import S3Tokenizer
+
+        _orig = S3Tokenizer.log_mel_spectrogram
+
+        def _patched(self, audio, padding=0):
+            if not torch.is_tensor(audio):
+                audio = torch.from_numpy(audio)
+            audio = audio.to(dtype=torch.float32)
+            return _orig(self, audio, padding)
+
+        S3Tokenizer.log_mel_spectrogram = _patched
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        from chatterbox.models.voice_encoder import VoiceEncoder
+
+        _orig_inf = VoiceEncoder.inference
+
+        def _patched_inf(self, mels, *args, **kwargs):
+            mels = mels.to(dtype=torch.float32)
+            return _orig_inf(self, mels, *args, **kwargs)
+
+        VoiceEncoder.inference = _patched_inf
+    except (ImportError, AttributeError):
+        pass
+
+
+def _load_model() -> ChatterboxTurboTTS:
     global _model
     if _model is None:
-        from chatterbox_vllm.tts import ChatterboxTTS
-
-        gpu_util = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.7"))
-        max_len = int(os.environ.get("MAX_MODEL_LEN", "1000"))
+        _patch_float64()
 
         model_dir = Path(MODEL_DIR)
-        if (model_dir / "t3_cfg.safetensors").exists():
-            _model = ChatterboxTTS.from_local(
-                model_dir,
-                max_model_len=max_len,
-                gpu_memory_utilization=gpu_util,
-                enforce_eager=True,
-            )
+        if (model_dir / "t3_turbo_v1.safetensors").exists():
+            _model = ChatterboxTurboTTS.from_local(str(model_dir), device="cuda")
         else:
-            _model = ChatterboxTTS.from_pretrained(
-                gpu_memory_utilization=gpu_util,
-                max_model_len=max_len,
-                enforce_eager=True,
-            )
-        _logger.info("ChatterboxTTS loaded (gpu_util=%.2f, max_len=%d)", gpu_util, max_len)
+            _model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+
+        _logger.info("ChatterboxTurboTTS loaded")
     return _model
 
 
 def _resolve_voice(voice_id: str) -> str:
-    """Map voice_id to reference audio file path."""
     for ext in (".flac", ".wav", ".mp3", ".ogg"):
         path = os.path.join(VOICES_DIR, f"{voice_id}{ext}")
         if os.path.exists(path):
@@ -73,8 +98,39 @@ def _resolve_voice(voice_id: str) -> str:
     raise FileNotFoundError(f"Voice '{voice_id}' not found in {VOICES_DIR}. Available: {available}")
 
 
+def _precompute_voices(model: ChatterboxTurboTTS) -> None:
+    """Cache conditionals for all voice files at startup."""
+    voices_path = Path(VOICES_DIR)
+    for audio_file in voices_path.iterdir():
+        if audio_file.suffix in (".flac", ".wav", ".mp3", ".ogg"):
+            voice_id = audio_file.stem
+            try:
+                model.prepare_conditionals(str(audio_file), exaggeration=0.5)
+                _voice_cache[voice_id] = model.conds
+                _logger.info("Cached voice: %s", voice_id)
+            except Exception as e:
+                _logger.warning("Failed to cache voice %s: %s", voice_id, e)
+
+
+def _get_conditionals(voice_id: str) -> Conditionals:
+    """Get cached conditionals or compute on demand."""
+    if voice_id in _voice_cache:
+        return _voice_cache[voice_id]
+
+    audio_path = _resolve_voice(voice_id)
+    model = _load_model()
+    model.prepare_conditionals(audio_path, exaggeration=0.5)
+    _voice_cache[voice_id] = model.conds
+    return model.conds
+
+
+def _synthesize(text: str, voice_id: str) -> torch.Tensor:
+    model = _load_model()
+    model.conds = _get_conditionals(voice_id)
+    return model.generate(text)
+
+
 def _tensor_to_wav(wav_tensor: torch.Tensor, sample_rate: int) -> bytes:
-    """Convert torch audio tensor to WAV bytes."""
     audio_np = wav_tensor.squeeze().cpu().numpy()
     pcm = (audio_np * 32767).astype(np.int16).tobytes()
     data_size = len(pcm)
@@ -102,7 +158,6 @@ async def ping(request: Request) -> Response:
 
 
 async def invocations(request: Request) -> Response:
-    """Synchronous TTS: accept text + voice_id, return WAV audio."""
     body = json.loads(await request.body())
     text = body.get("text", "")
     voice_id = body.get("voice", DEFAULT_VOICE)
@@ -115,15 +170,16 @@ async def invocations(request: Request) -> Response:
         return JSONResponse(status_code=400, content={"error": "text is required"})
 
     try:
-        audio_path = _resolve_voice(voice_id)
+        _resolve_voice(voice_id)
     except FileNotFoundError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
     t0 = time.perf_counter()
-    model = _get_model()
-    wav = model.generate(text, audio_prompt_path=audio_path)[0]
-    elapsed = time.perf_counter() - t0
 
+    async with _inference_lock:
+        wav = await asyncio.get_event_loop().run_in_executor(None, _synthesize, text, voice_id)
+
+    elapsed = time.perf_counter() - t0
     wav_bytes = _tensor_to_wav(wav, SAMPLE_RATE)
     audio_duration = wav.shape[-1] / SAMPLE_RATE
 
@@ -134,12 +190,12 @@ async def invocations(request: Request) -> Response:
             "X-Audio-Duration": f"{audio_duration:.3f}",
             "X-Inference-Time-Ms": str(int(elapsed * 1000)),
             "X-RTF": f"{elapsed / audio_duration:.3f}" if audio_duration > 0 else "0",
+            "X-Characters-Processed": str(len(text)),
         },
     )
 
 
 async def bidirectional_stream(websocket: WebSocket) -> None:
-    """WebSocket handler for streaming TTS."""
     await websocket.accept()
 
     try:
@@ -163,7 +219,7 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
                 continue
 
             try:
-                audio_path = _resolve_voice(voice_id)
+                _resolve_voice(voice_id)
             except FileNotFoundError as e:
                 await websocket.send_text(
                     json.dumps({"type": "error", "request_id": request_id, "message": str(e)})
@@ -175,8 +231,11 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
             )
 
             t0 = time.monotonic()
-            model = _get_model()
-            wav = model.generate(text, audio_prompt_path=audio_path)[0]
+
+            async with _inference_lock:
+                wav = await asyncio.get_event_loop().run_in_executor(
+                    None, _synthesize, text, voice_id
+                )
 
             audio_np = wav.squeeze().cpu().numpy()
             pcm = (audio_np * 32767).astype(np.int16).tobytes()
@@ -210,9 +269,12 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
 
 @asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
-    _logger.info("Preloading model at startup...")
-    _get_model()
-    _logger.info("Model preloaded and ready for inference")
+    global _inference_lock
+    _inference_lock = asyncio.Lock()
+    _logger.info("Loading model at startup...")
+    model = _load_model()
+    _precompute_voices(model)
+    _logger.info("Model loaded, %d voices cached", len(_voice_cache))
     yield
 
 
