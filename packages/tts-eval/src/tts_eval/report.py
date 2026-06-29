@@ -91,6 +91,50 @@ def _build_report_data(
     return report
 
 
+VOICE_CUSTOMIZATION: dict[str, dict[str, str]] = {
+    "kokoro-82m": {
+        "method": "Pre-trained voices",
+        "effort": "None",
+        "notes": "30+ built-in voices, no cloning support",
+    },
+    "kokoro-82m-cpu": {
+        "method": "Pre-trained voices",
+        "effort": "None",
+        "notes": "Same as kokoro-82m (CPU inference)",
+    },
+    "orpheus-3b": {
+        "method": "Pre-trained voices",
+        "effort": "None",
+        "notes": "Multiple speaker styles, no cloning",
+    },
+    "chatterbox-turbo": {
+        "method": "Reference audio cloning",
+        "effort": "Low (5s sample)",
+        "notes": "Zero-shot voice cloning from short reference audio",
+    },
+    "maya-veena": {
+        "method": "Pre-trained voices",
+        "effort": "None",
+        "notes": "Single voice model",
+    },
+    "polly-standard": {
+        "method": "Managed service",
+        "effort": "None",
+        "notes": "AWS Polly Standard, Salli voice (en-US)",
+    },
+    "polly-neural": {
+        "method": "Managed service",
+        "effort": "None",
+        "notes": "AWS Polly Neural, Joanna voice (en-US)",
+    },
+    "polly-generative": {
+        "method": "Managed service",
+        "effort": "None",
+        "notes": "AWS Polly Generative, Ruth voice (en-US)",
+    },
+}
+
+
 def _render_markdown(data: dict) -> str:
     """Render report data as Markdown."""
     lines = [
@@ -112,24 +156,41 @@ def _render_markdown(data: dict) -> str:
         lines.append(f"| {model} | {utmos} | {wer_val} | {s['successful']}/{s['total_samples']} |")
 
     lines.extend(
-        ["", "## Latency", "", "| Model | Mean Latency (ms) |", "|-------|-------------------|"]
+        [
+            "",
+            "## Latency",
+            "",
+            "| Model | Mean Latency (ms) | TTFAB P50 (ms) | TTFAB P99 (ms) |",
+            "|-------|-------------------|----------------|----------------|",
+        ]
     )
     for model in data["models"]:
         s = data["summary"][model]
         lat = f"{s['latency_ms']['mean']:.0f}" if s["latency_ms"]["mean"] else "N/A"
-        lines.append(f"| {model} | {lat} |")
+        ttfab_p50 = "N/A"
+        ttfab_p99 = "N/A"
+        if "benchmarks" in data and "scalability" in data["benchmarks"]:
+            baseline = [
+                e
+                for e in data["benchmarks"]["scalability"]
+                if e["model"] == model and e.get("concurrency") == 1
+            ]
+            if baseline:
+                ttfab_p50 = f"{baseline[0]['ttfab_p50_ms']:.0f}"
+                ttfab_p99 = f"{baseline[0]['ttfab_p99_ms']:.0f}"
+        lines.append(f"| {model} | {lat} | {ttfab_p50} | {ttfab_p99} |")
 
     if "benchmarks" in data:
-        lines.extend(["", "## Performance Benchmarks", ""])
         bench = data["benchmarks"]
 
         if "cost" in bench:
             lines.extend(
                 [
-                    "### Cost per Million Characters",
                     "",
-                    "| Model | $/M chars | Throughput (chars/min) | Sat. C | Instance |",
-                    "|-------|-----------|-----------------------|--------|----------|",
+                    "## Cost",
+                    "",
+                    "| Model | $/M chars | Throughput (chars/min) | Sat. C | Instance | $/hr |",
+                    "|-------|-----------|-----------------------|--------|----------|------|",
                 ]
             )
             for entry in bench["cost"]:
@@ -137,33 +198,52 @@ def _render_markdown(data: dict) -> str:
                 cpm = entry["chars_per_min"]
                 sat_c = entry.get("saturation_concurrency", "N/A")
                 inst = entry["instance_type"]
-                lines.append(f"| {entry['model']} | ${cost:.2f} | {cpm:.0f} | {sat_c} | {inst} |")
+                cost_hr = entry.get("instance_cost_per_hr", "N/A")
+                cost_hr_str = f"${cost_hr:.2f}" if isinstance(cost_hr, int | float) else cost_hr
+                lines.append(
+                    f"| {entry['model']} | ${cost:.2f} | {cpm:.0f} | {sat_c} | {inst} | {cost_hr_str} |"
+                )
 
         if "scalability" in bench:
             lines.extend(
                 [
                     "",
-                    "### Scalability",
+                    "## Scalability",
                     "",
-                    "| Model | Concurrency | Throughput (chars/s) | P50 (ms) | P99 (ms) | TTFAB P50 (ms) |",
-                    "|-------|-------------|----------------------|----------|----------|----------------|",
+                    "| Model | Concurrency | Throughput (chars/s) | Success | P50 (ms) | P99 (ms) | TTFAB P50 |",
+                    "|-------|-------------|----------------------|---------|----------|----------|-----------|",
                 ]
             )
             for entry in bench["scalability"]:
                 ttfab = entry.get("ttfab_p50_ms", "N/A")
                 ttfab_str = f"{ttfab:.0f}" if isinstance(ttfab, int | float) else ttfab
                 throughput = entry.get("throughput_chars_per_s", 0)
+                total_req = entry.get("total_requests", 0)
+                success_rate = "100%" if total_req > 0 else "0%"
                 lines.append(
                     f"| {entry['model']} | {entry['concurrency']} | "
-                    f"{throughput:.0f} | "
+                    f"{throughput:.0f} | {success_rate} | "
                     f"{entry['p50_ms']:.0f} | {entry['p99_ms']:.0f} | {ttfab_str} |"
                 )
+
+    lines.extend(
+        [
+            "",
+            "## Voice Customization",
+            "",
+            "| Model | Cloning Method | Effort | Notes |",
+            "|-------|----------------|--------|-------|",
+        ]
+    )
+    for model in data["models"]:
+        vc = VOICE_CUSTOMIZATION.get(model, {"method": "Unknown", "effort": "N/A", "notes": ""})
+        lines.append(f"| {model} | {vc['method']} | {vc['effort']} | {vc['notes']} |")
 
     if "human_panel" in data:
         lines.extend(
             [
                 "",
-                "## Human Panel Scores",
+                "## Human Panel Scores (3-5 listeners, blind)",
                 "",
                 "| Model | Naturalness | Clarity | Pacing | Consistency | Overall |",
                 "|-------|-------------|---------|--------|-------------|---------|",
@@ -195,6 +275,45 @@ def _render_markdown(data: dict) -> str:
                 else "N/A"
             )
             lines.append(f"| {model} | {nat} | {cla} | {pac} | {con} | {ovr} |")
+    else:
+        lines.extend(
+            [
+                "",
+                "## Human Panel Scores (3-5 listeners, blind)",
+                "",
+                "*Pending: Generate listening test with `tts-eval human-panel generate` "
+                "and collect scores from 3-5 listeners.*",
+                "",
+                "Dimensions: Naturalness (1-5), Clarity (1-5), Pacing (1-5), "
+                "Consistency (1-5), Overall (1-5)",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Voice Snippets (Side-by-Side)",
+            "",
+        ]
+    )
+    models = data["models"]
+    if len(models) > 0:
+        header = "| Sample |" + " | ".join(models) + " |"
+        sep = "|--------|" + " | ".join(["---"] * len(models)) + " |"
+        lines.extend([header, sep])
+
+        sample_ids: list[str] = []
+        for model in models:
+            for sample in data["summary"][model].get("samples", []):
+                sid = sample.get("sample_id", "")
+                if sid and sid not in sample_ids:
+                    sample_ids.append(sid)
+
+        for sid in sample_ids[:10]:
+            row = f"| {sid} |"
+            for model in models:
+                row += f" `samples/{model}/{sid}.wav` |"
+            lines.append(row)
 
     lines.extend(["", "---", "*Report generated by tts-eval*", ""])
     return "\n".join(lines)
