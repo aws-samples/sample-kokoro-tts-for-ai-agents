@@ -93,7 +93,7 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         container_type=ContainerType.PYTORCH_CUSTOM,
         streaming_mode=StreamingMode.BIDIRECTIONAL,
         min_instances=0,
-        max_instances=2,
+        max_instances=1,
         scaling_target_value=4,
     ),
     "kokoro-82m-cpu": ModelEndpointConfig(
@@ -103,7 +103,7 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         container_type=ContainerType.PYTORCH_CUSTOM,
         streaming_mode=StreamingMode.BIDIRECTIONAL,
         min_instances=0,
-        max_instances=2,
+        max_instances=1,
         scaling_target_value=4,
     ),
     "maya-veena": ModelEndpointConfig(
@@ -123,18 +123,16 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
     ),
     "chatterbox-turbo": ModelEndpointConfig(
         model_name="chatterbox-turbo",
-        hf_model_id="ResembleAI/chatterbox",
+        hf_model_id="ResembleAI/chatterbox-turbo",
         instance_type="ml.g5.xlarge",
         container_type=ContainerType.PYTORCH_CUSTOM,
         streaming_mode=StreamingMode.BIDIRECTIONAL,
         cache_model_weights=True,
         min_instances=0,
-        max_instances=2,
+        max_instances=1,
         scaling_target_value=4,
         container_env={
-            "GPU_MEMORY_UTILIZATION": "0.7",
-            "MAX_MODEL_LEN": "1000",
-            "DEFAULT_VOICE": "female_shadowheart4",
+            "DEFAULT_VOICE": "ENG_US_F_KimW",
         },
     ),
     "orpheus-3b": ModelEndpointConfig(
@@ -145,7 +143,7 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         streaming_mode=StreamingMode.BIDIRECTIONAL,
         cache_model_weights=True,
         min_instances=1,
-        max_instances=4,
+        max_instances=1,
         scaling_target_value=8,
         codec_model_ids=["hubertsiuzdak/snac_24khz"],
         container_env={
