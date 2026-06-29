@@ -7,7 +7,9 @@ from unittest.mock import MagicMock
 from tts_bench.cost import (
     INSTANCE_COST_PER_HOUR,
     MODEL_INSTANCE_TYPES,
+    POLLY_COST_PER_M_CHARS,
     SATURATION_LEVELS,
+    calculate_cost,
     find_saturation_concurrency,
     measure_sustained_throughput,
 )
@@ -63,6 +65,24 @@ class TestFindSaturationConcurrency:
             client, TTSModelName.KOKORO_82M, "test", max_concurrency=8
         )
         assert result >= 1
+
+
+class TestPollyCost:
+    def test_polly_models_have_fixed_pricing(self) -> None:
+        assert TTSModelName.POLLY_STANDARD in POLLY_COST_PER_M_CHARS
+        assert TTSModelName.POLLY_NEURAL in POLLY_COST_PER_M_CHARS
+        assert TTSModelName.POLLY_GENERATIVE in POLLY_COST_PER_M_CHARS
+
+    def test_polly_cost_values(self) -> None:
+        assert POLLY_COST_PER_M_CHARS[TTSModelName.POLLY_STANDARD] == 4.00
+        assert POLLY_COST_PER_M_CHARS[TTSModelName.POLLY_NEURAL] == 16.00
+        assert POLLY_COST_PER_M_CHARS[TTSModelName.POLLY_GENERATIVE] == 30.00
+
+    def test_calculate_cost_short_circuits_for_polly(self) -> None:
+        result = calculate_cost("polly-neural", texts=["test"], region="us-east-1")
+        assert result["cost_per_m_chars"] == 16.00
+        assert result["instance_type"] == "managed"
+        assert result["total_requests"] == 0
 
 
 class TestMeasureSustainedThroughput:

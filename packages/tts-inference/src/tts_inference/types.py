@@ -16,6 +16,9 @@ class TTSModelName(StrEnum):
     MAYA_VEENA = "maya-veena"
     CHATTERBOX_TURBO = "chatterbox-turbo"
     ORPHEUS_3B = "orpheus-3b"
+    POLLY_STANDARD = "polly-standard"
+    POLLY_NEURAL = "polly-neural"
+    POLLY_GENERATIVE = "polly-generative"
 
 
 class ExecutionMode(StrEnum):

@@ -30,24 +30,27 @@ class WERScorer:
         audio_path: str | Path | None = None,
         audio_bytes: bytes | None = None,
         sample_rate: int = 24000,
+        audio_format: str = "wav",
     ) -> dict[str, float | str]:
         """Compute WER between reference text and transcription of audio.
 
         Args:
             reference_text: Original text that was synthesized.
-            audio_path: Path to WAV file to transcribe.
-            audio_bytes: Raw WAV bytes to transcribe (alternative to audio_path).
+            audio_path: Path to audio file to transcribe.
+            audio_bytes: Raw audio bytes to transcribe (alternative to audio_path).
             sample_rate: Sample rate of the audio.
+            audio_format: Audio format ("wav" or "mp3").
 
         Returns:
             Dict with 'wer' (float 0-1), 'transcript' (str), 'reference' (str).
         """
         if audio_path is not None:
             audio_bytes = Path(audio_path).read_bytes()
+            audio_format = Path(audio_path).suffix.lstrip(".")
         if audio_bytes is None:
             raise ValueError("Must provide either audio_path or audio_bytes")
 
-        transcript = self._transcribe_audio(audio_bytes, sample_rate)
+        transcript = self._transcribe_audio(audio_bytes, sample_rate, audio_format)
         reference_normalized = reference_text.strip().lower()
         transcript_normalized = transcript.strip().lower()
 
@@ -62,11 +65,13 @@ class WERScorer:
             "reference": reference_text,
         }
 
-    def _transcribe_audio(self, audio_bytes: bytes, sample_rate: int) -> str:
-        """Transcribe audio bytes using AWS Transcribe streaming."""
+    def _transcribe_audio(
+        self, audio_bytes: bytes, sample_rate: int, audio_format: str = "wav"
+    ) -> str:
+        """Transcribe audio bytes using AWS Transcribe."""
         bucket = self._get_temp_bucket()
         job_name = f"tts-eval-{uuid.uuid4().hex[:12]}"
-        s3_key = f"tts-eval-tmp/{job_name}.wav"
+        s3_key = f"tts-eval-tmp/{job_name}.{audio_format}"
 
         self._s3.put_object(Bucket=bucket, Key=s3_key, Body=audio_bytes)
 
@@ -74,7 +79,7 @@ class WERScorer:
             self._transcribe.start_transcription_job(
                 TranscriptionJobName=job_name,
                 Media={"MediaFileUri": f"s3://{bucket}/{s3_key}"},
-                MediaFormat="wav",
+                MediaFormat=audio_format,
                 MediaSampleRateHertz=sample_rate,
                 LanguageCode="en-US",
             )

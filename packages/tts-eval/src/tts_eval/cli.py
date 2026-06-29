@@ -39,7 +39,8 @@ def main() -> None:
 @click.option("--max-samples", default=None, type=int, help="Limit number of samples")
 @click.option("--skip-wer", is_flag=True, help="Skip WER scoring (faster)")
 @click.option("--skip-bench", is_flag=True, help="Skip cost/scalability benchmarks")
-@click.option("--concurrency", default="10,50,100", help="Scalability concurrency levels")
+@click.option("--concurrency", default="1,10,50,100", help="Scalability concurrency levels")
+@click.option("--workers", default=10, type=int, help="Parallel workers per model for synthesis")
 @click.option("--region", default="us-east-1")
 def run(
     models: str,
@@ -49,6 +50,7 @@ def run(
     skip_wer: bool,
     skip_bench: bool,
     concurrency: str,
+    workers: int,
     region: str,
 ) -> None:
     """Run full evaluation (quality + benchmarks) across models."""
@@ -82,6 +84,7 @@ def run(
         output_dir=out,
         region=region,
         skip_wer=skip_wer,
+        max_workers=workers,
     )
     results = runner.run()
 

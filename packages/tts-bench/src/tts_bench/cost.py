@@ -30,6 +30,12 @@ MODEL_INSTANCE_TYPES: dict[str, str] = {
     TTSModelName.CHATTERBOX_TURBO: "ml.g5.xlarge",
 }
 
+POLLY_COST_PER_M_CHARS: dict[str, float] = {
+    TTSModelName.POLLY_STANDARD: 4.00,
+    TTSModelName.POLLY_NEURAL: 16.00,
+    TTSModelName.POLLY_GENERATIVE: 30.00,
+}
+
 SATURATION_LEVELS = [2, 4, 8, 16, 32]
 
 
@@ -176,6 +182,20 @@ def calculate_cost(
     """
     client = SynthesisClient(region=region)
     model = TTSModelName(model)
+
+    if model in POLLY_COST_PER_M_CHARS:
+        return {
+            "model": model.value,
+            "instance_type": "managed",
+            "instance_cost_per_hr": 0,
+            "saturation_concurrency": "N/A",
+            "chars_per_hr": 0,
+            "chars_per_min": 0,
+            "cost_per_m_chars": POLLY_COST_PER_M_CHARS[model],
+            "total_requests": 0,
+            "window_s": 0,
+        }
+
     instance_type = MODEL_INSTANCE_TYPES.get(model, "ml.g5.xlarge")
     instance_cost = INSTANCE_COST_PER_HOUR.get(instance_type, 1.408)
 

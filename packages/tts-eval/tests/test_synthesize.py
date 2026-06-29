@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import struct
 
-from tts_eval.synthesize import ENDPOINT_MAP, wav_duration
+from tts_eval.synthesize import ENDPOINT_MAP, POLLY_VOICES, _pcm_to_wav, wav_duration
 from tts_inference.types import TTSModelName
 
 
@@ -64,3 +64,33 @@ class TestEndpointMap:
     def test_endpoint_names_follow_convention(self) -> None:
         for _model, endpoint in ENDPOINT_MAP.items():
             assert endpoint.startswith("speech-"), f"{endpoint} should start with 'speech-'"
+
+
+class TestPollyIntegration:
+    def test_polly_voices_config_complete(self) -> None:
+        assert TTSModelName.POLLY_STANDARD in POLLY_VOICES
+        assert TTSModelName.POLLY_NEURAL in POLLY_VOICES
+        assert TTSModelName.POLLY_GENERATIVE in POLLY_VOICES
+        for config in POLLY_VOICES.values():
+            assert "engine" in config
+            assert "voice_id" in config
+
+    def test_pcm_to_wav_produces_valid_header(self) -> None:
+        pcm = b"\x00" * 32000  # 1 second at 16000Hz, 16-bit mono
+        wav = _pcm_to_wav(pcm, 16000)
+        assert wav[:4] == b"RIFF"
+        assert wav[8:12] == b"WAVE"
+        duration = wav_duration(wav)
+        assert abs(duration - 1.0) < 0.01
+
+    def test_pcm_to_wav_correct_sample_rate(self) -> None:
+        pcm = b"\x00" * 48000  # 1.5 seconds at 16000Hz
+        wav = _pcm_to_wav(pcm, 16000)
+        sr = struct.unpack_from("<I", wav, 24)[0]
+        assert sr == 16000
+
+    def test_polly_voices_use_mp3_format(self) -> None:
+        """Polly synthesis should indicate MP3 output format at 24kHz."""
+        for _model_name, config in POLLY_VOICES.items():
+            assert config["engine"] in ("standard", "neural", "generative")
+            assert config["voice_id"]

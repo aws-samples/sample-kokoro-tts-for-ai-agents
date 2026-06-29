@@ -8,11 +8,11 @@ signal quality, and background noise scores.
 from __future__ import annotations
 
 import io
+import threading
 from pathlib import Path
 
 import librosa
 import numpy as np
-import soundfile as sf
 from loguru import logger
 from speechmos import dnsmos
 
@@ -29,15 +29,18 @@ class UTMOSScorer:
 
     def __init__(self) -> None:
         self._loaded = False
+        self._lock = threading.Lock()
 
     def _load(self) -> None:
         if self._loaded:
             return
-        # Trigger model load by scoring a silent sample
-        silence = np.zeros(int(_SAMPLE_RATE * 10), dtype=np.float32)
-        dnsmos.run(silence, _SAMPLE_RATE)
-        self._loaded = True
-        logger.info("DNSMOS model loaded")
+        with self._lock:
+            if self._loaded:
+                return
+            silence = np.zeros(int(_SAMPLE_RATE * 10), dtype=np.float32)
+            dnsmos.run(silence, _SAMPLE_RATE)
+            self._loaded = True
+            logger.info("DNSMOS model loaded")
 
     def score_file(self, audio_path: str | Path) -> float:
         """Score a WAV file. Returns overall MOS estimate (1-5)."""
@@ -45,14 +48,10 @@ class UTMOSScorer:
         wav, _ = librosa.load(str(audio_path), sr=_SAMPLE_RATE, mono=True)
         return self._score_array(wav)
 
-    def score_bytes(self, wav_bytes: bytes, sample_rate: int = 24000) -> float:
-        """Score WAV audio from bytes. Returns overall MOS estimate (1-5)."""
+    def score_bytes(self, audio_bytes: bytes, sample_rate: int = 24000) -> float:
+        """Score audio from bytes (WAV or MP3). Returns overall MOS estimate (1-5)."""
         self._load()
-        audio, sr = sf.read(io.BytesIO(wav_bytes))
-        if sr != _SAMPLE_RATE:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=_SAMPLE_RATE)
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
+        audio, sr = librosa.load(io.BytesIO(audio_bytes), sr=_SAMPLE_RATE, mono=True)
         return self._score_array(audio)
 
     def score_batch(self, audio_paths: list[str | Path]) -> list[float]:

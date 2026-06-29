@@ -5,6 +5,8 @@ For each model x sample: synthesize -> score UTMOS -> score WER -> collect resul
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from loguru import logger
@@ -67,44 +69,64 @@ class EvalRunner:
         output_dir: Path,
         region: str = "us-east-1",
         skip_wer: bool = False,
+        max_workers: int = 10,
     ) -> None:
         self.models = [TTSModelName(m) for m in models]
         self.samples = samples
         self.output_dir = output_dir
         self.skip_wer = skip_wer
+        self._max_workers = max_workers
 
         self._client = SynthesisClient(region=region)
         self._utmos = UTMOSScorer()
         self._wer = WERScorer(region=region) if not skip_wer else None
 
     def run(self) -> list[EvalResult]:
-        """Run full evaluation. Returns list of results."""
+        """Run full evaluation. Returns list of results.
+
+        Samples within each model are evaluated in parallel using a thread pool.
+        Models are processed sequentially to keep logs readable.
+        """
         results: list[EvalResult] = []
         total = len(self.models) * len(self.samples)
         completed = 0
+        lock = threading.Lock()
 
         for model in self.models:
             model_dir = self.output_dir / "samples" / model.value
             model_dir.mkdir(parents=True, exist_ok=True)
 
-            logger.info("Evaluating {} ({} samples)", model.value, len(self.samples))
+            logger.info(
+                "Evaluating {} ({} samples, {} workers)",
+                model.value,
+                len(self.samples),
+                self._max_workers,
+            )
 
-            for sample in self.samples:
-                completed += 1
-                result = self._evaluate_single(model, sample, model_dir)
-                results.append(result)
+            with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+                futures = {
+                    pool.submit(self._evaluate_single, model, sample, model_dir): sample
+                    for sample in self.samples
+                }
+                for future in as_completed(futures):
+                    result = future.result()
+                    results.append(result)
 
-                status = "OK" if not result.error else f"ERR: {result.error}"
-                logger.debug(
-                    "[{}/{}] {} / {} -> UTMOS={} WER={} ({})",
-                    completed,
-                    total,
-                    model.value,
-                    sample.id,
-                    f"{result.utmos:.2f}" if result.utmos else "N/A",
-                    f"{result.wer:.3f}" if result.wer is not None else "N/A",
-                    status,
-                )
+                    with lock:
+                        completed += 1
+                        n = completed
+
+                    status = "OK" if not result.error else f"ERR: {result.error}"
+                    logger.debug(
+                        "[{}/{}] {} / {} -> UTMOS={} WER={} ({})",
+                        n,
+                        total,
+                        model.value,
+                        result.sample_id,
+                        f"{result.utmos:.2f}" if result.utmos else "N/A",
+                        f"{result.wer:.3f}" if result.wer is not None else "N/A",
+                        status,
+                    )
 
         return results
 
@@ -122,8 +144,9 @@ class EvalRunner:
                 error=f"Synthesis failed: {e}",
             )
 
-        wav_path = model_dir / f"{sample.id}.wav"
-        wav_path.write_bytes(synthesis["audio_bytes"])
+        audio_format = synthesis.get("audio_format", "wav")
+        audio_path = model_dir / f"{sample.id}.{audio_format}"
+        audio_path.write_bytes(synthesis["audio_bytes"])
 
         utmos_score = None
         try:
@@ -141,6 +164,7 @@ class EvalRunner:
                     reference_text=sample.text,
                     audio_bytes=synthesis["audio_bytes"],
                     sample_rate=synthesis["sample_rate"],
+                    audio_format=audio_format,
                 )
                 wer_score = float(wer_result["wer"])
                 transcript = str(wer_result["transcript"])
