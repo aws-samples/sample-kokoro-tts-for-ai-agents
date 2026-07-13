@@ -31,6 +31,8 @@ class EvalResult:
         transcript: str | None = None,
         latency_ms: float | None = None,
         audio_duration_s: float | None = None,
+        rtf: float | None = None,
+        ttfab_ms: float | None = None,
         error: str | None = None,
     ) -> None:
         self.model = model
@@ -41,6 +43,8 @@ class EvalResult:
         self.transcript = transcript
         self.latency_ms = latency_ms
         self.audio_duration_s = audio_duration_s
+        self.rtf = rtf
+        self.ttfab_ms = ttfab_ms
         self.error = error
 
     def to_dict(self) -> dict:
@@ -53,6 +57,8 @@ class EvalResult:
             "transcript": self.transcript,
             "latency_ms": self.latency_ms,
             "audio_duration_s": self.audio_duration_s,
+            "rtf": self.rtf,
+            "ttfab_ms": self.ttfab_ms,
         }
         if self.error:
             d["error"] = self.error
@@ -135,7 +141,7 @@ class EvalRunner:
     ) -> EvalResult:
         """Evaluate a single model x sample pair."""
         try:
-            synthesis = self._client.synthesize(model, sample.text)
+            synthesis = self._client.synthesize_stream(model, sample.text)
         except Exception as e:
             return EvalResult(
                 model=model.value,
@@ -147,6 +153,11 @@ class EvalRunner:
         audio_format = synthesis.get("audio_format", "wav")
         audio_path = model_dir / f"{sample.id}.{audio_format}"
         audio_path.write_bytes(synthesis["audio_bytes"])
+
+        latency_ms = synthesis["latency_ms"]
+        duration_s = synthesis["duration_s"]
+        ttfab_ms = synthesis.get("ttfab_ms")
+        rtf = (latency_ms / 1000) / duration_s if duration_s and duration_s > 0 else None
 
         utmos_score = None
         try:
@@ -178,6 +189,8 @@ class EvalRunner:
             utmos=utmos_score,
             wer=wer_score,
             transcript=transcript,
-            latency_ms=synthesis["latency_ms"],
-            audio_duration_s=synthesis["duration_s"],
+            latency_ms=latency_ms,
+            audio_duration_s=duration_s,
+            rtf=rtf,
+            ttfab_ms=ttfab_ms,
         )

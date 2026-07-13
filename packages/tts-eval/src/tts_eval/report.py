@@ -55,6 +55,9 @@ def _build_report_data(
         utmos_scores = [r.utmos for r in successful if r.utmos is not None]
         wer_scores = [r.wer for r in successful if r.wer is not None]
 
+        rtf_values = [r.rtf for r in successful if r.rtf is not None]
+        ttfab_values = [r.ttfab_ms for r in successful if r.ttfab_ms is not None]
+
         per_model[model] = {
             "total_samples": len(model_results),
             "successful": len(successful),
@@ -73,6 +76,16 @@ def _build_report_data(
             },
             "latency_ms": {
                 "mean": _mean([r.latency_ms for r in successful if r.latency_ms]),
+            },
+            "rtf": {
+                "mean": _mean(rtf_values),
+                "min": min(rtf_values) if rtf_values else None,
+                "max": max(rtf_values) if rtf_values else None,
+            },
+            "ttfab_ms": {
+                "mean": _mean(ttfab_values),
+                "p50": _percentile(ttfab_values, 50),
+                "p99": _percentile(ttfab_values, 99),
             },
             "samples": [r.to_dict() for r in model_results],
         }
@@ -160,16 +173,17 @@ def _render_markdown(data: dict) -> str:
             "",
             "## Latency",
             "",
-            "| Model | Mean Latency (ms) | TTFAB P50 (ms) | TTFAB P99 (ms) |",
-            "|-------|-------------------|----------------|----------------|",
+            "| Model | Mean Latency (ms) | RTF | TTFAB P50 (ms) | TTFAB P99 (ms) |",
+            "|-------|-------------------|-----|----------------|----------------|",
         ]
     )
     for model in data["models"]:
         s = data["summary"][model]
         lat = f"{s['latency_ms']['mean']:.0f}" if s["latency_ms"]["mean"] is not None else "N/A"
-        ttfab_p50 = "N/A"
-        ttfab_p99 = "N/A"
-        if "benchmarks" in data and "scalability" in data["benchmarks"]:
+        rtf_val = f"{s['rtf']['mean']:.2f}" if s["rtf"]["mean"] is not None else "N/A"
+        ttfab_p50 = f"{s['ttfab_ms']['p50']:.0f}" if s["ttfab_ms"]["p50"] is not None else "N/A"
+        ttfab_p99 = f"{s['ttfab_ms']['p99']:.0f}" if s["ttfab_ms"]["p99"] is not None else "N/A"
+        if ttfab_p50 == "N/A" and "benchmarks" in data and "scalability" in data["benchmarks"]:
             baseline = [
                 e
                 for e in data["benchmarks"]["scalability"]
@@ -178,7 +192,7 @@ def _render_markdown(data: dict) -> str:
             if baseline:
                 ttfab_p50 = f"{baseline[0]['ttfab_p50_ms']:.0f}"
                 ttfab_p99 = f"{baseline[0]['ttfab_p99_ms']:.0f}"
-        lines.append(f"| {model} | {lat} | {ttfab_p50} | {ttfab_p99} |")
+        lines.append(f"| {model} | {lat} | {rtf_val} | {ttfab_p50} | {ttfab_p99} |")
 
     if "benchmarks" in data:
         bench = data["benchmarks"]
@@ -323,3 +337,16 @@ def _mean(values: list[float]) -> float | None:
     if not values:
         return None
     return round(sum(values) / len(values), 4)
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    s = sorted(values)
+    idx = (pct / 100) * (len(s) - 1)
+    lo = int(idx)
+    hi = lo + 1
+    if hi >= len(s):
+        return s[-1]
+    frac = idx - lo
+    return s[lo] + frac * (s[hi] - s[lo])

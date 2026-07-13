@@ -101,3 +101,46 @@ class TestGenerateReport:
         json_path, md_path = generate_report(results, tmp_path)
         assert json_path.exists()
         assert md_path.exists()
+
+    def test_report_includes_rtf_and_ttfab(self, tmp_path: Path) -> None:
+        results = [
+            EvalResult(
+                model="kokoro-82m",
+                sample_id="s1",
+                text="Hello world",
+                utmos=3.5,
+                wer=0.1,
+                latency_ms=500.0,
+                audio_duration_s=2.0,
+                rtf=0.25,
+                ttfab_ms=120.0,
+            ),
+            EvalResult(
+                model="kokoro-82m",
+                sample_id="s2",
+                text="Test sentence",
+                utmos=3.8,
+                wer=0.0,
+                latency_ms=600.0,
+                audio_duration_s=3.0,
+                rtf=0.20,
+                ttfab_ms=150.0,
+            ),
+        ]
+
+        json_path, md_path = generate_report(results, tmp_path)
+        data = json.loads(json_path.read_text())
+
+        summary = data["summary"]["kokoro-82m"]
+        assert summary["rtf"]["mean"] is not None
+        assert 0.2 <= summary["rtf"]["mean"] <= 0.25
+        assert summary["rtf"]["min"] == 0.20
+        assert summary["rtf"]["max"] == 0.25
+        assert summary["ttfab_ms"]["mean"] is not None
+        assert summary["ttfab_ms"]["p50"] is not None
+        assert summary["ttfab_ms"]["p99"] is not None
+
+        content = md_path.read_text()
+        assert "RTF" in content
+        assert "TTFAB" in content
+        assert "0.2" in content

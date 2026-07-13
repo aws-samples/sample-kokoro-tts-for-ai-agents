@@ -51,3 +51,27 @@ class TestEvalResult:
         assert d["utmos"] == 3.2
         assert d["wer"] is None
         assert d["latency_ms"] == 3000.0
+
+    def test_to_dict_includes_rtf_and_ttfab(self) -> None:
+        result = EvalResult(
+            model="kokoro-82m",
+            sample_id="s1",
+            text="Test",
+            latency_ms=500.0,
+            audio_duration_s=2.0,
+            rtf=0.25,
+            ttfab_ms=120.0,
+        )
+        d = result.to_dict()
+        assert d["rtf"] == 0.25
+        assert d["ttfab_ms"] == 120.0
+
+    def test_to_dict_rtf_and_ttfab_default_none(self) -> None:
+        result = EvalResult(
+            model="kokoro-82m",
+            sample_id="s1",
+            text="Test",
+        )
+        d = result.to_dict()
+        assert d["rtf"] is None
+        assert d["ttfab_ms"] is None

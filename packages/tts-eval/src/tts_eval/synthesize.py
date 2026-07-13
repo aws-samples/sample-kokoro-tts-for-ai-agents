@@ -210,7 +210,11 @@ class SynthesisClient:
             OutputFormat="mp3",
             SampleRate=str(sample_rate),
         )
-        audio_bytes = response["AudioStream"].read()
+        stream = response["AudioStream"]
+        first_chunk = stream.read(1024)
+        ttfab_ms = (time.perf_counter() - t0) * 1000
+        rest = stream.read()
+        audio_bytes = first_chunk + rest
         latency_ms = (time.perf_counter() - t0) * 1000
 
         y, sr_actual = librosa.load(io.BytesIO(audio_bytes), sr=None)
@@ -220,7 +224,7 @@ class SynthesisClient:
             "audio_bytes": audio_bytes,
             "audio_format": "mp3",
             "duration_s": duration,
-            "ttfab_ms": latency_ms,
+            "ttfab_ms": ttfab_ms,
             "latency_ms": latency_ms,
             "chars": len(text),
             "sample_rate": sample_rate,
