@@ -151,8 +151,8 @@ def _render_markdown(data: dict) -> str:
 
     for model in data["models"]:
         s = data["summary"][model]
-        utmos = f"{s['utmos']['mean']:.2f}" if s["utmos"]["mean"] else "N/A"
-        wer_val = f"{s['wer']['mean']:.3f}" if s["wer"]["mean"] else "N/A"
+        utmos = f"{s['utmos']['mean']:.2f}" if s["utmos"]["mean"] is not None else "N/A"
+        wer_val = f"{s['wer']['mean']:.3f}" if s["wer"]["mean"] is not None else "N/A"
         lines.append(f"| {model} | {utmos} | {wer_val} | {s['successful']}/{s['total_samples']} |")
 
     lines.extend(
@@ -166,7 +166,7 @@ def _render_markdown(data: dict) -> str:
     )
     for model in data["models"]:
         s = data["summary"][model]
-        lat = f"{s['latency_ms']['mean']:.0f}" if s["latency_ms"]["mean"] else "N/A"
+        lat = f"{s['latency_ms']['mean']:.0f}" if s["latency_ms"]["mean"] is not None else "N/A"
         ttfab_p50 = "N/A"
         ttfab_p99 = "N/A"
         if "benchmarks" in data and "scalability" in data["benchmarks"]:

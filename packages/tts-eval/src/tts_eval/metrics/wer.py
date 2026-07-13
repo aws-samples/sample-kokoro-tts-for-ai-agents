@@ -7,6 +7,7 @@ Measures intelligibility: how accurately the synthesized speech can be understoo
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -14,6 +15,8 @@ from pathlib import Path
 import boto3
 from jiwer import wer as compute_wer
 from loguru import logger
+
+_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 
 
 class WERScorer:
@@ -51,8 +54,8 @@ class WERScorer:
             raise ValueError("Must provide either audio_path or audio_bytes")
 
         transcript = self._transcribe_audio(audio_bytes, sample_rate, audio_format)
-        reference_normalized = reference_text.strip().lower()
-        transcript_normalized = transcript.strip().lower()
+        reference_normalized = _PUNCT_RE.sub("", reference_text.strip().lower())
+        transcript_normalized = _PUNCT_RE.sub("", transcript.strip().lower())
 
         if not reference_normalized:
             return {"wer": 0.0, "transcript": transcript, "reference": reference_text}

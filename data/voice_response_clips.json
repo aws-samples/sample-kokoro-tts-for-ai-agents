@@ -1,0 +1,516 @@
+{
+  "version": "1.0.0",
+  "description": "Voice Response audio clip scripts - short conversational clips for healthcare voice assistant (immediate fillers and domain-specific responses)",
+  "samples": [
+    {
+      "id": "imm-let-me-check",
+      "text": "Let me check that for you.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Immediate filler - user asking a question that requires looking up information"
+    },
+    {
+      "id": "imm-one-moment",
+      "text": "One moment please.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Immediate filler - brief pause while the system processes any type of request"
+    },
+    {
+      "id": "imm-looking-into-that",
+      "text": "Looking into that now.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Immediate filler - user asked something that requires searching or retrieving data"
+    },
+    {
+      "id": "imm-pulling-that-up",
+      "text": "Let me pull that up.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Immediate filler - user wants to see specific records or details"
+    },
+    {
+      "id": "imm-checking-records",
+      "text": "Checking the records.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Immediate filler - user asking about patient history, charts, or documentation"
+    },
+    {
+      "id": "imm-getting-that-info",
+      "text": "Getting that information for you.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Immediate filler - user asked for specific details or data points"
+    },
+    {
+      "id": "imm-let-me-look",
+      "text": "Let me take a look.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Immediate filler - general acknowledgment for any lookup request"
+    },
+    {
+      "id": "imm-right-away",
+      "text": "Right away.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 1.5],
+      "language": "en",
+      "notes": "Immediate filler - short acknowledgment for straightforward requests"
+    },
+    {
+      "id": "imm-searching-now",
+      "text": "Searching now.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 1.5],
+      "language": "en",
+      "notes": "Immediate filler - user asked to find or locate something specific"
+    },
+    {
+      "id": "imm-give-me-a-sec",
+      "text": "Give me just a second.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Immediate filler - casual acknowledgment for any request"
+    },
+    {
+      "id": "imm-on-it",
+      "text": "On it.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.3, 1.0],
+      "language": "en",
+      "notes": "Immediate filler - very short filler for rapid-fire queries"
+    },
+    {
+      "id": "imm-let-me-find",
+      "text": "Let me find that.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Immediate filler - user looking for a specific record or piece of information"
+    },
+    {
+      "id": "resp-schedule",
+      "text": "Here's your schedule.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Response clip - presenting upcoming appointments or schedule information for a patient"
+    },
+    {
+      "id": "resp-appointment-details",
+      "text": "Here are the appointment details.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - showing details for a specific appointment"
+    },
+    {
+      "id": "resp-open-slots",
+      "text": "Here's what's available.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Response clip - showing open appointment slots or availability"
+    },
+    {
+      "id": "resp-encounters",
+      "text": "Here are the encounters.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's recent encounters or visit history"
+    },
+    {
+      "id": "resp-encounter-details",
+      "text": "Here are the encounter details.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - showing details of a specific encounter on a specific date"
+    },
+    {
+      "id": "resp-visit-reasons",
+      "text": "Here's what was documented.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting reasons for visit, chief complaints, or clinical documentation"
+    },
+    {
+      "id": "resp-notes",
+      "text": "Here are the notes.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Response clip - presenting SOAP notes, clinical notes, or care documentation"
+    },
+    {
+      "id": "resp-care-plan",
+      "text": "Here's the care plan.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting a care plan or referrals from an encounter"
+    },
+    {
+      "id": "resp-encounter-meds",
+      "text": "Here's what was prescribed.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting medications prescribed during a specific encounter"
+    },
+    {
+      "id": "resp-encounter-allergies",
+      "text": "Here are the allergies noted.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting allergies documented during an encounter"
+    },
+    {
+      "id": "resp-telephone-calls",
+      "text": "Here are the call records.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting telephone call records logged for an encounter"
+    },
+    {
+      "id": "resp-current-meds",
+      "text": "Here are the current medications.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's active medication list"
+    },
+    {
+      "id": "resp-med-history",
+      "text": "Here's the medication history.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's past and current medication history"
+    },
+    {
+      "id": "resp-renewals",
+      "text": "Here are the pending renewals.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting pending medication renewal or refill requests"
+    },
+    {
+      "id": "resp-allergies",
+      "text": "Here are the allergies on file.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's documented allergies"
+    },
+    {
+      "id": "resp-med-surg-history",
+      "text": "Here's the medical and surgical history.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's medical and surgical history"
+    },
+    {
+      "id": "resp-history-details",
+      "text": "Here are the history details.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting details of a specific history record"
+    },
+    {
+      "id": "resp-family-history",
+      "text": "Here's the family history.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's family medical history"
+    },
+    {
+      "id": "resp-hpi",
+      "text": "Here's the history of present illness.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting or summarizing a patient's history of present illness"
+    },
+    {
+      "id": "resp-lab-results",
+      "text": "Here are the lab results.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's recent lab results or diagnostic findings"
+    },
+    {
+      "id": "resp-lab-orders",
+      "text": "Here are the lab orders.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting lab orders or the tests included in a lab order"
+    },
+    {
+      "id": "resp-lab-details",
+      "text": "Here are the details.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Response clip - presenting detailed information about a specific lab order"
+    },
+    {
+      "id": "resp-social-history",
+      "text": "Here's the social history.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's social history including lifestyle factors"
+    },
+    {
+      "id": "resp-substance-use",
+      "text": "Here's what's documented for substance use.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting alcohol, tobacco, drug, caffeine, or vaping usage history"
+    },
+    {
+      "id": "resp-social-comments",
+      "text": "Here are the comments.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Response clip - presenting comments or notes from a patient's social history"
+    },
+    {
+      "id": "resp-diet",
+      "text": "Here's the diet information.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting dietary documentation for a patient"
+    },
+    {
+      "id": "resp-employment",
+      "text": "Here's the employment history.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's employment history"
+    },
+    {
+      "id": "resp-vitals",
+      "text": "Here are the vitals.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's most recent vital signs"
+    },
+    {
+      "id": "resp-vitals-details",
+      "text": "Here are the vitals details.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting specific vitals from a particular encounter or vitals record"
+    },
+    {
+      "id": "resp-vitals-concerns",
+      "text": "Here's what's linked.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Response clip - presenting vitals linked to health concerns"
+    },
+    {
+      "id": "resp-problem-list",
+      "text": "Here's the problem list.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's active problem list"
+    },
+    {
+      "id": "resp-procedures",
+      "text": "Here are the procedures.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting procedures a patient has had"
+    },
+    {
+      "id": "resp-procedure-details",
+      "text": "Here are the procedure details.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting details of a specific procedure from an encounter"
+    },
+    {
+      "id": "resp-health-concern",
+      "text": "Here's what's documented.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting documentation for a specific health concern"
+    },
+    {
+      "id": "resp-demographics",
+      "text": "Here are the demographics.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's demographic information"
+    },
+    {
+      "id": "resp-chart",
+      "text": "Here's the chart.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [0.5, 2.0],
+      "language": "en",
+      "notes": "Response clip - presenting a patient's full chart or today's encounter documentation"
+    },
+    {
+      "id": "resp-phone-records",
+      "text": "Here are the telephone records.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 3.0],
+      "language": "en",
+      "notes": "Response clip - presenting telephone call records or communications for a patient"
+    },
+    {
+      "id": "resp-reference-data",
+      "text": "Here's the reference data.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": [],
+      "expected_duration_range_seconds": [1.0, 2.5],
+      "language": "en",
+      "notes": "Response clip - presenting master data, reference codes, event lists, or available resources"
+    },
+    {
+      "id": "override-error",
+      "text": "Sorry, something went wrong. Let me try a different approach.",
+      "category": "short",
+      "style": "conversational",
+      "linguistic_features": ["mixed_punctuation"],
+      "expected_duration_range_seconds": [2.0, 4.0],
+      "language": "en",
+      "notes": "Error override clip - played when a sub-agent invocation fails after an immediate clip was already emitted"
+    }
+  ]
+}
