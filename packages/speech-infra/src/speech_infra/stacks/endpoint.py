@@ -62,10 +62,11 @@ class SpeechEndpointStack(cdk.Stack):
             env_overrides=env_overrides,
         )
 
-        autoscaling = EndpointAutoscaling(
-            self,
-            "Autoscaling",
-            model_config=model_config,
-            endpoint_name=model_config.endpoint_name,
-        )
-        autoscaling.node.add_dependency(endpoint)
+        if model_config.scaling_enabled:
+            autoscaling = EndpointAutoscaling(
+                self,
+                "Autoscaling",
+                model_config=model_config,
+                endpoint_name=model_config.endpoint_name,
+            )
+            autoscaling.node.add_dependency(endpoint)

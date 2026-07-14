@@ -48,6 +48,12 @@ class ModelEndpointConfig(BaseModel):
         return f"Speech-{self.model_name}"
 
     @property
+    def scaling_enabled(self) -> bool:
+        """Whether autoscaling is meaningful for this config."""
+        effective_min = max(self.min_instances, 1)
+        return self.max_instances > effective_min
+
+    @property
     def all_model_ids(self) -> list[str]:
         """All HF model IDs to cache (main model + codecs)."""
         return [self.hf_model_id] + self.codec_model_ids

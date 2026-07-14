@@ -18,7 +18,7 @@ import uuid
 
 from loguru import logger
 
-from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP, POLLY_VOICES, wav_duration
+from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP, POLLY_VOICES
 from tts_inference.types import TTSModelName
 
 SAMPLE_RATE = 24000
@@ -109,11 +109,13 @@ class BidirectionalTTSClient:
             InvokeEndpointWithBidirectionalStreamInput(endpoint_name=endpoint)
         )
 
-        message = json.dumps({
-            "text": text,
-            "voice": voice,
-            "request_id": request_id,
-        })
+        message = json.dumps(
+            {
+                "text": text,
+                "voice": voice,
+                "request_id": request_id,
+            }
+        )
         payload = RequestPayloadPart(bytes_=message.encode("utf-8"))
         event = RequestStreamEventPayloadPart(value=payload)
         await stream.input_stream.send(event)

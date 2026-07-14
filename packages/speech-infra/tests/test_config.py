@@ -54,6 +54,39 @@ class TestModelEndpointConfig:
             "hubertsiuzdak/snac_24khz",
         ]
 
+    def test_scaling_enabled_when_can_scale(self) -> None:
+        cfg = ModelEndpointConfig(
+            model_name="test",
+            hf_model_id="org/test",
+            instance_type="ml.g5.xlarge",
+            container_type=ContainerType.VLLM,
+            min_instances=0,
+            max_instances=4,
+        )
+        assert cfg.scaling_enabled is True
+
+    def test_scaling_disabled_when_max_equals_effective_min(self) -> None:
+        cfg = ModelEndpointConfig(
+            model_name="test",
+            hf_model_id="org/test",
+            instance_type="ml.g5.xlarge",
+            container_type=ContainerType.VLLM,
+            min_instances=0,
+            max_instances=1,
+        )
+        assert cfg.scaling_enabled is False
+
+    def test_scaling_disabled_when_min_equals_max(self) -> None:
+        cfg = ModelEndpointConfig(
+            model_name="test",
+            hf_model_id="org/test",
+            instance_type="ml.g5.xlarge",
+            container_type=ContainerType.VLLM,
+            min_instances=1,
+            max_instances=1,
+        )
+        assert cfg.scaling_enabled is False
+
     def test_frozen_config(self) -> None:
         cfg = TTS_MODEL_CONFIGS["orpheus-3b"]
         with pytest.raises(ValidationError):
@@ -102,3 +135,8 @@ class TestConfigRegistry:
                 assert (
                     cfg.cache_model_weights
                 ), f"{name} has codec_model_ids but cache_model_weights=False"
+
+    def test_tts_single_instance_models_not_scalable(self) -> None:
+        for name, cfg in TTS_MODEL_CONFIGS.items():
+            if cfg.max_instances <= max(cfg.min_instances, 1):
+                assert not cfg.scaling_enabled, f"{name} should have scaling_enabled=False"
