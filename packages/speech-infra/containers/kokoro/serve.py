@@ -119,13 +119,11 @@ def _wav_header_placeholder(sample_rate: int = SAMPLE_RATE) -> bytes:
     )
 
 
-def _synthesize_sentence(text: str, voice: str, speed: float) -> np.ndarray | None:
-    """Synthesize a single sentence via KPipeline (runs in executor)."""
-    pipeline = _load_pipeline()
-    for _, _, audio in pipeline(text, voice=voice, speed=speed):
-        if audio is not None:
-            return audio
-    return None
+def _to_numpy(audio: object) -> np.ndarray:
+    """Convert a KPipeline audio segment (torch.Tensor) to a float32 numpy array."""
+    if hasattr(audio, "detach"):
+        return audio.detach().cpu().numpy()
+    return np.asarray(audio, dtype=np.float32)
 
 
 def _generate_sentences(text: str, voice: str, speed: float) -> list[np.ndarray]:
@@ -134,29 +132,50 @@ def _generate_sentences(text: str, voice: str, speed: float) -> list[np.ndarray]
     results = []
     for _, _, audio in pipeline(text, voice=voice, speed=speed):
         if audio is not None:
-            results.append(audio)
+            results.append(_to_numpy(audio))
     return results
+
+
+def _next_segment(segments: object) -> np.ndarray | None:
+    """Advance the KPipeline generator to the next audio segment (runs in executor).
+
+    Returns the segment as float32 numpy, or None once the generator is exhausted.
+    The passed iterator resumes where it left off, so repeated calls walk the
+    segments one at a time - enabling true incremental streaming.
+    """
+    for _, _, audio in segments:
+        if audio is not None:
+            return _to_numpy(audio)
+    return None
 
 
 async def _stream_sentences_generator(
     text: str, voice: str, speed: float
 ) -> AsyncGenerator[bytes, None]:
-    """Yield WAV header + PCM chunks per sentence as KPipeline produces them."""
+    """Yield WAV header + PCM chunks per KPipeline segment as they are produced.
+
+    The inference lock is held for the whole stream: KPipeline is a single stateful
+    instance, so two interleaved segment generators would corrupt each other. The
+    model is fast enough that serializing whole requests costs nothing meaningful.
+    """
     header_sent = False
     wav_header = _wav_header_placeholder()
 
     loop = asyncio.get_event_loop()
+    pipeline = _load_pipeline()
 
     async with _inference_lock:
-        sentence_audios = await loop.run_in_executor(None, _generate_sentences, text, voice, speed)
-
-    for audio in sentence_audios:
-        pcm = (audio * 32767).astype(np.int16).tobytes()
-        if not header_sent:
-            yield wav_header + pcm
-            header_sent = True
-        else:
-            yield pcm
+        segments = iter(pipeline(text, voice=voice, speed=speed))
+        while True:
+            audio = await loop.run_in_executor(None, _next_segment, segments)
+            if audio is None:
+                break
+            pcm = (audio * 32767).astype(np.int16).tobytes()
+            if not header_sent:
+                yield wav_header + pcm
+                header_sent = True
+            else:
+                yield pcm
 
 
 async def _invocations_sync(text: str, voice: str, speed: float) -> Response:
