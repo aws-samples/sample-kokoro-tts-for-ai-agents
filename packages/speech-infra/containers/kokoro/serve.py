@@ -2,7 +2,7 @@
 
 Provides:
 - GET /ping: health check
-- POST /invocations: synchronous TTS inference
+- POST /invocations: streaming TTS inference (per-sentence chunks)
 - WS /invocations-bidirectional-stream: streaming TTS over WebSocket
 
 Uses the PyTorch `kokoro` package with KPipeline for native CUDA
@@ -26,7 +26,7 @@ import uvicorn
 from kokoro import KPipeline
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -99,19 +99,68 @@ async def ping(request: Request) -> Response:
     return Response(content="OK", status_code=200)
 
 
-async def invocations(request: Request) -> Response:
-    body = json.loads(await request.body())
-    text = body.get("text", "")
-    voice = body.get("voice", DEFAULT_VOICE)
-    speed = body.get("speed", 1.0)
+def _wav_header_placeholder(sample_rate: int = SAMPLE_RATE) -> bytes:
+    """44-byte WAV header with 0xFFFFFFFF data size for streaming."""
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        0xFFFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        1,
+        sample_rate,
+        sample_rate * 2,
+        2,
+        16,
+        b"data",
+        0xFFFFFFFF,
+    )
 
-    request_ts = body.get("request_timestamp")
-    if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
-        return JSONResponse(status_code=408, content={"error": "request_stale"})
 
-    if not text:
-        return JSONResponse(status_code=400, content={"error": "text is required"})
+def _synthesize_sentence(text: str, voice: str, speed: float) -> np.ndarray | None:
+    """Synthesize a single sentence via KPipeline (runs in executor)."""
+    pipeline = _load_pipeline()
+    for _, _, audio in pipeline(text, voice=voice, speed=speed):
+        if audio is not None:
+            return audio
+    return None
 
+
+def _generate_sentences(text: str, voice: str, speed: float) -> list[np.ndarray]:
+    """Generate all sentence audio chunks (runs in executor)."""
+    pipeline = _load_pipeline()
+    results = []
+    for _, _, audio in pipeline(text, voice=voice, speed=speed):
+        if audio is not None:
+            results.append(audio)
+    return results
+
+
+async def _stream_sentences_generator(
+    text: str, voice: str, speed: float
+) -> AsyncGenerator[bytes, None]:
+    """Yield WAV header + PCM chunks per sentence as KPipeline produces them."""
+    header_sent = False
+    wav_header = _wav_header_placeholder()
+
+    loop = asyncio.get_event_loop()
+
+    async with _inference_lock:
+        sentence_audios = await loop.run_in_executor(None, _generate_sentences, text, voice, speed)
+
+    for audio in sentence_audios:
+        pcm = (audio * 32767).astype(np.int16).tobytes()
+        if not header_sent:
+            yield wav_header + pcm
+            header_sent = True
+        else:
+            yield pcm
+
+
+async def _invocations_sync(text: str, voice: str, speed: float) -> Response:
+    """Original synchronous path: full WAV in one response."""
     t0 = time.perf_counter()
 
     async with _inference_lock:
@@ -132,6 +181,30 @@ async def invocations(request: Request) -> Response:
             "X-RTF": f"{elapsed / audio_duration:.3f}" if audio_duration > 0 else "0",
             "X-Characters-Processed": str(len(text)),
         },
+    )
+
+
+async def invocations(request: Request) -> Response:
+    """TTS: accept text, return WAV audio (streaming by default)."""
+    body = json.loads(await request.body())
+    text = body.get("text", "")
+    voice = body.get("voice", DEFAULT_VOICE)
+    speed = body.get("speed", 1.0)
+    use_stream = body.get("stream", True)
+
+    request_ts = body.get("request_timestamp")
+    if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
+        return JSONResponse(status_code=408, content={"error": "request_stale"})
+
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "text is required"})
+
+    if not use_stream:
+        return await _invocations_sync(text, voice, speed)
+
+    return StreamingResponse(
+        _stream_sentences_generator(text, voice, speed),
+        media_type="audio/wav",
     )
 
 
@@ -164,16 +237,20 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
             )
 
             t0 = time.monotonic()
+            loop = asyncio.get_event_loop()
 
             async with _inference_lock:
-                samples = await asyncio.get_event_loop().run_in_executor(
-                    None, _synthesize_full, text, voice, speed
+                sentence_audios = await loop.run_in_executor(
+                    None, _generate_sentences, text, voice, speed
                 )
 
-            pcm = (samples * 32767).astype(np.int16).tobytes()
-            await websocket.send_bytes(pcm)
+            cumulative_duration = 0.0
+            for audio in sentence_audios:
+                pcm = (audio * 32767).astype(np.int16).tobytes()
+                await websocket.send_bytes(pcm)
+                segment_duration = len(audio) / SAMPLE_RATE
+                cumulative_duration += segment_duration
 
-            audio_duration = len(samples) / SAMPLE_RATE
             elapsed = time.monotonic() - t0
 
             await websocket.send_text(
@@ -181,7 +258,7 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
                     {
                         "type": "synthesis_complete",
                         "request_id": request_id,
-                        "total_duration_s": round(audio_duration, 3),
+                        "total_duration_s": round(cumulative_duration, 3),
                         "elapsed_s": round(elapsed, 3),
                     }
                 )

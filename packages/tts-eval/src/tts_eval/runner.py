@@ -76,14 +76,17 @@ class EvalRunner:
         region: str = "us-east-1",
         skip_wer: bool = False,
         max_workers: int = 10,
+        streaming_mode: str = "response-stream",
     ) -> None:
         self.models = [TTSModelName(m) for m in models]
         self.samples = samples
         self.output_dir = output_dir
         self.skip_wer = skip_wer
         self._max_workers = max_workers
+        self._streaming_mode = streaming_mode
 
         self._client = SynthesisClient(region=region)
+        self._region = region
         self._utmos = UTMOSScorer()
         self._wer = WERScorer(region=region) if not skip_wer else None
 
@@ -141,7 +144,16 @@ class EvalRunner:
     ) -> EvalResult:
         """Evaluate a single model x sample pair."""
         try:
-            synthesis = self._client.synthesize_stream(model, sample.text)
+            if self._streaming_mode == "bidirectional" and model not in (
+                TTSModelName.POLLY_STANDARD,
+                TTSModelName.POLLY_NEURAL,
+                TTSModelName.POLLY_GENERATIVE,
+            ):
+                from tts_eval.bidi_client import synthesize_bidirectional
+
+                synthesis = synthesize_bidirectional(model, sample.text, region=self._region)
+            else:
+                synthesis = self._client.synthesize_stream(model, sample.text)
         except Exception as e:
             return EvalResult(
                 model=model.value,

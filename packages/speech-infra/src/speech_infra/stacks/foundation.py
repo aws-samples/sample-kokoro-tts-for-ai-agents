@@ -66,6 +66,7 @@ class SpeechFoundationStack(cdk.Stack):
                 actions=[
                     "sagemaker:InvokeEndpoint",
                     "sagemaker:InvokeEndpointWithResponseStream",
+                    "sagemaker:InvokeEndpointWithBidirectionalStream",
                 ],
                 resources=[
                     cdk.Arn.format(

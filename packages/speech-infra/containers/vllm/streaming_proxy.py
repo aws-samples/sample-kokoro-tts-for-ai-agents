@@ -2,7 +2,7 @@
 
 Provides:
 - GET /ping: health check passthrough
-- POST /invocations: synchronous TTS (backpressure + full audio response)
+- POST /invocations: streaming TTS (backpressure + chunked audio response)
 - WS /invocations-bidirectional-stream: streaming TTS over WebSocket
 
 Monitors vLLM's queue depth for backpressure (503 / WS close 1013).
@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import re
+import struct
 import time
+from collections.abc import AsyncGenerator
 from io import BytesIO
 
 import httpx
@@ -21,7 +23,7 @@ import soundfile as sf
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from tts_orpheus.prompt import STOP_TOKEN_ID, build_prompt, token_ids_to_snac_codes
@@ -143,33 +145,82 @@ async def ping(request: Request) -> Response:
     return Response(content=resp.content, status_code=resp.status_code)
 
 
-async def invocations(request: Request) -> Response:
-    """Synchronous TTS: accept text, return full WAV audio."""
-    should_reject, num_waiting = await _check_backpressure()
-    if should_reject:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "queue_saturated",
-                "queue_depth": int(num_waiting),
-                "max_queue_depth": MAX_QUEUE_DEPTH,
-            },
-            headers={"Retry-After": "5"},
-        )
+def _wav_header_placeholder(sample_rate: int = SAMPLE_RATE) -> bytes:
+    """44-byte WAV header with 0xFFFFFFFF data size for streaming."""
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        0xFFFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        1,
+        sample_rate,
+        sample_rate * 2,
+        2,
+        16,
+        b"data",
+        0xFFFFFFFF,
+    )
 
-    body = json.loads(await request.body())
-    text = body.get("text", "")
-    voice = body.get("voice", "tara")
 
-    request_ts = body.get("request_timestamp")
-    if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
-        return JSONResponse(status_code=408, content={"error": "request_stale"})
+async def _stream_audio_generator(
+    segments: list[str],
+    voice: str,
+    decoder: SnacDecoder,
+) -> AsyncGenerator[bytes, None]:
+    """Yield WAV header + incremental PCM chunks as vLLM generates tokens."""
+    header_sent = False
+    wav_header = _wav_header_placeholder()
 
-    if not text:
-        return JSONResponse(status_code=400, content={"error": "text is required"})
+    for segment_text in segments:
+        prompt = build_prompt(segment_text, voice)
+        vllm_payload = _make_vllm_payload(prompt, stream=True)
+        token_ids: list[int] = []
+        decoded_frames = 0
 
-    segments = _split_text(text)
-    decoder = _get_snac_decoder()
+        async with _client.stream(
+            "POST", "/v1/completions", json=vllm_payload, timeout=60.0
+        ) as resp:
+            if resp.status_code != 200:
+                if not header_sent:
+                    return
+                return
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+
+                chunk = json.loads(data_str)
+                token_text = chunk["choices"][0].get("text", "")
+                if not token_text:
+                    continue
+
+                new_ids = _extract_token_ids(token_text)
+                if not new_ids:
+                    continue
+                token_ids.extend(new_ids)
+
+                audio_codes = token_ids_to_snac_codes(token_ids)
+                while len(audio_codes) - decoded_frames * 7 >= 28:
+                    start = decoded_frames * 7
+                    frame_codes = audio_codes[start : start + 28]
+                    audio_chunk = decoder.decode_frames(frame_codes)
+                    if audio_chunk:
+                        if not header_sent:
+                            yield wav_header + audio_chunk
+                            header_sent = True
+                        else:
+                            yield audio_chunk
+                    decoded_frames += 4
+
+
+async def _invocations_sync(segments: list[str], voice: str, decoder: SnacDecoder) -> Response:
+    """Original synchronous path: full WAV in one response."""
     all_audio_np: list[np.ndarray] = []
 
     for segment_text in segments:
@@ -207,6 +258,44 @@ async def invocations(request: Request) -> Response:
         content=buffer.getvalue(),
         media_type="audio/wav",
         headers={"X-Audio-Duration": str(len(combined) / SAMPLE_RATE)},
+    )
+
+
+async def invocations(request: Request) -> Response:
+    """TTS: accept text, return WAV audio (streaming by default)."""
+    should_reject, num_waiting = await _check_backpressure()
+    if should_reject:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "queue_saturated",
+                "queue_depth": int(num_waiting),
+                "max_queue_depth": MAX_QUEUE_DEPTH,
+            },
+            headers={"Retry-After": "5"},
+        )
+
+    body = json.loads(await request.body())
+    text = body.get("text", "")
+    voice = body.get("voice", "tara")
+    use_stream = body.get("stream", True)
+
+    request_ts = body.get("request_timestamp")
+    if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
+        return JSONResponse(status_code=408, content={"error": "request_stale"})
+
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "text is required"})
+
+    segments = _split_text(text)
+    decoder = _get_snac_decoder()
+
+    if not use_stream:
+        return await _invocations_sync(segments, voice, decoder)
+
+    return StreamingResponse(
+        _stream_audio_generator(segments, voice, decoder),
+        media_type="audio/wav",
     )
 
 

@@ -30,6 +30,8 @@ RUN chmod +x /app/entrypoint.sh
 RUN printf '#!/bin/bash\nexec /app/entrypoint.sh\n' > /usr/local/bin/serve \
     && chmod +x /usr/local/bin/serve
 
+LABEL com.amazonaws.sagemaker.capabilities.bidirectional-streaming=true
+
 EXPOSE 8080
 
 CMD ["/app/entrypoint.sh"]

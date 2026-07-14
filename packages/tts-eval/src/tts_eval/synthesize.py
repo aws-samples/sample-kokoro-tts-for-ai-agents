@@ -233,6 +233,22 @@ class SynthesisClient:
         }
 
 
+def synthesize_bidirectional(
+    model: str | TTSModelName,
+    text: str,
+    voice: str | None = None,
+    region: str = "us-east-1",
+) -> dict:
+    """Bidirectional streaming synthesis via SageMaker HTTP/2.
+
+    Convenience re-export from bidi_client module.
+    Returns same dict shape as SynthesisClient.synthesize_stream().
+    """
+    from tts_eval.bidi_client import synthesize_bidirectional as _bidi
+
+    return _bidi(model, text, voice, region)
+
+
 def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
     """Wrap raw 16-bit mono PCM in a WAV header."""
     data_size = len(pcm_bytes)

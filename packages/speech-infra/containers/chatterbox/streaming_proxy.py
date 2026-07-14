@@ -7,7 +7,7 @@ fits and parallelism provides no benefit.
 
 Provides:
 - GET /ping: health check
-- POST /invocations: synchronous TTS (text + voice_id -> WAV)
+- POST /invocations: streaming TTS (per-sentence chunks)
 - WS /invocations-bidirectional-stream: streaming TTS over WebSocket
 """
 
@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import struct
 import time
 from collections.abc import AsyncGenerator
@@ -27,7 +28,7 @@ import uvicorn
 from chatterbox.tts_turbo import ChatterboxTurboTTS, Conditionals
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -36,6 +37,8 @@ DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "ENG_US_F_KimW")
 MODEL_DIR = os.environ.get("MODEL_DIR", "/app/model")
 MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "51"))
 SAMPLE_RATE = 24000
+
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 
 _logger = logging.getLogger("chatterbox_proxy")
 _model: ChatterboxTurboTTS | None = None
@@ -157,23 +160,55 @@ async def ping(request: Request) -> Response:
     return Response(content="OK", status_code=200)
 
 
-async def invocations(request: Request) -> Response:
-    body = json.loads(await request.body())
-    text = body.get("text", "")
-    voice_id = body.get("voice", DEFAULT_VOICE)
+def _wav_header_placeholder(sample_rate: int = SAMPLE_RATE) -> bytes:
+    """44-byte WAV header with 0xFFFFFFFF data size for streaming."""
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        0xFFFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        1,
+        sample_rate,
+        sample_rate * 2,
+        2,
+        16,
+        b"data",
+        0xFFFFFFFF,
+    )
 
-    request_ts = body.get("request_timestamp")
-    if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
-        return JSONResponse(status_code=408, content={"error": "request_stale"})
 
-    if not text:
-        return JSONResponse(status_code=400, content={"error": "text is required"})
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences for per-sentence streaming."""
+    sentences = _SENTENCE_RE.split(text.strip())
+    return [s for s in sentences if s.strip()]
 
-    try:
-        _resolve_voice(voice_id)
-    except FileNotFoundError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
 
+async def _stream_sentences_generator(text: str, voice_id: str) -> AsyncGenerator[bytes, None]:
+    """Yield WAV header + PCM chunks per sentence."""
+    header_sent = False
+    wav_header = _wav_header_placeholder()
+    sentences = _split_sentences(text)
+    loop = asyncio.get_event_loop()
+
+    for sentence in sentences:
+        async with _inference_lock:
+            wav = await loop.run_in_executor(None, _synthesize, sentence, voice_id)
+
+        audio_np = wav.squeeze().cpu().numpy()
+        pcm = (audio_np * 32767).astype(np.int16).tobytes()
+
+        if not header_sent:
+            yield wav_header + pcm
+            header_sent = True
+        else:
+            yield pcm
+
+
+async def _invocations_sync(text: str, voice_id: str) -> Response:
+    """Original synchronous path: full WAV in one response."""
     t0 = time.perf_counter()
 
     async with _inference_lock:
@@ -192,6 +227,34 @@ async def invocations(request: Request) -> Response:
             "X-RTF": f"{elapsed / audio_duration:.3f}" if audio_duration > 0 else "0",
             "X-Characters-Processed": str(len(text)),
         },
+    )
+
+
+async def invocations(request: Request) -> Response:
+    """TTS: accept text, return WAV audio (streaming by default)."""
+    body = json.loads(await request.body())
+    text = body.get("text", "")
+    voice_id = body.get("voice", DEFAULT_VOICE)
+    use_stream = body.get("stream", True)
+
+    request_ts = body.get("request_timestamp")
+    if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
+        return JSONResponse(status_code=408, content={"error": "request_stale"})
+
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "text is required"})
+
+    try:
+        _resolve_voice(voice_id)
+    except FileNotFoundError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+    if not use_stream:
+        return await _invocations_sync(text, voice_id)
+
+    return StreamingResponse(
+        _stream_sentences_generator(text, voice_id),
+        media_type="audio/wav",
     )
 
 
@@ -231,17 +294,19 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
             )
 
             t0 = time.monotonic()
+            sentences = _split_sentences(text)
+            loop = asyncio.get_event_loop()
+            cumulative_duration = 0.0
 
-            async with _inference_lock:
-                wav = await asyncio.get_event_loop().run_in_executor(
-                    None, _synthesize, text, voice_id
-                )
+            for sentence in sentences:
+                async with _inference_lock:
+                    wav = await loop.run_in_executor(None, _synthesize, sentence, voice_id)
 
-            audio_np = wav.squeeze().cpu().numpy()
-            pcm = (audio_np * 32767).astype(np.int16).tobytes()
-            await websocket.send_bytes(pcm)
+                audio_np = wav.squeeze().cpu().numpy()
+                pcm = (audio_np * 32767).astype(np.int16).tobytes()
+                await websocket.send_bytes(pcm)
+                cumulative_duration += len(audio_np) / SAMPLE_RATE
 
-            audio_duration = len(audio_np) / SAMPLE_RATE
             elapsed = time.monotonic() - t0
 
             await websocket.send_text(
@@ -249,7 +314,7 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
                     {
                         "type": "synthesis_complete",
                         "request_id": request_id,
-                        "total_duration_s": round(audio_duration, 3),
+                        "total_duration_s": round(cumulative_duration, 3),
                         "elapsed_s": round(elapsed, 3),
                     }
                 )

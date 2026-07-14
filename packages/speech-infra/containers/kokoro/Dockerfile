@@ -24,6 +24,8 @@ COPY serve.py .
 RUN printf '#!/bin/bash\nexec python /app/serve.py\n' > /usr/local/bin/serve \
     && chmod +x /usr/local/bin/serve
 
+LABEL com.amazonaws.sagemaker.capabilities.bidirectional-streaming=true
+
 EXPOSE 8080
 
 CMD ["python", "serve.py"]

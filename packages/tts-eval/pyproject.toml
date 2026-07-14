@@ -2,7 +2,7 @@
 name = "tts-eval"
 version = "0.1.0"
 description = "Quality evaluation for TTS models — UTMOS, WER, human panel"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "click>=8.1.0",
     "pydantic>=2.5.0",
@@ -17,6 +17,7 @@ dependencies = [
     "librosa>=0.10.0",
     "soundfile>=0.12.0",
     "boto3>=1.34.0",
+    "aws-sdk-sagemaker-runtime-http2>=0.7.0",
 ]
 
 [project.scripts]
