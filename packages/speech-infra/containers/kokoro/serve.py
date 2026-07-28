@@ -9,9 +9,21 @@ Uses the PyTorch `kokoro` package with KPipeline for native CUDA
 inference on A10G GPU. Single model instance with asyncio.Lock
 serialization — the model is fast enough (0.12s/inference) that
 multi-session adds negligible benefit.
+
+/invocations selects its wire shape from two body fields, both defaulting to
+today's behaviour so existing callers are unaffected:
+- transport: "binary" (raw chunked bytes) | "sse" (text/event-stream)
+- format:    "wav" (raw PCM frames) | "mp3" (48 kbps mono)
+
+SSE exists because audio reaches the browser over an AgentCore relay that
+already multiplexes other agent event types on one stream. SSE is UTF-8 only,
+so audio is base64-encoded (+33%); MP3 keeps that affordable and every prefix
+of an MP3 frame stream is independently decodable, which is what lets the
+client start playing before synthesis finishes.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -20,6 +32,7 @@ import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+import lameenc
 import numpy as np
 import torch
 import uvicorn
@@ -33,6 +46,15 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "56"))
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = "af_heart"
+MP3_BITRATE_KBPS = 48
+MP3_QUALITY = 2
+
+FORMAT_WAV = "wav"
+FORMAT_MP3 = "mp3"
+TRANSPORT_BINARY = "binary"
+TRANSPORT_SSE = "sse"
+
+_MEDIA_TYPES = {FORMAT_WAV: "audio/wav", FORMAT_MP3: "audio/mpeg"}
 
 _logger = logging.getLogger("kokoro_serve")
 
@@ -126,6 +148,50 @@ def _to_numpy(audio: object) -> np.ndarray:
     return np.asarray(audio, dtype=np.float32)
 
 
+def _samples_to_pcm(samples: np.ndarray) -> bytes:
+    return (samples * 32767).astype(np.int16).tobytes()
+
+
+class Mp3StreamEncoder:
+    """Incremental MP3 encoder for one request.
+
+    lameenc is used instead of an ffmpeg subprocess because ffmpeg buffers
+    ~1.5-2.1s of audio before emitting its first byte, which would defeat
+    progressive playback for short replies. This emits after ~0.5s of audio at
+    roughly 3ms per call.
+
+    A single instance is valid for exactly one utterance: lameenc raises
+    "Encoder not initialised" if encode() is called after flush().
+    """
+
+    def __init__(self, sample_rate: int = SAMPLE_RATE) -> None:
+        self._encoder = lameenc.Encoder()
+        self._encoder.set_bit_rate(MP3_BITRATE_KBPS)
+        self._encoder.set_in_sample_rate(sample_rate)
+        self._encoder.set_channels(1)
+        self._encoder.set_quality(MP3_QUALITY)
+        self._encoder.silence()
+        self._closed = False
+
+    def encode(self, samples: np.ndarray) -> bytes:
+        """Encode one segment. Returns b"" when LAME is still filling its frame buffer."""
+        if self._closed:
+            raise RuntimeError("Mp3StreamEncoder already flushed")
+        return bytes(self._encoder.encode(_samples_to_pcm(samples)))
+
+    def flush(self) -> bytes:
+        """Emit LAME's remaining frames.
+
+        This tail carries real audio, not just padding, and for utterances short
+        enough that encode() never returned anything it carries *all* of the
+        audio. Callers must always send it before ending the stream.
+        """
+        if self._closed:
+            return b""
+        self._closed = True
+        return bytes(self._encoder.flush())
+
+
 def _generate_sentences(text: str, voice: str, speed: float) -> list[np.ndarray]:
     """Generate all sentence audio chunks (runs in executor)."""
     pipeline = _load_pipeline()
@@ -150,16 +216,20 @@ def _next_segment(segments: object) -> np.ndarray | None:
 
 
 async def _stream_sentences_generator(
-    text: str, voice: str, speed: float
+    text: str, voice: str, speed: float, audio_format: str = FORMAT_WAV, stats: dict | None = None
 ) -> AsyncGenerator[bytes, None]:
-    """Yield WAV header + PCM chunks per KPipeline segment as they are produced.
+    """Yield encoded audio chunks per KPipeline segment as they are produced.
+
+    For WAV this is a placeholder header followed by raw PCM; for MP3 it is a
+    bare frame stream, so any prefix the client has received is playable.
 
     The inference lock is held for the whole stream: KPipeline is a single stateful
     instance, so two interleaved segment generators would corrupt each other. The
     model is fast enough that serializing whole requests costs nothing meaningful.
     """
     header_sent = False
-    wav_header = _wav_header_placeholder()
+    encoder = Mp3StreamEncoder() if audio_format == FORMAT_MP3 else None
+    sample_count = 0
 
     loop = asyncio.get_event_loop()
     pipeline = _load_pipeline()
@@ -170,16 +240,90 @@ async def _stream_sentences_generator(
             audio = await loop.run_in_executor(None, _next_segment, segments)
             if audio is None:
                 break
-            pcm = (audio * 32767).astype(np.int16).tobytes()
-            if not header_sent:
-                yield wav_header + pcm
-                header_sent = True
+            sample_count += len(audio)
+            if encoder is None:
+                pcm = _samples_to_pcm(audio)
+                if not header_sent:
+                    yield _wav_header_placeholder() + pcm
+                    header_sent = True
+                else:
+                    yield pcm
             else:
-                yield pcm
+                # Empty output is normal: LAME is still filling its frame buffer.
+                chunk = encoder.encode(audio)
+                if chunk:
+                    yield chunk
+
+        if encoder is not None:
+            tail = encoder.flush()
+            if tail:
+                yield tail
+
+    if stats is not None:
+        stats["samples"] = sample_count
 
 
-async def _invocations_sync(text: str, voice: str, speed: float) -> Response:
-    """Original synchronous path: full WAV in one response."""
+def _sse_frame(event: str, payload: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
+
+
+async def _sse_generator(
+    text: str, voice: str, speed: float, audio_format: str, request_id: str
+) -> AsyncGenerator[bytes, None]:
+    """Wrap the audio byte stream in the AgentCore relay's SSE event contract.
+
+    start is emitted before inference begins so the client can build its decoder
+    while the model runs. A failure mid-stream becomes an in-band `error` event:
+    on the raw binary path the same failure just truncates the chunked body and
+    reaches the caller as an opaque ModelStreamError.
+    """
+    yield _sse_frame(
+        "audio_stream_start",
+        {
+            "request_id": request_id,
+            "format": audio_format,
+            "voice": voice,
+            "sample_rate": SAMPLE_RATE,
+        },
+    )
+
+    stats: dict = {}
+    seq = 0
+    try:
+        async for chunk in _stream_sentences_generator(text, voice, speed, audio_format, stats):
+            yield _sse_frame(
+                "audio_chunk",
+                {
+                    "request_id": request_id,
+                    "seq": seq,
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                },
+            )
+            seq += 1
+    except Exception as e:
+        _logger.exception("SSE synthesis failed")
+        yield _sse_frame("error", {"request_id": request_id, "message": str(e)})
+        return
+
+    yield _sse_frame(
+        "audio_stream_end",
+        {
+            "request_id": request_id,
+            "total_chunks": seq,
+            "duration_s": round(stats.get("samples", 0) / SAMPLE_RATE, 3),
+        },
+    )
+
+
+def _samples_to_mp3(samples: np.ndarray) -> bytes:
+    encoder = Mp3StreamEncoder()
+    return encoder.encode(samples) + encoder.flush()
+
+
+async def _invocations_sync(
+    text: str, voice: str, speed: float, audio_format: str = FORMAT_WAV
+) -> Response:
+    """Original synchronous path: complete audio file in one response."""
     t0 = time.perf_counter()
 
     async with _inference_lock:
@@ -187,13 +331,16 @@ async def _invocations_sync(text: str, voice: str, speed: float) -> Response:
             None, _synthesize_full, text, voice, speed
         )
 
-    wav_bytes = _samples_to_wav(samples, SAMPLE_RATE)
+    if audio_format == FORMAT_MP3:
+        content = _samples_to_mp3(samples)
+    else:
+        content = _samples_to_wav(samples, SAMPLE_RATE)
     elapsed = time.perf_counter() - t0
     audio_duration = len(samples) / SAMPLE_RATE
 
     return Response(
-        content=wav_bytes,
-        media_type="audio/wav",
+        content=content,
+        media_type=_MEDIA_TYPES[audio_format],
         headers={
             "X-Audio-Duration": f"{audio_duration:.3f}",
             "X-Inference-Time-Ms": str(int(elapsed * 1000)),
@@ -204,12 +351,14 @@ async def _invocations_sync(text: str, voice: str, speed: float) -> Response:
 
 
 async def invocations(request: Request) -> Response:
-    """TTS: accept text, return WAV audio (streaming by default)."""
+    """TTS: accept text, return audio (chunked WAV by default)."""
     body = json.loads(await request.body())
     text = body.get("text", "")
     voice = body.get("voice", DEFAULT_VOICE)
     speed = body.get("speed", 1.0)
     use_stream = body.get("stream", True)
+    audio_format = body.get("format", FORMAT_WAV)
+    transport = body.get("transport", TRANSPORT_BINARY)
 
     request_ts = body.get("request_timestamp")
     if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
@@ -218,12 +367,31 @@ async def invocations(request: Request) -> Response:
     if not text:
         return JSONResponse(status_code=400, content={"error": "text is required"})
 
+    if audio_format not in _MEDIA_TYPES:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"format must be one of {sorted(_MEDIA_TYPES)}"},
+        )
+
+    if transport not in (TRANSPORT_BINARY, TRANSPORT_SSE):
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"transport must be '{TRANSPORT_BINARY}' or '{TRANSPORT_SSE}'"},
+        )
+
+    if transport == TRANSPORT_SSE:
+        return StreamingResponse(
+            _sse_generator(text, voice, speed, audio_format, body.get("request_id", "unknown")),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     if not use_stream:
-        return await _invocations_sync(text, voice, speed)
+        return await _invocations_sync(text, voice, speed, audio_format)
 
     return StreamingResponse(
-        _stream_sentences_generator(text, voice, speed),
-        media_type="audio/wav",
+        _stream_sentences_generator(text, voice, speed, audio_format),
+        media_type=_MEDIA_TYPES[audio_format],
     )
 
 
