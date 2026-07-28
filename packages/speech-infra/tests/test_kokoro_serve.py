@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+
 def _find_serve_py() -> Path | None:
     """Locate the kokoro serve.py in the repo layout or the container layout."""
     candidates = [
@@ -64,9 +65,7 @@ def serve_module():
     kokoro_mod.KPipeline = _FakePipeline
     sys.modules["kokoro"] = kokoro_mod
 
-    spec = importlib.util.spec_from_file_location(
-        "kokoro_serve_under_test", _SERVE_PY
-    )
+    spec = importlib.util.spec_from_file_location("kokoro_serve_under_test", _SERVE_PY)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     try:
