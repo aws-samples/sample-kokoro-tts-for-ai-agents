@@ -2,7 +2,7 @@
 
 Provides:
 - GET /ping: health check
-- POST /invocations: streaming TTS inference (per-sentence chunks)
+- POST /invocations: streaming TTS inference (per KPipeline segment)
 - WS /invocations-bidirectional-stream: streaming TTS over WebSocket
 
 Uses the PyTorch `kokoro` package with KPipeline for native CUDA
@@ -223,6 +223,14 @@ async def _stream_sentences_generator(
     For WAV this is a placeholder header followed by raw PCM; for MP3 it is a
     bare frame stream, so any prefix the client has received is playable.
 
+    Segment size is KPipeline's, not ours: no split_pattern is passed, so its
+    default r"\\n+" applies and ". "-separated prose arrives as ONE segment. A
+    measured 7-sentence paragraph produced first audio at 503ms in 3 segments;
+    the same sentences newline-separated gave 143ms in 8. Passing a
+    sentence-aware split_pattern would cut first-audio latency ~70% at +3%
+    duration from inter-sentence pauses and no WER change, but it moves the
+    default path the eval harness measures, so it is deliberately not done here.
+
     The inference lock is held for the whole stream: KPipeline is a single stateful
     instance, so two interleaved segment generators would corrupt each other. The
     model is fast enough that serializing whole requests costs nothing meaningful.
@@ -276,6 +284,11 @@ async def _sse_generator(
     while the model runs. A failure mid-stream becomes an in-band `error` event:
     on the raw binary path the same failure just truncates the chunked body and
     reaches the caller as an opaque ModelStreamError.
+
+    Consumers must buffer and split on a blank line rather than parsing each
+    delivery unit as one event. SageMaker fragments the body on its own
+    boundaries: a measured 4-frame response arrived as 6 PayloadParts with 2 of
+    them ending mid-frame, so per-part json.loads() fails on valid traffic.
     """
     yield _sse_frame(
         "audio_stream_start",
