@@ -6,6 +6,7 @@ back WAV or MP3 audio bytes with timing information.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import struct
@@ -51,6 +52,21 @@ def wav_duration(data: bytes) -> float:
     channels: int = struct.unpack_from("<H", data, 22)[0]
     data_size = len(data) - 44
     return float(data_size / (sr * channels * (bits // 8)))
+
+
+def _parse_sse_frame(frame: bytes) -> tuple[str | None, dict]:
+    """Parse one SSE frame into (event_name, payload).
+
+    Returns (None, {}) for keep-alive comments and blank frames.
+    """
+    name: str | None = None
+    data: dict = {}
+    for line in frame.decode("utf-8").splitlines():
+        if line.startswith("event: "):
+            name = line[len("event: ") :]
+        elif line.startswith("data: "):
+            data = json.loads(line[len("data: ") :])
+    return name, data
 
 
 class SynthesisClient:
@@ -186,6 +202,96 @@ class SynthesisClient:
             else 24000,
             "voice": voice,
             "model": model,
+        }
+
+    def synthesize_sse(
+        self,
+        model: str | TTSModelName,
+        text: str,
+        voice: str | None = None,
+    ) -> dict:
+        """Streaming synthesis over SSE with base64 MP3 chunks.
+
+        This is the transport the AgentCore relay uses, so benchmarking it needs
+        its own method: `synthesize_stream` requests raw chunked WAV and asserts
+        RIFF, which the eval baseline depends on.
+
+        Returns:
+            Dict with keys: audio_bytes (decoded MP3), audio_format, duration_s,
+            ttfab_ms, latency_ms, chars, sample_rate, voice, model, total_chunks.
+        """
+        model = TTSModelName(model)
+        endpoint = ENDPOINT_MAP[model]
+        voice = voice or DEFAULT_VOICES[model]
+
+        payload = json.dumps(
+            {
+                "text": text,
+                "voice": voice,
+                "transport": "sse",
+                "format": "mp3",
+                "request_timestamp": time.time(),
+            }
+        )
+
+        client = self._get_thread_client()
+        t0 = time.perf_counter()
+        resp = client.invoke_endpoint_with_response_stream(
+            EndpointName=endpoint,
+            ContentType="application/json",
+            Body=payload.encode("utf-8"),
+        )
+
+        chunks: list[bytes] = []
+        ttfab_ms: float | None = None
+        sample_rate = 24000
+        duration_s = 0.0
+        buffer = b""
+
+        for event in resp["Body"]:
+            if "PayloadPart" not in event:
+                continue
+            buffer += event["PayloadPart"]["Bytes"]
+            # Frames straddle PayloadPart boundaries: a measured 4-frame response
+            # arrived as 6 parts with 2 ending mid-frame. Split on the blank line
+            # and keep the remainder rather than parsing parts individually.
+            while b"\n\n" in buffer:
+                frame, buffer = buffer.split(b"\n\n", 1)
+                name, data = _parse_sse_frame(frame)
+                if name is None:
+                    continue
+                if name == "audio_chunk":
+                    if ttfab_ms is None:
+                        # Stamped here, not on audio_stream_start: that frame is
+                        # emitted before inference begins and would report ~0ms.
+                        ttfab_ms = (time.perf_counter() - t0) * 1000
+                    chunks.append(base64.b64decode(data["data"]))
+                elif name == "audio_stream_start":
+                    sample_rate = data.get("sample_rate", sample_rate)
+                elif name == "audio_stream_end":
+                    duration_s = data.get("duration_s", 0.0)
+                elif name == "error":
+                    raise RuntimeError(
+                        f"{endpoint} SSE synthesis failed: {data.get('message', 'unknown')}"
+                    )
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        audio_bytes = b"".join(chunks)
+
+        if not audio_bytes:
+            logger.warning("No audio chunks in SSE response from {}", endpoint)
+
+        return {
+            "audio_bytes": audio_bytes,
+            "audio_format": "mp3",
+            "duration_s": duration_s,
+            "ttfab_ms": ttfab_ms or latency_ms,
+            "latency_ms": latency_ms,
+            "chars": len(text),
+            "sample_rate": sample_rate,
+            "voice": voice,
+            "model": model,
+            "total_chunks": len(chunks),
         }
 
     def _get_polly_client(self):
