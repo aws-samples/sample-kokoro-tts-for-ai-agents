@@ -41,7 +41,7 @@ from tts_bench.cli import (
     main,
 )
 from tts_bench.fixture import FixtureError
-from tts_bench.types import CMaxReport, KneePoint
+from tts_bench.types import CMaxReport, KneePoint, StepSummary
 from tts_inference.types import TTSModelName
 
 MODEL = "kokoro-82m"
@@ -73,6 +73,29 @@ def _knee(budget: int, concurrency: float, *, bracketed: bool = True) -> KneePoi
         p95_ttfab_ms=budget - 20.0,
         step_index=0,
         bracketed=bracketed,
+    )
+
+
+def _summary_at(
+    *,
+    step_index: int,
+    target_concurrency: float,
+    usable: bool = True,
+    ttfab_p95_ms: float = 100.0,
+) -> StepSummary:
+    """A minimal step, only for the properties that split the two lower-bound notes."""
+    return StepSummary(
+        run_index=0,
+        step_index=step_index,
+        target_concurrency=target_concurrency,
+        offered_rps=target_concurrency / 0.25,
+        achieved_rps=target_concurrency / 0.25,
+        completed=100,
+        ok=100,
+        ttfab_p95_ms=ttfab_p95_ms,
+        saturated=False,
+        settled=True,
+        usable=usable,
     )
 
 
@@ -497,6 +520,28 @@ class TestRendering:
         result, _ = _run(runner, report=report)
         assert "[300]" in result.output
         assert "lower bounds" in result.output
+        assert "Extend --target-concurrency" in result.output
+
+    def test_does_not_advise_a_longer_ladder_when_higher_rates_already_ran(
+        self, runner: CliRunner
+    ) -> None:
+        # The live bidi run: the knee sat at step 1 and steps 2-3 were excluded as
+        # client-limited, so the operator was told to extend a ladder that had
+        # already offered 3x the knee's rate. Extending it measures nothing new.
+        report = _report(
+            c_max_curve={300: 1.63},
+            knees=[_knee(300, 1.63, bracketed=False)],
+            curve_spread={},
+            steps=[
+                _summary_at(step_index=1, target_concurrency=1.63),
+                _summary_at(step_index=2, target_concurrency=2.0, usable=False),
+            ],
+        )
+        result, _ = _run(runner, report=report)
+        assert "lower bounds" in result.output
+        assert "Extend --target-concurrency" not in result.output
+        assert "a longer ladder will not help" in result.output
+        assert "unusable_reason" in result.output
 
     def test_says_nothing_about_lower_bounds_when_every_knee_is_bracketed(
         self, runner: CliRunner

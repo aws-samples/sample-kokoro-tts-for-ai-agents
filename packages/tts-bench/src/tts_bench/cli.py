@@ -405,10 +405,16 @@ def cmax(
     click.echo(
         f"\nS (uncontended): mean {report.s_mean_s * 1000:.0f}ms p95 {report.s_p95_s * 1000:.0f}ms"
     )
-    if report.unbracketed_budgets:
+    if report.exhausted_budgets:
         click.echo(
-            f"NOTE: budgets {report.unbracketed_budgets} still passed at the top of the ladder, "
+            f"NOTE: budgets {report.exhausted_budgets} still passed at the top of the ladder, "
             "so those are lower bounds. Extend --target-concurrency to bracket them."
+        )
+    if report.inconclusive_budgets:
+        click.echo(
+            f"NOTE: budgets {report.inconclusive_budgets} are lower bounds, but higher rates "
+            "*were* offered and produced no usable latency — a longer ladder will not help. "
+            "Check the unusable_reason on the steps above the knee."
         )
     if report.ladder_truncated_at is not None:
         click.echo(

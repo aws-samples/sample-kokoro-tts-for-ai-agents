@@ -66,3 +66,8 @@ scratch/*
 
 # UV lock files for model packages (isolated, not workspace)
 packages/models/*/uv.lock
+
+# Per-request event logs from tts-bench runs. Multi-megabyte and regenerable;
+# the small JSON summary next to them is the artifact worth keeping, since
+# `tts-bench plan --measured` reads that one.
+artifacts/*.jsonl

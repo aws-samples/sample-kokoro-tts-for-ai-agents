@@ -367,6 +367,46 @@ class CMaxReport(BaseModel):
         """Budgets whose knee is only a lower bound, in ascending order."""
         return sorted(k.ttfab_budget_ms for k in self.knees if k.is_lower_bound)
 
+    @property
+    def _top_step_index(self) -> int:
+        """Highest step index the run that produced :attr:`knees` actually reached.
+
+        Scoped to that one run because ``steps`` holds every run and they can
+        truncate at different points: a global maximum would call a knee
+        "inconclusive" on the strength of a step a *different* run ran.
+        """
+        if not self.steps:
+            return -1
+        last_run = max(s.run_index for s in self.steps)
+        return max(s.step_index for s in self.steps if s.run_index == last_run)
+
+    @property
+    def exhausted_budgets(self) -> list[int]:
+        """Unbracketed budgets whose knee sits at the very top of the ladder.
+
+        These are the ones a longer ladder would actually resolve. Split from
+        :attr:`inconclusive_budgets` because the two need opposite responses and
+        a single "extend --target-concurrency" note sent operators to re-run a
+        45-minute ladder in the case where extending it changes nothing.
+        """
+        top = self._top_step_index
+        return sorted(
+            k.ttfab_budget_ms for k in self.knees if k.is_lower_bound and k.step_index >= top
+        )
+
+    @property
+    def inconclusive_budgets(self) -> list[int]:
+        """Unbracketed budgets where higher rates ran but measured nothing usable.
+
+        The ladder did reach past this knee; those steps just produced no p95 to
+        judge — every request failed, or none completed inside the window. A
+        longer ladder cannot help, so the fix is upstream of the rate schedule.
+        """
+        top = self._top_step_index
+        return sorted(
+            k.ttfab_budget_ms for k in self.knees if k.is_lower_bound and k.step_index < top
+        )
+
     def to_measured(
         self,
         *,

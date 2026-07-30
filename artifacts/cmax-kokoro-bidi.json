@@ -1,0 +1,207 @@
+{
+  "model_name": "kokoro-82m",
+  "endpoint": "speech-kokoro-82m",
+  "instance_type": "ml.g5.xlarge",
+  "run_id": "326f4d709bbc",
+  "c_max_curve": {
+    "300": 1.6302521008403361,
+    "500": 1.6302521008403361
+  },
+  "knees": [
+    {
+      "ttfab_budget_ms": 300,
+      "concurrency": 1.6302521008403361,
+      "offered_rps": 10.785450174592983,
+      "p95_ttfab_ms": 275.7749368902294,
+      "step_index": 1,
+      "bracketed": true
+    },
+    {
+      "ttfab_budget_ms": 500,
+      "concurrency": 1.6302521008403361,
+      "offered_rps": 10.785450174592983,
+      "p95_ttfab_ms": 275.7749368902294,
+      "step_index": 1,
+      "bracketed": true
+    }
+  ],
+  "curve_spread": {
+    "300": 0.0,
+    "500": 0.0
+  },
+  "s_mean_s": 0.10986375146305409,
+  "s_p95_s": 0.1741435159929097,
+  "derate": 0.875,
+  "frozen": true,
+  "instance_counts_observed": [
+    1
+  ],
+  "ladder_truncated_at": 3,
+  "transport": "bidi",
+  "runs": 1,
+  "hold_s": 180.0,
+  "measure_window_s": 120.0,
+  "arrival_process": "poisson",
+  "seed": 1234,
+  "steps": [
+    {
+      "run_index": 0,
+      "step_index": 0,
+      "target_concurrency": 0.5,
+      "offered_rps": 5.392725087296491,
+      "achieved_rps": 5.366666666666666,
+      "completed": 644,
+      "ok": 644,
+      "outcome_counts": {
+        "ok": 644
+      },
+      "ttfab_p50_ms": 96.36703901924193,
+      "ttfab_p95_ms": 174.05025905463847,
+      "ttfab_p99_ms": 236.95579929277312,
+      "latency_p95_ms": 174.1435159929097,
+      "s_mean_s": 0.10986375146305409,
+      "s_p95_s": 0.1741435159929097,
+      "concurrency_mean": 0.652542372881356,
+      "concurrency_p95": 2.0,
+      "concurrency_slope_per_s": -0.001362748489974769,
+      "chars_per_hour": 486719.99999999994,
+      "saturated": false,
+      "settled": true,
+      "usable": true,
+      "unusable_reason": null,
+      "dispatch_skipped": 0,
+      "capacity_changed": false,
+      "instance_counts": [
+        1
+      ],
+      "server_concurrency_mean": 4.384615384615385,
+      "server_model_latency_p95_ms": null,
+      "server_5xx_total": 0.0,
+      "gpu_utilization_mean": 9.5,
+      "cpu_utilization_mean": 31.659753870954734,
+      "concurrency_agreement": "server counted more concurrency (4.38) than the client observed (0.65); requests are queueing server-side, which is expected once the in-container queue is admitting"
+    },
+    {
+      "run_index": 0,
+      "step_index": 1,
+      "target_concurrency": 1.0,
+      "offered_rps": 10.785450174592983,
+      "achieved_rps": 10.65,
+      "completed": 1278,
+      "ok": 1278,
+      "outcome_counts": {
+        "ok": 1278
+      },
+      "ttfab_p50_ms": 126.79074634797871,
+      "ttfab_p95_ms": 275.7749368902294,
+      "ttfab_p99_ms": 454.0501786768438,
+      "latency_p95_ms": 275.89732804335637,
+      "s_mean_s": 0.1492130867710573,
+      "s_p95_s": 0.27589732804335637,
+      "concurrency_mean": 1.6302521008403361,
+      "concurrency_p95": 4.099999999999994,
+      "concurrency_slope_per_s": -0.0010011351202301585,
+      "chars_per_hour": 968070.0000000001,
+      "saturated": false,
+      "settled": true,
+      "usable": true,
+      "unusable_reason": null,
+      "dispatch_skipped": 0,
+      "capacity_changed": false,
+      "instance_counts": [
+        1
+      ],
+      "server_concurrency_mean": 7.0,
+      "server_model_latency_p95_ms": null,
+      "server_5xx_total": 0.0,
+      "gpu_utilization_mean": 9.5,
+      "cpu_utilization_mean": 56.05228868394281,
+      "concurrency_agreement": "server counted more concurrency (7.00) than the client observed (1.63); requests are queueing server-side, which is expected once the in-container queue is admitting"
+    },
+    {
+      "run_index": 0,
+      "step_index": 2,
+      "target_concurrency": 2.0,
+      "offered_rps": 21.570900349185965,
+      "achieved_rps": 16.758333333333333,
+      "completed": 2011,
+      "ok": 2006,
+      "outcome_counts": {
+        "ok": 2006,
+        "dispatch_skipped": 616,
+        "error": 5
+      },
+      "ttfab_p50_ms": 1818.8766781240702,
+      "ttfab_p95_ms": 1926.5747203025967,
+      "ttfab_p99_ms": 2004.7878842568027,
+      "latency_p95_ms": 1926.678086980246,
+      "s_mean_s": 1.7931105299803576,
+      "s_p95_s": 1.926678086980246,
+      "concurrency_mean": 30.084033613445378,
+      "concurrency_p95": 32.0,
+      "concurrency_slope_per_s": -0.006572808275813017,
+      "chars_per_hour": 1515900.0,
+      "saturated": true,
+      "settled": true,
+      "usable": false,
+      "unusable_reason": "933/3964 dispatches skipped; the client ran out of workers, so this step measures the benchmark",
+      "dispatch_skipped": 933,
+      "capacity_changed": false,
+      "instance_counts": [
+        1
+      ],
+      "server_concurrency_mean": 33.0,
+      "server_model_latency_p95_ms": null,
+      "server_5xx_total": 0.0,
+      "gpu_utilization_mean": 39.0,
+      "cpu_utilization_mean": 101.10419031767552,
+      "concurrency_agreement": "client and server concurrency agree"
+    },
+    {
+      "run_index": 0,
+      "step_index": 3,
+      "target_concurrency": 3.0,
+      "offered_rps": 32.35635052377894,
+      "achieved_rps": 16.766666666666666,
+      "completed": 2012,
+      "ok": 2009,
+      "outcome_counts": {
+        "ok": 2009,
+        "dispatch_skipped": 1880,
+        "error": 3
+      },
+      "ttfab_p50_ms": 1867.9508469067514,
+      "ttfab_p95_ms": 1937.5812300480902,
+      "ttfab_p99_ms": 2028.8642693310976,
+      "latency_p95_ms": 1937.6990790478885,
+      "s_mean_s": 1.857211486418579,
+      "s_p95_s": 1.9376990790478885,
+      "concurrency_mean": 30.873949579831933,
+      "concurrency_p95": 32.0,
+      "concurrency_slope_per_s": -0.01666437720854849,
+      "chars_per_hour": 1522950.0,
+      "saturated": true,
+      "settled": true,
+      "usable": false,
+      "unusable_reason": "2837/5880 dispatches skipped; the client ran out of workers, so this step measures the benchmark",
+      "dispatch_skipped": 2837,
+      "capacity_changed": false,
+      "instance_counts": [
+        1
+      ],
+      "server_concurrency_mean": 33.0,
+      "server_model_latency_p95_ms": null,
+      "server_5xx_total": 0.0,
+      "gpu_utilization_mean": 18.5,
+      "cpu_utilization_mean": 92.70122823862721,
+      "concurrency_agreement": "client and server concurrency agree"
+    }
+  ],
+  "provenance": {
+    "origin": "measured",
+    "run_id": "326f4d709bbc",
+    "measured_at": "2026-07-30T03:04:28.538524+00:00",
+    "endpoint": "speech-kokoro-82m",
+    "note": "C_max at the p95 TTFAB knee on bidi, autoscaling frozen"
+  }
+}

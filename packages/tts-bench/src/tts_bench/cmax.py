@@ -132,9 +132,20 @@ def rps_for_concurrency(target_concurrency: float, s_mean_s: float) -> float:
 def worker_count(max_target_concurrency: float) -> int:
     """Thread-pool and connection-pool size for the ladder's highest step.
 
-    Sized well above the peak in-flight count so ``dispatch_skipped`` means the
-    *server* backed up rather than that we ran out of threads — the distinction
-    :attr:`loadgen.StepResult.dispatch_skipped` exists to preserve.
+    Sized above the *target* in-flight count, which is only the same as the peak
+    in-flight count while the endpoint is keeping up. Once a step is past
+    capacity, residence time grows without bound and real in-flight concurrency
+    overshoots the target by however much the server is behind — measured at 30
+    against a target of 2 on kokoro's bidi transport, where the inference lock is
+    held for the whole session. No fixed multiple of the target can cover that,
+    because the overshoot is a property of the server's backlog, not of the
+    schedule.
+
+    So this bounds the pool for the steps that can still *be* a knee, and past
+    the knee ``dispatch_skipped`` is expected rather than a defect: the step is
+    marked unusable (:func:`_unusable_reason`) and still brackets the knee from
+    above (:func:`_brackets_from_above`). What must never happen is a *passing*
+    step that was silently client-limited, and that is what the headroom buys.
     """
     return max(2, int((max_target_concurrency + WORKER_HEADROOM) * 2))
 
@@ -274,6 +285,26 @@ def _meets_budget(step: StepSummary, ttfab_budget_ms: int) -> bool:
     )
 
 
+def _brackets_from_above(step: StepSummary, ttfab_budget_ms: int) -> bool:
+    """Whether this step is evidence that the budget is unmeetable above the knee.
+
+    Weaker than "could be the knee" on purpose. A step excluded by
+    :func:`_unusable_reason` cannot *be* a knee, but it can still bound one, and
+    dropping it entirely is what made a ladder that hit the wall report its knee
+    as a lower bound.
+
+    An unusable step is judged on its measured p95 alone. ``saturated`` compares
+    achieved against *offered* rps, and a skipped dispatch lowers achieved
+    without the server ever seeing the request — so a client-limited step reads
+    as saturated even when the endpoint kept up fine. TTFAB percentiles have no
+    such problem: they are computed only over requests that really were
+    dispatched, so a p95 past the budget there is a fact about the endpoint.
+    """
+    if step.usable:
+        return not _meets_budget(step, ttfab_budget_ms)
+    return step.ttfab_p95_ms is not None and step.ttfab_p95_ms > ttfab_budget_ms
+
+
 def find_knee(steps: Sequence[StepSummary], ttfab_budget_ms: int) -> KneePoint | None:
     """Highest usable step meeting a p95 TTFAB budget without saturating.
 
@@ -286,11 +317,8 @@ def find_knee(steps: Sequence[StepSummary], ttfab_budget_ms: int) -> KneePoint |
     Returns:
         The knee, or ``None`` if no usable step met the budget.
     """
-    ordered = sorted(
-        (s for s in steps if s.usable),
-        key=lambda s: (s.target_concurrency, s.offered_rps),
-    )
-    passing = [s for s in ordered if _meets_budget(s, ttfab_budget_ms)]
+    ordered = sorted(steps, key=lambda s: (s.target_concurrency, s.offered_rps))
+    passing = [s for s in ordered if s.usable and _meets_budget(s, ttfab_budget_ms)]
     if not passing:
         return None
 
@@ -298,8 +326,10 @@ def find_knee(steps: Sequence[StepSummary], ttfab_budget_ms: int) -> KneePoint |
     # Bracketed relative to the knee we chose, not to any earlier pass: on a
     # pass/fail/pass ladder, accumulating the flag while walking upward would
     # claim a bracket that actually sits *below* the reported knee.
+    #
+    # Unusable steps bracket but cannot *be* the knee — see _brackets_from_above.
     bracketed = any(
-        s.target_concurrency > best.target_concurrency and not _meets_budget(s, ttfab_budget_ms)
+        s.target_concurrency > best.target_concurrency and _brackets_from_above(s, ttfab_budget_ms)
         for s in ordered
     )
 
@@ -748,11 +778,18 @@ def build_report(
                 derate,
                 curve[budget],
             )
-    if report.unbracketed_budgets:
+    if report.exhausted_budgets:
         logger.warning(
             "Budgets {} were still passing at the top of the ladder, so their knee is a lower "
             "bound. Extend --target-concurrency to bracket them.",
-            report.unbracketed_budgets,
+            report.exhausted_budgets,
+        )
+    if report.inconclusive_budgets:
+        logger.warning(
+            "Budgets {} are lower bounds, but higher rates were offered and produced no usable "
+            "latency, so a longer ladder will not help; see unusable_reason on the steps above "
+            "the knee",
+            report.inconclusive_budgets,
         )
     if not report.trustworthy:
         logger.error(

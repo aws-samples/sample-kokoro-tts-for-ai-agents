@@ -686,7 +686,7 @@ class TestFindKnee:
         assert knee is not None
         assert knee.step_index == 0
 
-    def test_unusable_steps_are_excluded_entirely(self) -> None:
+    def test_unusable_steps_cannot_host_the_knee(self) -> None:
         steps = [
             _summary(step_index=0, target_concurrency=1.0),
             _summary(step_index=1, target_concurrency=8.0, usable=False),
@@ -694,8 +694,62 @@ class TestFindKnee:
         knee = find_knee(steps, 300)
         assert knee is not None
         assert knee.step_index == 0
-        # The unusable step cannot bracket either — it is not evidence of anything.
+        # This unusable step met the budget (100ms), so it is not evidence the
+        # knee was bracketed — see test_an_unusable_step_that_blew_the_budget_brackets
+        # for the case where it is.
         assert not knee.bracketed
+
+    def test_an_unusable_step_that_blew_the_budget_brackets(self) -> None:
+        # The live bidi ladder against speech-kokoro-82m: steps 2 and 3 were
+        # excluded because the client ran out of workers, so the knee at step 1
+        # was reported as a lower bound with "extend --target-concurrency" — on a
+        # ladder that had already offered 3x the knee's rate and watched p95 go
+        # from 276ms to 1927ms. Extending it would have measured nothing new.
+        #
+        # A client-limited step still measures real latency on the requests it
+        # dispatched: TTFAB is timed from dispatch inside `invoke`, and the
+        # dispatcher skips rather than queues, so a full pool cannot inflate it.
+        steps = [
+            _summary(step_index=1, target_concurrency=1.63, ttfab_p95_ms=276.0),
+            _summary(step_index=2, target_concurrency=2.0, ttfab_p95_ms=1927.0, usable=False),
+        ]
+        knee = find_knee(steps, 300)
+        assert knee is not None
+        assert knee.step_index == 1
+        assert knee.bracketed
+        assert not knee.is_lower_bound
+
+    def test_an_unusable_step_with_no_latency_does_not_bracket(self) -> None:
+        # Nothing completed, so there is no p95 to judge and no evidence either
+        # way. Bracketing on "did not pass" alone would silently upgrade a
+        # lower-bound knee into a firm one.
+        steps = [
+            _summary(step_index=0, target_concurrency=1.0),
+            _summary(step_index=1, target_concurrency=8.0, ttfab_p95_ms=None, usable=False),
+        ]
+        knee = find_knee(steps, 300)
+        assert knee is not None
+        assert knee.is_lower_bound
+
+    def test_an_unusable_step_does_not_bracket_on_saturation_alone(self) -> None:
+        # `saturated` compares achieved against *offered* rps, and a skipped
+        # dispatch lowers achieved without the server ever seeing the request —
+        # so a client-limited step reads as saturated even when the endpoint kept
+        # up. Only its measured p95 may be trusted here.
+        steps = [
+            _summary(step_index=0, target_concurrency=1.0),
+            _summary(
+                step_index=1,
+                target_concurrency=8.0,
+                ttfab_p95_ms=90.0,
+                saturated=True,
+                usable=False,
+            ),
+        ]
+        knee = find_knee(steps, 300)
+        assert knee is not None
+        assert knee.step_index == 0
+        assert knee.is_lower_bound
 
     def test_a_step_with_no_ttfab_samples_cannot_pass(self) -> None:
         assert find_knee([_summary(ttfab_p95_ms=None)], 300) is None
@@ -1270,6 +1324,65 @@ class TestBuildReport:
             budgets=(150, 300),
         )
         assert report.unbracketed_budgets == [150, 300]
+
+    def test_a_knee_at_the_top_of_the_ladder_is_exhausted_not_inconclusive(self) -> None:
+        # Extending the ladder is the right advice here: it genuinely ran out
+        # while still passing.
+        report = _build(
+            ladders=[_ladder([_summary(target_concurrency=16.0, ttfab_p95_ms=40.0)])],
+            budgets=(150, 300),
+        )
+        assert report.exhausted_budgets == [150, 300]
+        assert report.inconclusive_budgets == []
+
+    def test_a_knee_below_unusable_higher_steps_is_inconclusive(self) -> None:
+        # Higher rates *were* offered; they just measured nothing judgeable. A
+        # longer ladder cannot help, so the two notes must not be interchangeable.
+        report = _build(
+            ladders=[
+                _ladder(
+                    [
+                        _summary(step_index=0, target_concurrency=1.0, ttfab_p95_ms=40.0),
+                        _summary(
+                            step_index=1,
+                            target_concurrency=8.0,
+                            ttfab_p95_ms=None,
+                            usable=False,
+                        ),
+                    ]
+                )
+            ],
+            budgets=(150,),
+        )
+        assert report.inconclusive_budgets == [150]
+        assert report.exhausted_budgets == []
+
+    def test_the_top_step_is_scoped_to_the_run_that_produced_the_knees(self) -> None:
+        # `steps` holds every run and they can truncate at different points. A
+        # global max would call this knee inconclusive on the strength of a step
+        # that only run 0 ever reached.
+        report = _build(
+            ladders=[
+                _ladder(
+                    [
+                        _summary(step_index=0, target_concurrency=1.0, ttfab_p95_ms=40.0),
+                        _summary(step_index=1, target_concurrency=8.0, ttfab_p95_ms=40.0),
+                    ],
+                    run_index=0,
+                ),
+                _ladder(
+                    [
+                        _summary(
+                            step_index=0, target_concurrency=1.0, ttfab_p95_ms=40.0, run_index=1
+                        )
+                    ],
+                    run_index=1,
+                ),
+            ],
+            budgets=(150,),
+        )
+        assert report.exhausted_budgets == [150]
+        assert report.inconclusive_budgets == []
 
     def test_provenance_is_measured_and_names_the_run(self) -> None:
         report = _build(run_id="deadbeef", measured_at="2026-07-29T12:00:00+00:00")
