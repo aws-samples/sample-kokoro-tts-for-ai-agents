@@ -1041,7 +1041,59 @@ class TestExplainNoScaleOut:
         assert "ml.g5.xlarge for endpoint usage" in message
 
     def test_a_slow_provision_is_told_apart_from_a_refusal(self, appscaling: Any) -> None:
-        # Same visible outcome, opposite fix: wait longer rather than change the account.
+        # The live case: AWS accepted "set desired to 4" and was still pulling images
+        # 24 minutes later. Reporting that as a failure sent the reader after the quota,
+        # which had already been fixed. Opposite fix: wait longer.
+        client, stub = appscaling
+        stub.add_response(
+            "describe_scaling_activities",
+            {
+                "ScalingActivities": [
+                    _activity(
+                        at_s=50,
+                        status="InProgress",
+                        activity_id="live",
+                        description="Setting desired instance count to 4.",
+                        status_message=(
+                            "Successfully set desired instance count to 4. Waiting for "
+                            "change to be fulfilled by sagemaker."
+                        ),
+                    )
+                ]
+            },
+        )
+
+        message = self._explain(client)
+
+        assert "ACCEPTED" in message
+        assert "not refusing" in message
+        assert "--max-wait" in message
+        assert "lower max_capacity" in message
+        # The elapsed figure, so "still provisioning" can be judged against how long.
+        assert "1450s" in message
+        # And emphatically NOT the word that sent the last read astray.
+        assert "failed" not in message.lower()
+
+    def test_a_refusal_wins_over_a_later_retry_in_flight(self, appscaling: Any) -> None:
+        # A window can hold both. The refusal is the more expensive finding, so it leads.
+        client, stub = appscaling
+        stub.add_response(
+            "describe_scaling_activities",
+            {
+                "ScalingActivities": [
+                    _activity(
+                        at_s=10, status="Failed", activity_id="f1", status_message=QUOTA_REFUSAL
+                    ),
+                    _activity(at_s=60, status="InProgress", activity_id="live"),
+                ]
+            },
+        )
+
+        assert "The policy DID act" in self._explain(client)
+
+    def test_an_all_terminal_window_that_still_did_not_arrive(self, appscaling: Any) -> None:
+        # Succeeded, nothing in flight, and yet the count never rose. Nothing to blame,
+        # so it says where to look rather than inventing a cause.
         client, stub = appscaling
         stub.add_response(
             "describe_scaling_activities",
@@ -1050,8 +1102,8 @@ class TestExplainNoScaleOut:
 
         message = self._explain(client)
 
-        assert "none failed" in message
-        assert "--max-wait" in message
+        assert "none failed and none is still in flight" in message
+        assert "describe-scaling-activities" in message
 
     def test_no_activity_at_all_points_at_the_offered_load(self, appscaling: Any) -> None:
         # The policy never decided, so the fault is upstream: too little load, or an

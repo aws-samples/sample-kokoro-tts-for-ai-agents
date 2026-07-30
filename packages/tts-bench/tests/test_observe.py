@@ -693,7 +693,91 @@ class TestScalingActivities:
         assert scaling_activities(client, endpoint=ENDPOINT) == []
 
 
-def _raw_activity(activity_id: str, start: datetime, *, end: datetime | None = None) -> dict:
+class TestActivityStatusIsThreeWay:
+    """``StatusCode`` has six values, so the predicates are not each other's negations.
+
+    A live run read an ``InProgress`` activity — AWS pulling three images — and, treating
+    ``not succeeded`` as failure, reported "1 of 1 scaling activities failed" while
+    quoting *"Successfully set desired instance count to 4"*. Refusal and slow
+    provisioning look identical from the endpoint and have opposite fixes.
+    """
+
+    @pytest.mark.parametrize("status", ["Pending", "InProgress"])
+    def test_in_flight_is_neither_success_nor_failure(self, appscaling, status: str) -> None:
+        client, stub = appscaling
+        raw = _raw_activity("running", T0, status=status)
+        raw.pop("EndTime")
+        stub.add_response("describe_scaling_activities", {"ScalingActivities": [raw]})
+
+        (activity,) = scaling_activities(client, endpoint=ENDPOINT)
+
+        assert activity.in_flight
+        assert not activity.failed
+        assert not activity.succeeded
+
+    @pytest.mark.parametrize("status", ["Failed", "Unfulfilled"])
+    def test_terminal_refusals_are_failures(self, appscaling, status: str) -> None:
+        # Unfulfilled included: AWS accepted the change and then could not deliver it,
+        # which is a capacity problem for the operator either way.
+        client, stub = appscaling
+        stub.add_response(
+            "describe_scaling_activities",
+            {"ScalingActivities": [_raw_activity("refused", T0, status=status)]},
+        )
+
+        (activity,) = scaling_activities(client, endpoint=ENDPOINT)
+
+        assert activity.failed
+        assert not activity.in_flight
+        assert not activity.succeeded
+
+    def test_overridden_is_not_a_failure(self, appscaling) -> None:
+        # A policy revising its own decision. Reporting it as a fault would make normal
+        # target-tracking behaviour look like an error.
+        client, stub = appscaling
+        stub.add_response(
+            "describe_scaling_activities",
+            {"ScalingActivities": [_raw_activity("superseded", T0, status="Overridden")]},
+        )
+
+        (activity,) = scaling_activities(client, endpoint=ENDPOINT)
+
+        assert not activity.failed
+        assert not activity.in_flight
+        assert not activity.succeeded
+
+    def test_every_documented_status_is_classified_at_most_once(self, appscaling) -> None:
+        # Guards against a future status landing in two buckets, or the enum growing a
+        # value that quietly reads as success.
+        from tts_bench.observe import ScalingActivity
+
+        for status in [
+            "Pending",
+            "InProgress",
+            "Successful",
+            "Overridden",
+            "Unfulfilled",
+            "Failed",
+        ]:
+            activity = ScalingActivity(
+                activity_id="a",
+                start_time=T0,
+                end_time=None,
+                status_code=status,
+                description="",
+                cause="",
+            )
+            flags = [activity.succeeded, activity.failed, activity.in_flight]
+            assert sum(flags) <= 1, f"{status} is in {sum(flags)} buckets"
+
+
+def _raw_activity(
+    activity_id: str,
+    start: datetime,
+    *,
+    end: datetime | None = None,
+    status: str = "Successful",
+) -> dict:
     return {
         "ActivityId": activity_id,
         "ServiceNamespace": "sagemaker",
@@ -703,7 +787,7 @@ def _raw_activity(activity_id: str, start: datetime, *, end: datetime | None = N
         "Cause": "monitor alarm triggered a scaling activity",
         "StartTime": start,
         "EndTime": end or start + timedelta(seconds=180),
-        "StatusCode": "Successful",
+        "StatusCode": status,
     }
 
 

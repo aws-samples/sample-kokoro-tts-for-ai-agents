@@ -538,9 +538,24 @@ def alarm_transitions(
     return transitions
 
 
+#: Terminal states in which the capacity change did not happen. ``Overridden`` is
+#: excluded deliberately: a superseded activity is neither a failure nor a success, and
+#: calling it a failure would report a policy revising its own decision as a fault.
+FAILED_ACTIVITY_STATUSES = frozenset({"Failed", "Unfulfilled"})
+
+#: Still being fulfilled. Not success and *not* failure — the distinction the whole
+#: ``ttotal`` diagnosis rests on, since "AWS refused" and "AWS is still working on it"
+#: look identical from the endpoint but have opposite fixes.
+IN_FLIGHT_ACTIVITY_STATUSES = frozenset({"Pending", "InProgress"})
+
+
 @dataclass(frozen=True, slots=True)
 class ScalingActivity:
-    """One Application Auto Scaling activity."""
+    """One Application Auto Scaling activity.
+
+    ``StatusCode`` has six values, so the three predicates below are not each other's
+    negations: ``not succeeded`` is true of an activity that is merely still running.
+    """
 
     activity_id: str
     start_time: datetime
@@ -553,6 +568,16 @@ class ScalingActivity:
     @property
     def succeeded(self) -> bool:
         return self.status_code == "Successful"
+
+    @property
+    def failed(self) -> bool:
+        """The change was refused or could not be fulfilled. Terminal."""
+        return self.status_code in FAILED_ACTIVITY_STATUSES
+
+    @property
+    def in_flight(self) -> bool:
+        """AWS accepted the change and is still applying it."""
+        return self.status_code in IN_FLIGHT_ACTIVITY_STATUSES
 
     @property
     def duration_s(self) -> float | None:

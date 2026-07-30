@@ -963,7 +963,7 @@ def collect_timeline(
         # silently drop the only record of when the change began.
         activity_note = f"{chosen.description} ({chosen.status_code})"
 
-        failed = [a for a in activities if not a.succeeded]
+        failed = [a for a in activities if a.failed]
         if failed:
             # The failure mode is silent from the endpoint's side: it stays InService at
             # its old count while the policy retries. The StatusMessage is the only place
@@ -974,8 +974,15 @@ def collect_timeline(
                 "acted and SageMaker refused; nothing about this is visible on the endpoint, "
                 "which stays InService at its old count."
             )
-            if not succeeded:
-                activity_note += " — no activity succeeded"
+        if not succeeded:
+            # An in-flight activity is neither: AWS took the change and is applying it.
+            # Reporting that as a failure would blame the account for a slow image pull.
+            in_flight = [a for a in activities if a.in_flight]
+            activity_note += (
+                f" — still {in_flight[0].status_code} when read"
+                if in_flight
+                else " — no activity succeeded"
+            )
     elif policy_driven:
         activity_note = "no scaling activity recorded in the window"
         report.notes.append(
@@ -1259,11 +1266,12 @@ def _explain_no_scale_out(
 ) -> str:
     """Why no scale-out happened, distinguishing "never acted" from "was refused".
 
-    The two look identical from the endpoint, which stays ``InService`` at its old count
-    either way. Only ``DescribeScalingActivities`` tells them apart, and a ``Failed``
-    activity's ``StatusMessage`` carries the actual reason — an account quota, a
-    capacity shortage, a bad role. Quoted verbatim rather than classified, because the
-    set of reasons is AWS's to extend.
+    Three outcomes, not two, and they are ordered by how much they cost to fix. The
+    endpoint looks the same in all of them — ``InService`` or ``Updating`` at its old
+    count — but a refusal needs the account changed, an in-flight activity needs only a
+    longer wait, and no activity at all means the policy never decided. A ``Failed``
+    activity's ``StatusMessage`` carries AWS's own reason, quoted rather than classified
+    because the set of reasons is AWS's to extend.
     """
     head = (
         f"{endpoint} did not reach more than {from_instances} instance(s) within "
@@ -1272,18 +1280,30 @@ def _explain_no_scale_out(
     activities = scaling_activities(
         appscaling, endpoint=endpoint, variant=variant, start=window_start, end=window_end
     )
-    failed = [a for a in activities if not a.succeeded]
+    failed = [a for a in activities if a.failed]
     if failed:
         return head + (
             f"The policy DID act — {len(failed)} of {len(activities)} scaling activities "
             f"failed, so this is not a detection problem. AWS gave: "
             f"{failed[0].status_message or failed[0].description}"
         )
+    in_flight = [a for a in activities if a.in_flight]
+    if in_flight:
+        # Not a failure: AWS accepted the change and is still applying it. Pulling a
+        # multi-GB image onto several instances at once routinely outlasts the default
+        # wait, and calling that an error would send the operator after the wrong thing.
+        waited = (window_end - in_flight[0].start_time).total_seconds()
+        return head + (
+            f"The change was ACCEPTED and is still {in_flight[0].status_code} after "
+            f"{waited:.0f}s — AWS is provisioning, not refusing. Retry with a longer "
+            f"--max-wait, or lower max_capacity so fewer instances are pulled at once. "
+            f"AWS gave: {in_flight[0].status_message or in_flight[0].description}"
+        )
     if activities:
         return head + (
-            f"{len(activities)} scaling activities were recorded and none failed, so "
-            "capacity was still being provisioned when the wait elapsed. Retry with a "
-            "longer --max-wait."
+            f"{len(activities)} scaling activities were recorded, none failed and none is "
+            "still in flight, so capacity moved without the endpoint reaching the new "
+            "count. Worth reading `describe-scaling-activities` directly."
         )
     return head + (
         f"No scaling activity was recorded at all, so the policy never acted. Check that "
