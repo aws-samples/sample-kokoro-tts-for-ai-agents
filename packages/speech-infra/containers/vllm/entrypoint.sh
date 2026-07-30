@@ -17,6 +17,24 @@
 set -eo pipefail
 exec > >(tee -a /dev/fd/1) 2>&1
 
+# ─── Startup Stage Markers ────────────────────────────────────────────────────
+# Parsed by `tts-bench ttotal` to attribute scaling lag to a stage. The format is
+# byte-identical across all four containers so one parser reads them all. Exported
+# so streaming_proxy.py can share the origin if it ever grows a lifespan hook.
+export CONTAINER_START_EPOCH="$(date +%s.%N)"
+
+stage() {
+    local now stamp elapsed
+    # One clock reading for both fields: two `date` calls can straddle a second
+    # boundary and emit a timestamp that disagrees with its own elapsed_s.
+    now="$(date +%s.%N)"
+    stamp="$(date -u -d "@${now}" '+%Y-%m-%dT%H:%M:%S.%3NZ')"
+    elapsed="$(awk -v a="$now" -v b="$CONTAINER_START_EPOCH" 'BEGIN{printf "%.3f", a-b}')"
+    echo "=== STAGE $1 t=${stamp} elapsed_s=${elapsed} ==="
+}
+
+stage container_start
+
 # ─── Early Diagnostics ────────────────────────────────────────────────────────
 echo "=== CONTAINER START: $(date -u '+%Y-%m-%dT%H:%M:%SZ') | host=$(hostname) ==="
 echo "--- GPU ---"
@@ -62,6 +80,11 @@ if [ -n "${SNAC_S3_URI:-}" ]; then
     echo "INFO: SNAC download complete. Size: $(du -sh /tmp/snac | cut -f1)"
 fi
 
+# Distinct from `weights_ready`: the bytes are on local disk, not yet in GPU memory.
+# Only the two S3-syncing containers emit this stage; the kokoro images bake their
+# weights into the image, so for them it would always be zero.
+stage weights_fetched
+
 # ─── Build vLLM CLI Args ──────────────────────────────────────────────────────
 # Follows the same SM_VLLM_* -> --arg-name pattern as sagemaker_entrypoint.sh.
 # Key difference: we default to port 8000 (internal), not 8080.
@@ -96,6 +119,9 @@ while IFS='=' read -r key value; do
 done < <(env | grep "^SM_VLLM_")
 
 echo "INFO: Starting vLLM with args: ${ARGS[*]}"
+# Argument assembly is done; everything after this is process startup. The kokoro
+# containers emit this on lifespan entry, which is the same boundary.
+stage framework_init
 
 # ─── Process Supervision ──────────────────────────────────────────────────────
 # Three processes, all critical. If any dies the container exits and SageMaker
@@ -119,6 +145,9 @@ until curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1; do
     sleep 2
 done
 echo "INFO: vLLM healthy on port ${VLLM_PORT}"
+# vLLM has loaded the weights onto the GPU and is accepting requests. The proxy that
+# fronts it is not up yet, so this is not readiness.
+stage weights_ready
 
 # 2. Streaming proxy (port 8080 — SageMaker routes all traffic here)
 #    Handles: GET /ping, POST /invocations, WS /invocations-bidirectional-stream
@@ -135,12 +164,29 @@ until curl -sf http://localhost:8080/ping >/dev/null 2>&1; do
 done
 echo "INFO: Streaming proxy healthy on port 8080"
 
+# One discarded synthesis. /ping answering 200 only proves the proxy is up: the SNAC
+# decoder is lazy-loaded on first use (streaming_proxy.py:_get_snac_decoder), so
+# without this the first real caller after a scale-out pays for decoder init plus
+# CUDA autotune. Driven over HTTP because there is no lifespan hook to hang it on.
+# Non-fatal by design - a container that cannot warm up can still serve, and failing
+# startup here would turn a latency problem into an outage.
+if curl -sf -m 120 -X POST http://localhost:8080/invocations \
+        -H 'Content-Type: application/json' \
+        -d "{\"text\": \"${WARMUP_TEXT:-Warming up.}\", \"stream\": false}" \
+        -o /dev/null 2>&1; then
+    echo "INFO: Warm-up synthesis complete"
+else
+    echo "WARN: Warm-up synthesis failed; serving anyway"
+fi
+stage warmup_done
+
 # 3. AWS Distro for OpenTelemetry (metrics export)
 /opt/aws/aws-otel-collector/bin/aws-otel-collector \
     --config=/opt/aws/aws-otel-collector/etc/config.yaml &
 ADOT_PID=$!
 
 echo "INFO: All processes started"
+stage ready
 
 # wait -n: exit when ANY process dies (all three are critical for production)
 wait -n "$VLLM_PID" "$PROXY_PID" "$ADOT_PID"

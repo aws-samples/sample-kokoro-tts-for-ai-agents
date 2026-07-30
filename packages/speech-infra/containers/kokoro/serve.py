@@ -33,11 +33,40 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "56"))
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = "af_heart"
+WARMUP_TEXT = os.environ.get("WARMUP_TEXT", "Warming up.")
 
 _logger = logging.getLogger("kokoro_serve")
 
 _pipeline: KPipeline | None = None
 _inference_lock: asyncio.Lock | None = None
+
+#: Container start, for `elapsed_s` on the stage markers below. Taken from the
+#: entrypoint via `CONTAINER_START_EPOCH` where one exists; this container is
+#: started directly by `CMD`, so process start is the earliest point observable
+#: from inside. Image pull is bounded externally by the log stream's first event.
+_STAGE_EPOCH = float(os.environ.get("CONTAINER_START_EPOCH") or time.time())
+
+
+def _stage(name: str) -> None:
+    """Emit a startup-stage marker, parsed by `tts-bench ttotal`.
+
+    T_total is the scaling lag the whole capacity plan is most sensitive to, and
+    it is only actionable when attributed to a stage. The format is
+    byte-identical across all four containers so a single parser reads them all;
+    `time.strftime` rather than `datetime.UTC` because this image and
+    chatterbox's are ubuntu22.04-based (Python 3.10, no `datetime.UTC`), and
+    the emitters must not diverge between containers.
+
+    `elapsed_s` runs from container start, so a log stream whose earlier lines
+    aged out is still partially usable.
+    """
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+    print(
+        f"=== STAGE {name} t={stamp}.{int(now % 1 * 1000):03d}Z "
+        f"elapsed_s={now - _STAGE_EPOCH:.3f} ===",
+        flush=True,
+    )
 
 
 def _load_pipeline() -> KPipeline:
@@ -87,11 +116,44 @@ def _samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     return header + pcm
 
 
+def _warmup() -> int:
+    """Run one discarded synthesis so the first real request does not pay for JIT.
+
+    The pipeline being loaded is not the same as it being ready: CUDA kernel
+    autotune happens on first inference, so without this the first caller after a
+    scale-out absorbs it. T_total should measure time-to-serving-*good*-traffic,
+    which makes paying that cost here — before uvicorn accepts connections — the
+    right trade.
+
+    Returns:
+        Samples generated, for the log line. Zero is not fatal: a container that
+        cannot warm up can still serve, and failing startup over it would turn a
+        latency problem into an outage.
+    """
+    samples = _synthesize_full(WARMUP_TEXT, DEFAULT_VOICE, 1.0)
+    return int(samples.size)
+
+
 @asynccontextmanager
 async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     global _inference_lock
     _inference_lock = asyncio.Lock()
+
+    _stage("framework_init")
     _load_pipeline()
+    _stage("weights_ready")
+
+    try:
+        count = _warmup()
+        print(f"[kokoro] Warm-up complete, {count} samples discarded", flush=True)
+    except Exception:
+        # Logged and swallowed: see _warmup. The marker is still emitted so
+        # ttotal's stage sequence stays complete and the warm-up cost is visible
+        # even when the warm-up itself failed.
+        _logger.exception("Warm-up inference failed; serving anyway")
+    _stage("warmup_done")
+
+    _stage("ready")
     yield
 
 

@@ -37,6 +37,7 @@ DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "ENG_US_F_KimW")
 MODEL_DIR = os.environ.get("MODEL_DIR", "/app/model")
 MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "51"))
 SAMPLE_RATE = 24000
+WARMUP_TEXT = os.environ.get("WARMUP_TEXT", "Warming up.")
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 
@@ -44,6 +45,21 @@ _logger = logging.getLogger("chatterbox_proxy")
 _model: ChatterboxTurboTTS | None = None
 _inference_lock: asyncio.Lock | None = None
 _voice_cache: dict[str, Conditionals] = {}
+
+#: See the identical block in ../kokoro/serve.py. `CONTAINER_START_EPOCH` is
+#: exported by entrypoint.sh here, so `elapsed_s` covers the S3 model sync too.
+_STAGE_EPOCH = float(os.environ.get("CONTAINER_START_EPOCH") or time.time())
+
+
+def _stage(name: str) -> None:
+    """Emit a startup-stage marker, parsed by `tts-bench ttotal`."""
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+    print(
+        f"=== STAGE {name} t={stamp}.{int(now % 1 * 1000):03d}Z "
+        f"elapsed_s={now - _STAGE_EPOCH:.3f} ===",
+        flush=True,
+    )
 
 
 def _patch_float64():
@@ -332,14 +348,40 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
             pass
 
 
+def _warmup() -> int:
+    """Run one discarded generation so the first real request does not pay for JIT.
+
+    Voice conditionals are already precomputed at startup, but CUDA kernel autotune
+    for the T3 backbone happens on first `generate`. See ../kokoro/serve.py:_warmup
+    for why a failure here is logged rather than fatal.
+
+    Returns:
+        Samples generated, for the log line.
+    """
+    wav = _synthesize(WARMUP_TEXT, DEFAULT_VOICE)
+    return int(wav.numel())
+
+
 @asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     global _inference_lock
     _inference_lock = asyncio.Lock()
+
+    _stage("framework_init")
     _logger.info("Loading model at startup...")
     model = _load_model()
     _precompute_voices(model)
     _logger.info("Model loaded, %d voices cached", len(_voice_cache))
+    _stage("weights_ready")
+
+    try:
+        count = _warmup()
+        _logger.info("Warm-up complete, %d samples discarded", count)
+    except Exception:
+        _logger.exception("Warm-up inference failed; serving anyway")
+    _stage("warmup_done")
+
+    _stage("ready")
     yield
 
 
