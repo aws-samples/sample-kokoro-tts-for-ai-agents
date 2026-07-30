@@ -8,6 +8,7 @@ import aws_cdk.aws_iam as iam
 from constructs import Construct
 
 from speech_infra.config import ModelEndpointConfig
+from speech_infra.constructs.observability import EndpointObservability
 from speech_infra.constructs.scaling import EndpointAutoscaling
 from speech_infra.constructs.vllm_endpoint import VllmStreamingEndpoint
 
@@ -70,3 +71,14 @@ class SpeechEndpointStack(cdk.Stack):
                 endpoint_name=model_config.endpoint_name,
             )
             autoscaling.node.add_dependency(endpoint)
+
+            # Gated on the same condition as scaling, not added unconditionally: the
+            # alarms are all about whether scaling is keeping up, and the dashboard
+            # annotates C_target, which a non-scaling model does not have.
+            observability = EndpointObservability(
+                self,
+                "Observability",
+                model_config=model_config,
+                endpoint_name=model_config.endpoint_name,
+            )
+            observability.node.add_dependency(endpoint)

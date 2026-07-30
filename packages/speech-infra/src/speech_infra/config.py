@@ -30,9 +30,45 @@ class ModelEndpointConfig(BaseModel):
     min_instances: int = 1
     max_instances: int = 4
 
-    scaling_metric_namespace: str = "Speech/vLLM"
-    scaling_metric_name: str = "vllm:num_requests_running"
-    scaling_target_value: int = 8
+    #: Metric the scale-in step policy reads. The native SageMaker metric, not a
+    #: container-published one: ``Speech/vLLM`` published nothing, so the policies
+    #: built on it sat in ``INSUFFICIENT_DATA`` and could never fire.
+    scaling_metric_namespace: str = "AWS/SageMaker"
+    scaling_metric_name: str = "ConcurrentRequestsPerModel"
+
+    #: Per-instance concurrency the scale-out policy tracks. A float because
+    #: ``derate x C_max / k`` rarely lands on an integer: kokoro's measured
+    #: C_max of 1.63 at k=2 gives 0.713, which an int cannot express.
+    scaling_target_value: float = 8.0
+
+    #: Concurrency at or below which one instance is removed. Well under
+    #: ``scaling_target_value`` so the two policies do not oscillate around it.
+    scale_in_threshold: float = 0.2
+
+    #: Cooldowns are deliberately asymmetric. Scaling out costs money and is
+    #: reversible; scaling in drops capacity that takes a full T_total to get
+    #: back, so it waits long enough to be sure the load is really gone.
+    scale_out_cooldown_s: int = 30
+    scale_in_cooldown_s: int = 600
+
+    #: Opt-in steep step-out for models that cannot wait for target tracking to
+    #: converge one step at a time. Off until a measurement justifies it.
+    emergency_step_enabled: bool = False
+
+    #: The p95 TTFAB budget ``scaling_target_value`` was derived against. Recorded
+    #: beside the target because a target without its budget is unfalsifiable —
+    #: you cannot tell later which SLO it was meant to hold.
+    ttfab_budget_ms: int = 300
+
+    #: W_max: added queueing wait a request may absorb. Hard-capped well under
+    #: SageMaker's 60s invocation ceiling.
+    max_added_wait_s: float = 2.0
+
+    #: Q_max per instance = Lambda_cap x W_max. Consumed by the container
+    #: admission queue; 0 means unbounded, i.e. not yet planned for this model.
+    queue_max_depth: int = 0
+
+    container_startup_health_check_timeout_s: int = 600
 
     cache_model_weights: bool = False
 
@@ -92,15 +128,32 @@ STT_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
 }
 
 TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
+    # The one model with a measured C_max, so the one model configured to scale.
+    # From artifacts/cmax-kokoro-bidi.json (bidi transport, frozen, 1 instance):
+    # C_max 1.63 concurrent at p95 TTFAB 276ms, S mean 110ms, so Lambda_cap 14.82 rps.
+    # At the chosen k=2: C_target = 0.875 x 1.63 / 2 = 0.713, or 44% utilization.
+    #
+    # C_target below 1 is not a mistake. Kokoro holds its inference lock for a whole
+    # bidi session, so an instance serves about one stream and one sustained request
+    # is enough to scale out. For this model max_instances, not the target, is the
+    # lever that sizes the fleet.
     "kokoro-82m": ModelEndpointConfig(
         model_name="kokoro-82m",
         hf_model_id="hexgrad/Kokoro-82M",
         instance_type="ml.g5.xlarge",
         container_type=ContainerType.PYTORCH_CUSTOM,
         streaming_mode=StreamingMode.BIDIRECTIONAL,
-        min_instances=0,
-        max_instances=1,
-        scaling_target_value=4,
+        # min=1 rather than 0 because SageMaker real-time variants cannot scale to
+        # zero; max(min_instances, 1) already coerced it, so 1 is what deploys.
+        min_instances=1,
+        # Placeholder: enough to observe a real scale-out, which `tts-bench ttotal`
+        # needs. Size it properly once `tts-bench plan` runs against a stated peak.
+        max_instances=4,
+        scaling_target_value=0.713,
+        scale_in_threshold=0.2,
+        ttfab_budget_ms=300,
+        max_added_wait_s=20.0,
+        queue_max_depth=296,
     ),
     "kokoro-82m-cpu": ModelEndpointConfig(
         model_name="kokoro-82m-cpu",
@@ -112,12 +165,18 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         max_instances=1,
         scaling_target_value=4,
     ),
+    # min/max stated explicitly rather than inherited. Taking the class defaults
+    # (1-4) made `scaling_enabled` true for a model with no endpoint and no stack,
+    # which is the whole reason `tts-bench drift` reported a missing_target for it.
+    # No model gets scaling until its own C_max is measured.
     "maya-veena": ModelEndpointConfig(
         model_name="maya-veena",
         hf_model_id="maya-research/veena-tts",
         instance_type="ml.g5.xlarge",
         container_type=ContainerType.VLLM,
         streaming_mode=StreamingMode.BIDIRECTIONAL,
+        min_instances=1,
+        max_instances=1,
         cache_model_weights=True,
         codec_model_ids=["hubertsiuzdak/snac_24khz"],
         container_env={

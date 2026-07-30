@@ -139,15 +139,26 @@ class TestExpectedScaling:
         assert len(_expected_scaling()) == len(TTS_MODEL_CONFIGS)
 
     def test_carries_the_scaling_enabled_gate(self) -> None:
-        # kokoro is pinned min=0/max=1, so CDK synthesizes no policy for it —
-        # which is exactly what makes a live policy on it an orphan.
-        assert not _expected_scaling()["speech-kokoro-82m"].scaling_enabled
+        # A model pinned to one instance gets no synthesized policy, which is
+        # exactly what makes a live policy on it an orphan. Asserted against a
+        # pinned model rather than a named one so it keeps testing the gate as
+        # models gain measured C_max values and start scaling.
+        expected = _expected_scaling()
+        pinned = {name for name, e in expected.items() if e.max_instances <= e.effective_min}
+        assert pinned, "no pinned model left to check the gate against"
+        assert all(not expected[name].scaling_enabled for name in pinned)
+        assert expected["speech-kokoro-82m"].scaling_enabled
 
     def test_coerces_min_zero_the_way_cdk_does(self) -> None:
-        # config.py says min_instances=0; both CDK constructs wrap it in
+        # Several configs say min_instances=0; both CDK constructs wrap it in
         # max(..., 1). Comparing against the raw 0 would report a capacity
-        # mismatch on every endpoint.
-        assert _expected_scaling()["speech-kokoro-82m"].effective_min == 1
+        # mismatch on every one of those endpoints.
+        from speech_infra.config import TTS_MODEL_CONFIGS
+
+        zeroed = [c for c in TTS_MODEL_CONFIGS.values() if c.min_instances == 0]
+        assert zeroed, "no min_instances=0 config left to check coercion against"
+        expected = _expected_scaling()
+        assert all(expected[c.endpoint_name].effective_min == 1 for c in zeroed)
 
 
 class TestDriftCommand:

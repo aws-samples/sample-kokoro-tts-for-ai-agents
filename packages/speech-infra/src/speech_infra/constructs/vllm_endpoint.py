@@ -47,7 +47,9 @@ class VllmStreamingEndpoint(Construct):
                     model_name=self.model.attr_model_name,
                     instance_type=model_config.instance_type,
                     initial_instance_count=max(model_config.min_instances, 1),
-                    container_startup_health_check_timeout_in_seconds=600,
+                    container_startup_health_check_timeout_in_seconds=(
+                        model_config.container_startup_health_check_timeout_s
+                    ),
                     routing_config=sagemaker.CfnEndpointConfig.RoutingConfigProperty(
                         routing_strategy="LEAST_OUTSTANDING_REQUESTS",
                     ),
@@ -61,6 +63,13 @@ class VllmStreamingEndpoint(Construct):
             "Endpoint",
             endpoint_name=endpoint_name,
             endpoint_config_name=self.endpoint_config.attr_endpoint_config_name,
+            # Without this, CloudFormation keeps asserting the variant properties it
+            # synthesized — including initial_instance_count — while autoscaling is
+            # busy changing DesiredInstanceCount. The two fight, and a deploy can
+            # silently scale a busy endpoint back down to its initial count. That
+            # race is why autoscaling was disabled outright in 6997191; retaining
+            # the live values is the actual fix.
+            retain_all_variant_properties=True,
         )
         self.endpoint.add_dependency(self.endpoint_config)
 
