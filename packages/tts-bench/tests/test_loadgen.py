@@ -737,6 +737,119 @@ class TestRunStep:
         assert sum(real_sleeps) == pytest.approx(239.75, abs=0.01)
 
 
+class TestTransportAgnosticism:
+    """``run_step`` must not care which transport it is driving.
+
+    With ``invoke=invoke_bidi`` the client is a ``SageMakerRuntimeHTTP2Client``,
+    which shares no base class with botocore's. The driver never calls a method
+    on it — it only hands it to ``invoke`` — so client and transport stay a
+    matched pair chosen by the caller.
+    """
+
+    def test_the_client_is_passed_through_untouched(self) -> None:
+        # Not merely "an object arrives": the *same* object, unwrapped. A driver
+        # that adapted the client would silently break whichever transport it
+        # was not written for.
+        sentinel = object()
+        seen: list[object] = []
+
+        def spy(client, endpoint, text, voice, *, deadline_ts=None) -> InvokeResult:
+            seen.append(client)
+            now = time.time()
+            return InvokeResult(
+                outcome=InvokeOutcome.OK, dispatch_ts=now, end_ts=now, latency_ms=1.0
+            )
+
+        run_step(
+            client=sentinel,
+            model="m",
+            endpoint="e",
+            voice="v",
+            texts=TEXTS,
+            offered_rps=20.0,
+            duration_s=0.3,
+            max_workers=4,
+            arrival=ArrivalProcess.FIXED,
+            monitor_interval_s=0.05,
+            invoke=spy,
+        )
+        assert seen
+        assert all(c is sentinel for c in seen)
+
+    def test_a_non_botocore_client_is_accepted(self) -> None:
+        # The bidi client's type is the point: run_step's annotation was widened
+        # to Any precisely so this is not a type error waiting to surprise a
+        # ladder 40 minutes in.
+        class NotABaseClient:
+            """Has none of botocore's interface."""
+
+        result = run_step(
+            client=NotABaseClient(),
+            model="m",
+            endpoint="e",
+            voice="v",
+            texts=TEXTS,
+            offered_rps=20.0,
+            duration_s=0.3,
+            max_workers=4,
+            arrival=ArrivalProcess.FIXED,
+            monitor_interval_s=0.05,
+            invoke=lambda client, endpoint, text, voice, *, deadline_ts=None: InvokeResult(
+                outcome=InvokeOutcome.OK,
+                dispatch_ts=time.time(),
+                end_ts=time.time(),
+                latency_ms=1.0,
+                audio_duration_s=0.1,
+            ),
+        )
+        assert result.events
+        assert all(e.outcome == InvokeOutcome.OK.value for e in result.events)
+
+    def test_drives_the_real_bidi_transport_end_to_end(self) -> None:
+        # The bidi transport wraps each session in asyncio.run inside its worker
+        # thread. run_step dispatches into a ThreadPoolExecutor, so this is the
+        # test that the two actually compose — a shared or missing event loop
+        # fails here rather than mid-ladder.
+        from tests.test_bidi import PCM_100MS, FakeBidiClient, FakeStream, _payload_event
+        from tts_bench.bidi import invoke_bidi
+
+        class PerRequestClient:
+            """A fresh scripted session per request, as a real endpoint gives."""
+
+            def __init__(self) -> None:
+                self.sessions = 0
+                self._lock = threading.Lock()
+
+            async def invoke_endpoint_with_bidirectional_stream(self, input_):
+                with self._lock:
+                    self.sessions += 1
+                delegate = FakeBidiClient(FakeStream([_payload_event(PCM_100MS)]))
+                return await delegate.invoke_endpoint_with_bidirectional_stream(input_)
+
+        client = PerRequestClient()
+        result = run_step(
+            client=client,
+            model="kokoro-82m",
+            endpoint="speech-kokoro-82m",
+            voice="af_heart",
+            texts=TEXTS,
+            offered_rps=20.0,
+            duration_s=0.3,
+            max_workers=4,
+            arrival=ArrivalProcess.FIXED,
+            monitor_interval_s=0.05,
+            invoke=invoke_bidi,
+        )
+
+        completed = [e for e in result.events if e.end_ts is not None]
+        assert completed
+        assert all(e.outcome == InvokeOutcome.OK.value for e in completed)
+        # The accounting the ladder reads is populated on this transport too.
+        assert all(e.audio_duration_s > 0 for e in completed)
+        assert all(e.ttfab_ms is not None for e in completed)
+        assert client.sessions == len(completed)
+
+
 class TestSummarizeWindow:
     def test_achieved_rps_counts_completions_in_the_window(self) -> None:
         events = [_event(seq=i, end_ts=float(i)) for i in range(10)]

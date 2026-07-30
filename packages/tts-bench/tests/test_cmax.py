@@ -36,6 +36,7 @@ import pytest
 from loguru import logger
 
 from tts_bench import cmax
+from tts_bench.bidi import Transport, invoke_bidi
 from tts_bench.cmax import (
     SPREAD_WARN_THRESHOLD,
     CMaxError,
@@ -56,7 +57,7 @@ from tts_bench.cmax import (
     worker_count,
 )
 from tts_bench.fixture import SCALABLE_DIMENSION, SERVICE_NAMESPACE, FixtureError
-from tts_bench.invoke import InvokeOutcome, InvokeResult
+from tts_bench.invoke import InvokeOutcome, InvokeResult, invoke_stream
 from tts_bench.loadgen import (
     SYSTEM_CLOCK,
     Clock,
@@ -985,7 +986,11 @@ class TestRunLadderAgainstAFakeServer:
             settle_between_steps_s=0.0,
             arrival="fixed",
             seed=7,
-            step_runner=functools.partial(run_step, invoke=server, monitor_interval_s=0.05),
+            # ``invoke`` goes through run_ladder's own parameter rather than the
+            # partial: the ladder forwards the transport to every step, and
+            # binding it here would hide a break in that forwarding.
+            invoke=server,
+            step_runner=functools.partial(run_step, monitor_interval_s=0.05),
         )
 
         assert len(ladder.steps) == 1
@@ -1379,6 +1384,24 @@ def _patch_load(monkeypatch, *, ladder: LadderRun | None = None) -> list[dict]:
     return recorded
 
 
+def _patch_ladder_only(monkeypatch) -> list[dict]:
+    """Replace only the ladder, leaving the caller's own probe patch in place."""
+    recorded: list[dict] = []
+
+    def fake_run_ladder(client, **kwargs) -> LadderRun:
+        recorded.append(kwargs)
+        return _ladder(
+            [
+                _summary(step_index=0, target_concurrency=1.0, ttfab_p95_ms=80.0),
+                _summary(step_index=1, target_concurrency=2.0, ttfab_p95_ms=280.0),
+            ],
+            run_index=kwargs["run_index"],
+        )
+
+    monkeypatch.setattr(cmax, "run_ladder", fake_run_ladder)
+    return recorded
+
+
 def _measure(**kwargs) -> CMaxReport:
     defaults = {
         "model": MODEL,
@@ -1540,3 +1563,119 @@ class TestJoinWithTTotal:
         assert restored.c_max_curve == report.c_max_curve
         assert all(isinstance(k, int) for k in restored.c_max_curve)
         assert restored.model_name is TTSModelName.KOKORO_82M
+
+
+# --------------------------------------------------------------------------- #
+# Transport
+# --------------------------------------------------------------------------- #
+
+
+class TestTransportIsRecorded:
+    """A ``C_max`` without its transport is not interpretable.
+
+    The containers hold their inference lock differently per protocol — kokoro
+    holds it across an entire bidi session but per-generator on response-stream —
+    so the number does not transfer. The transport therefore has to survive all
+    the way into the artifact and then into the planner input.
+    """
+
+    def test_defaults_to_response_stream(self) -> None:
+        # Every C_max measured before the bidi transport existed came from this
+        # path, so the default has to name it rather than be blank.
+        assert _build().transport == "response-stream"
+
+    def test_records_the_transport_it_was_given(self) -> None:
+        assert _build(transport=Transport.BIDI).transport == "bidi"
+
+    def test_accepts_the_raw_cli_string(self) -> None:
+        # The CLI hands its --transport value straight through.
+        assert _build(transport="bidi").transport == "bidi"
+
+    def test_the_provenance_note_names_the_transport(self) -> None:
+        # The note is what a reader sees first; a C_max attributed to the wrong
+        # protocol would size a fleet for traffic it cannot serve.
+        assert "bidi" in (_build(transport="bidi").provenance.note or "")
+
+    def test_the_transport_survives_a_run_without_the_freeze(self) -> None:
+        # Both caveats have to coexist: the note carries the freeze warning and
+        # still has to say which protocol produced the number.
+        note = _build(transport="bidi", frozen=False).provenance.note or ""
+        assert "bidi" in note
+        assert "WITHOUT the autoscaling freeze" in note
+
+    def test_the_transport_survives_the_join_into_measured(self) -> None:
+        # to_measured is where a C_max becomes a planner input; losing the
+        # transport there means the plan configures a fleet from a capacity
+        # number measured on a protocol production does not use.
+        joined = _build(transport="bidi").to_measured(t_total_s=180.0)
+        assert joined.transport == "bidi"
+
+    def test_the_transport_round_trips_through_json(self) -> None:
+        report = _build(transport="bidi")
+        restored = CMaxReport.model_validate_json(report.model_dump_json())
+        assert restored.transport == "bidi"
+
+
+class TestMeasureUsesOneTransport:
+    def test_the_probe_and_the_ladder_share_the_transport(self, monkeypatch) -> None:
+        # S is what converts every concurrency target into a rate, so probing on
+        # one protocol and laddering on another misprices every step.
+        probes: list[dict] = []
+        monkeypatch.setattr(
+            cmax,
+            "probe_service_time",
+            lambda *a, **k: probes.append(k) or _probe(),
+        )
+        recorded = _patch_ladder_only(monkeypatch)
+
+        _measure(
+            transport="bidi",
+            runtime_client=object(),
+            appscaling=FakeAppScaling(),
+            sagemaker=FakeSageMaker(),
+        )
+
+        assert probes[0]["invoke"] is invoke_bidi
+        assert all(k["invoke"] is invoke_bidi for k in recorded)
+
+    def test_response_stream_stays_the_default(self, monkeypatch) -> None:
+        recorded = _patch_load(monkeypatch)
+        report = _measure(appscaling=FakeAppScaling(), sagemaker=FakeSageMaker())
+        assert report.transport == "response-stream"
+        assert all(k["invoke"] is invoke_stream for k in recorded)
+
+    def test_the_transport_reaches_the_artifact(self, monkeypatch) -> None:
+        _patch_load(monkeypatch)
+        report = _measure(
+            transport="bidi",
+            runtime_client=object(),
+            appscaling=FakeAppScaling(),
+            sagemaker=FakeSageMaker(),
+        )
+        assert report.transport == "bidi"
+
+    def test_an_unknown_transport_is_refused_before_any_load(self) -> None:
+        client = _NoInvocations()
+        with pytest.raises(ValueError):
+            _measure(transport="grpc", runtime_client=client)
+        assert client.calls == 0
+
+    def test_builds_the_matching_client_when_none_is_supplied(self, monkeypatch) -> None:
+        # measure() owns client construction, and the client and the invoke
+        # function have to be a matched pair: a boto3 client handed to
+        # invoke_bidi fails on the first request of every step.
+        built: list[tuple] = []
+        monkeypatch.setattr(
+            cmax,
+            "make_client_for",
+            lambda transport, region, **kw: built.append((transport, region, kw)) or object(),
+        )
+        _patch_load(monkeypatch)
+
+        _measure(
+            transport="bidi",
+            runtime_client=None,
+            appscaling=FakeAppScaling(),
+            sagemaker=FakeSageMaker(),
+        )
+        assert built[0][0] is Transport.BIDI

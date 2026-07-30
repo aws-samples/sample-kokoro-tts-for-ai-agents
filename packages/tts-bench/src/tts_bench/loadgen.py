@@ -519,7 +519,11 @@ def build_text_pool(
 
 
 def run_step(
-    client: BaseClient,
+    # Not `BaseClient`: with `invoke=invoke_bidi` this is a
+    # `SageMakerRuntimeHTTP2Client`, which shares no base class with botocore's.
+    # The driver never calls a method on it — it only hands it to `invoke` — so
+    # the transport and its client stay a matched pair chosen by the caller.
+    client: Any,
     *,
     model: str,
     endpoint: str,
@@ -554,7 +558,11 @@ def run_step(
             experiences, and it means dispatch delay eats into the budget
             instead of being hidden.
         instance_count_fetch: Optional reader for the mid-run capacity tripwire.
-        invoke: Injected for tests; defaults to :func:`invoke_stream`.
+        invoke: The transport. :func:`invoke_stream` or
+            :func:`tts_bench.bidi.invoke_bidi` — see
+            :func:`tts_bench.bidi.invoke_for` — and injected by tests. ``client``
+            is passed through untouched, so each transport receives the client
+            type it built.
 
     Returns:
         A :class:`StepResult` with exactly one event per scheduled arrival.

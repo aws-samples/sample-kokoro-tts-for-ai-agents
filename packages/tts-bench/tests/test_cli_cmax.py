@@ -380,6 +380,36 @@ class TestOptionsReachMeasure:
         assert calls[0]["event_sink"] is None
 
 
+class TestTransportFlag:
+    def test_defaults_to_response_stream(self, runner: CliRunner) -> None:
+        # Every C_max measured so far came from this path; changing the default
+        # would silently make new runs incomparable with the existing artifacts.
+        _, calls = _run(runner)
+        assert calls[0]["transport"] == "response-stream"
+
+    def test_bidi_reaches_measure(self, runner: CliRunner) -> None:
+        _, calls = _run(runner, "--transport", "bidi")
+        assert calls[0]["transport"] == "bidi"
+
+    def test_an_unknown_transport_is_rejected_before_any_load(self, runner: CliRunner) -> None:
+        result, calls = _run(runner, "--transport", "websocket")
+        assert result.exit_code == 2
+        assert calls == []
+
+    def test_the_choices_match_the_transport_enum(self) -> None:
+        # The flag hands its raw string to Transport(); a member added to the
+        # enum without the flag would be unreachable from the CLI.
+        from tts_bench.bidi import Transport
+
+        assert set(_param("transport").type.choices) == {t.value for t in Transport}
+
+    def test_the_pre_run_echo_names_the_transport(self, runner: CliRunner) -> None:
+        # Printed before the ladder starts: a 45-minute run on the wrong protocol
+        # should be catchable in the first second, not from the artifact.
+        result, _ = _run(runner, "--transport", "bidi")
+        assert "transport=bidi" in result.output
+
+
 class TestEventsAndArtifact:
     def test_events_flag_opens_a_writer_for_the_run(self, runner: CliRunner, tmp_path) -> None:
         path = tmp_path / "events.jsonl"
@@ -498,6 +528,12 @@ class TestRendering:
         result, _ = _run(runner)
         assert "tts-bench ttotal" in result.output
         assert "tts-bench plan" in result.output
+
+    def test_the_curve_header_names_the_transport(self, runner: CliRunner) -> None:
+        # Nobody opens the JSON before reading the table, and a curve read as
+        # response-stream when it is bidi sizes the fleet from the wrong number.
+        result, _ = _run(runner, report=_report(transport="bidi"))
+        assert "via bidi" in result.output
 
 
 class TestRefusalsExitCleanly:

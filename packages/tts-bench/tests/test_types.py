@@ -137,6 +137,36 @@ class TestMeasured:
             _measured(t_total_s=0.0)
 
 
+class TestMeasuredTransport:
+    """The transport has to reach the planner, not stop at the artifact.
+
+    A ``C_max`` measured on response-stream does not describe capacity for bidi
+    traffic — the containers hold their inference lock differently per protocol —
+    so a plan that configures a real fleet must carry the protocol its capacity
+    number came from.
+    """
+
+    def test_defaults_to_response_stream(self) -> None:
+        # Artifacts written before the bidi transport existed have no transport
+        # field, and they all came from response-stream. The default is what
+        # keeps them readable rather than un-loadable.
+        assert _measured().transport == "response-stream"
+
+    def test_records_the_transport(self) -> None:
+        assert _measured(transport="bidi").transport == "bidi"
+
+    def test_round_trips_through_json(self) -> None:
+        restored = Measured.model_validate_json(_measured(transport="bidi").model_dump_json())
+        assert restored.transport == "bidi"
+
+    def test_an_older_artifact_without_the_field_still_loads(self) -> None:
+        # Explicitly: the field was added mid-project, and a run recorded before
+        # it must not become unreadable.
+        payload = _measured().model_dump()
+        payload.pop("transport")
+        assert Measured.model_validate(payload).transport == "response-stream"
+
+
 class TestMeasuredTrustworthy:
     def test_frozen_and_stable_capacity_is_trustworthy(self) -> None:
         assert _measured(frozen=True, instance_counts_observed=(1, 1)).trustworthy

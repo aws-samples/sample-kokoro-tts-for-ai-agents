@@ -124,6 +124,14 @@ class Measured(BaseModel):
         default=(),
         description="Distinct instance counts seen across steps. More than one invalidates C_max.",
     )
+    transport: str = Field(
+        default="response-stream",
+        description=(
+            "Wire protocol c_max_curve was measured on. Carried this far because "
+            "the plan derived from it configures a real fleet: a C_max measured "
+            "on response-stream does not describe capacity for bidi traffic."
+        ),
+    )
     provenance: Provenance = Field(
         default_factory=lambda: Provenance(origin=Origin.MEASURED),
     )
@@ -312,6 +320,16 @@ class CMaxReport(BaseModel):
         ),
     )
 
+    transport: str = Field(
+        default="response-stream",
+        description=(
+            "Wire protocol the ladder ran on. Not decoration: the containers hold "
+            "their inference lock differently per transport - kokoro holds it "
+            "across an entire bidi session but per-generator on response-stream - "
+            "so a C_max from one does not transfer to the other."
+        ),
+    )
+
     runs: int = Field(default=1, ge=1)
     hold_s: float = Field(gt=0)
     measure_window_s: float = Field(gt=0)
@@ -381,6 +399,7 @@ class CMaxReport(BaseModel):
             t_total_s=t_total_s,
             frozen=self.frozen,
             instance_counts_observed=self.instance_counts_observed,
+            transport=self.transport,
             provenance=Provenance(
                 origin=Origin.MEASURED,
                 run_id=self.run_id,

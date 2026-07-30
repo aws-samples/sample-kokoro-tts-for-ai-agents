@@ -209,6 +209,12 @@ CMAX_BUDGETS_DEFAULT = "50,150,300,500"
 )
 @click.option("--runs", default=1, type=int, help="Ladder passes; 3 to see run-to-run spread")
 @click.option("--derate", default=0.875, type=float, help="Recorded in the artifact, not applied")
+@click.option(
+    "--transport",
+    default="response-stream",
+    type=click.Choice(["response-stream", "bidi"]),
+    help="Wire protocol to measure. C_max does not transfer between the two.",
+)
 @click.option("--arrival", default="poisson", type=click.Choice(["poisson", "fixed"]))
 @click.option("--seed", default=1234, type=int, help="Arrival-schedule seed; keeps runs comparable")
 @click.option("--max-samples", default=50, type=int, help="Texts drawn into the pool")
@@ -250,6 +256,7 @@ def cmax(
     settle_between_steps_s: float,
     runs: int,
     derate: float,
+    transport: str,
     arrival: str,
     seed: int,
     max_samples: int,
@@ -273,6 +280,11 @@ def cmax(
     including on Ctrl-C. C_max is a *per-instance* number: if the fleet grows
     mid-run, throughput rises for a reason unrelated to the knee and the result
     is silently N x C_max.
+
+    ``--transport bidi`` measures the protocol production is configured for. It
+    is a separate measurement, not a refinement: the containers serialize
+    differently on it, so expect a lower C_max on kokoro, which holds its
+    inference lock across a whole bidi session.
     """
     from tts_bench import cmax as cmax_mod
     from tts_bench.invoke import resolve_endpoint
@@ -328,7 +340,8 @@ def cmax(
     texts = _load_texts(samples, max_samples)
     click.echo(
         f"{model} ({endpoint}): {len(targets)} step(s) x {runs} run(s), "
-        f"~{estimate_s / 60:.0f} min, {len(texts)} texts, frozen={require_frozen}"
+        f"~{estimate_s / 60:.0f} min, {len(texts)} texts, transport={transport}, "
+        f"frozen={require_frozen}"
     )
     if not require_frozen:
         click.echo(
@@ -360,6 +373,7 @@ def cmax(
                 derate=derate,
                 arrival=arrival,
                 seed=seed,
+                transport=transport,
                 require_frozen=require_frozen,
                 pin_to=pin_to,
                 cloudwatch_join=cloudwatch_join,
@@ -373,7 +387,9 @@ def cmax(
     if events:
         click.echo(f"Events: {events}")
 
-    click.echo(f"\nC_max curve for {report.model_name} on {report.instance_type}:")
+    click.echo(
+        f"\nC_max curve for {report.model_name} on {report.instance_type} via {report.transport}:"
+    )
     click.echo(f"{'budget_ms':>10} {'C_max':>8} {'rps':>8} {'p95_ttfab':>10} {'spread':>8}")
     knees = {k.ttfab_budget_ms: k for k in report.knees}
     for budget in sorted(report.c_max_curve):

@@ -37,12 +37,14 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import numpy as np
 from botocore.client import BaseClient
 from loguru import logger
 
 from tts_bench import observe
+from tts_bench.bidi import Transport, invoke_for, make_client_for
 from tts_bench.invoke import InvokeResult, invoke_stream, resolve_endpoint, resolve_voice
 from tts_bench.loadgen import (
     SYSTEM_CLOCK,
@@ -152,7 +154,10 @@ class ProbeResult:
 
 
 def probe_service_time(
-    client: BaseClient,
+    # `Any`, not `BaseClient`: the bidi transport's client is a
+    # `SageMakerRuntimeHTTP2Client` with no botocore ancestry. It is only ever
+    # handed to `invoke`, never called directly.
+    client: Any,
     *,
     endpoint: str,
     voice: str,
@@ -403,7 +408,7 @@ class LadderRun:
 
 
 def run_ladder(
-    client: BaseClient,
+    client: Any,  # See probe_service_time: bidi's client is not a BaseClient.
     *,
     model: str,
     endpoint: str,
@@ -423,6 +428,7 @@ def run_ladder(
     event_sink: Callable[[LoadEvent], None] | None = None,
     clock: Clock = SYSTEM_CLOCK,
     step_runner: Callable[..., StepResult] = run_step,
+    invoke: Callable[..., InvokeResult] = invoke_stream,
 ) -> LadderRun:
     """Walk the ladder once, measuring only each step's trailing window.
 
@@ -437,6 +443,9 @@ def run_ladder(
         measure_window_s: Trailing part of each step that is measured. The rest
             is warm-up and is discarded.
         step_runner: Injected for tests; defaults to :func:`loadgen.run_step`.
+        invoke: Transport for each request. Must be the same one the probe used,
+            or ``S`` and the ladder describe different wire protocols and every
+            rate on the ladder is wrong.
 
     Raises:
         ValueError: If the measure window does not fit inside the hold.
@@ -484,6 +493,7 @@ def run_ladder(
             instance_count_fetch=instance_count_fetch,
             event_sink=event_sink,
             clock=clock,
+            invoke=invoke,
         )
 
         stats = summarize_window(
@@ -646,6 +656,7 @@ def build_report(
     frozen: bool = False,
     arrival: str = str(ArrivalProcess.POISSON),
     seed: int | None = None,
+    transport: Transport | str = Transport.RESPONSE_STREAM,
     joined_steps: Sequence[StepSummary] | None = None,
     measured_at: str | None = None,
 ) -> CMaxReport:
@@ -710,6 +721,7 @@ def build_report(
         measure_window_s=measure_window_s,
         arrival_process=arrival,
         seed=seed,
+        transport=str(Transport(transport)),
         steps=all_steps,
         provenance=Provenance(
             origin=Origin.MEASURED,
@@ -717,9 +729,10 @@ def build_report(
             measured_at=measured_at,
             endpoint=endpoint,
             note=(
-                "C_max at the p95 TTFAB knee, autoscaling frozen"
+                f"C_max at the p95 TTFAB knee on {Transport(transport)}, autoscaling frozen"
                 if frozen
-                else "C_max measured WITHOUT the autoscaling freeze; may be N x C_max"
+                else f"C_max measured on {Transport(transport)} WITHOUT the autoscaling "
+                "freeze; may be N x C_max"
             ),
         ),
     )
@@ -813,8 +826,11 @@ def measure(
     require_frozen: bool = True,
     pin_to: int = 1,
     cloudwatch_join: bool = True,
+    transport: Transport | str = Transport.RESPONSE_STREAM,
     event_sink: Callable[[LoadEvent], None] | None = None,
-    runtime_client: BaseClient | None = None,
+    # See probe_service_time: bidi's client is not a BaseClient. Callers passing
+    # one must build it for the same transport they ask for.
+    runtime_client: Any | None = None,
     cloudwatch: BaseClient | None = None,
     appscaling: BaseClient | None = None,
     sagemaker: BaseClient | None = None,
@@ -835,13 +851,16 @@ def measure(
             possibly fleet-wide.
         cloudwatch_join: Join server-side metrics after the ladder. Costs a
             settle wait (~2 min) and buys the client/server cross-check.
+        transport: Wire protocol to measure on. Recorded on the report, because
+            the containers hold their inference lock differently per transport
+            (``bidi.py`` module docstring) and a ``C_max`` from one does not
+            transfer to the other.
 
     Raises:
         CMaxError: If the probe fails, or no step met any budget.
         fixture.FixtureError: If the freeze cannot be established or verified.
     """
     from tts_bench import fixture
-    from tts_bench.invoke import make_runtime_client
 
     model = TTSModelName(model)
     endpoint = resolve_endpoint(model)
@@ -849,10 +868,15 @@ def measure(
     instance_type = _instance_type_for(model)
     pool = build_text_pool(texts, seed=seed)
     run_id = uuid.uuid4().hex[:12]
+    transport = Transport(transport)
 
-    client = runtime_client or make_runtime_client(
-        region, max_pool=worker_count(max(target_concurrencies))
+    client = runtime_client or make_client_for(
+        transport, region, max_pool=worker_count(max(target_concurrencies))
     )
+    # One transport for the probe and every ladder step. S is what converts each
+    # concurrency target into a rate, so probing on one protocol and laddering on
+    # another would misprice every step on the ladder.
+    invoke = invoke_for(transport)
     # The mid-run tripwire runs whether or not we froze — it matters *most* when
     # we did not, since that is the run whose fleet is actually free to change.
     fetch = _instance_count_fetcher(sagemaker, region=region, endpoint=endpoint, variant=variant)
@@ -864,6 +888,7 @@ def measure(
             voice=voice,
             texts=pool,
             requests=probe_requests,
+            invoke=invoke,
         )
         logger.info(
             "Probe: S mean {:.3f}s p95 {:.3f}s over {} sample(s); ladder spans {:.2f}-{:.2f} rps",
@@ -892,6 +917,7 @@ def measure(
                 instance_count_fetch=fetch,
                 event_sink=event_sink,
                 clock=clock,
+                invoke=invoke,
             )
             for run_index in range(runs)
         ]
@@ -950,6 +976,7 @@ def measure(
         frozen=require_frozen,
         arrival=str(ArrivalProcess(arrival)),
         seed=seed,
+        transport=transport,
         joined_steps=all_steps,
         measured_at=datetime.now(UTC).isoformat(),
     )
