@@ -274,12 +274,30 @@ async def invocations(request: Request) -> Response:
     )
 
 
+async def _receive_message(websocket: WebSocket) -> str:
+    """Read one client frame as text, whatever frame type it arrived as.
+
+    SageMaker's bidirectional transport forwards ``RequestPayloadPart`` as a
+    *binary* WebSocket frame, so ``receive_text()`` raises ``KeyError: 'text'``
+    on every request from ``invoke_endpoint_with_bidirectional_stream`` — the
+    only way this endpoint is invoked in production. Browsers and the local
+    test client send text frames. Accept both rather than picking one.
+    """
+    message = await websocket.receive()
+    if message["type"] == "websocket.disconnect":
+        raise WebSocketDisconnect(message.get("code", 1000))
+    payload = message.get("text")
+    if payload is None:
+        payload = message.get("bytes", b"").decode("utf-8")
+    return payload
+
+
 async def bidirectional_stream(websocket: WebSocket) -> None:
     await websocket.accept()
 
     try:
         while True:
-            raw = await websocket.receive_text()
+            raw = await _receive_message(websocket)
             msg = json.loads(raw)
 
             if msg.get("type") == "close":

@@ -201,3 +201,102 @@ class TestStartupWarmup:
         names = [m.name for m in parse_stage_markers(capfd.readouterr().out.splitlines())]
         assert Stage.WARMUP_DONE in names
         assert names[-1] == Stage.READY
+
+
+class TestBidirectionalBinaryFrames:
+    """SageMaker sends binary frames; the handler must not require text ones.
+
+    ``invoke_endpoint_with_bidirectional_stream`` forwards each
+    ``RequestPayloadPart`` as a *binary* WebSocket frame. Starlette's
+    ``receive_text()`` reads ``message["text"]`` unconditionally, so it raised
+    ``KeyError: 'text'`` on every production request — surfacing to the client as
+    an error frame whose message was the literal string ``'text'``, and to a
+    benchmark as a zero-audio "success" if error frames are not classified.
+
+    Both frame types are asserted here because the local browser demo and
+    ``TestClient`` send text while SageMaker sends binary; a fix that swapped
+    ``receive_text`` for ``receive_bytes`` would just invert the bug.
+    """
+
+    def _synthesize(self, serve_module, *, binary: bool) -> tuple[list[dict], int]:
+        """Drive one bidi request, returning (control frames, total audio bytes)."""
+        import json
+
+        from starlette.testclient import TestClient
+
+        message = json.dumps({"text": "One. Two.", "voice": "af_heart", "request_id": "r1"})
+
+        frames: list[dict] = []
+        audio = 0
+        with TestClient(serve_module.app) as client:
+            with client.websocket_connect("/invocations-bidirectional-stream") as ws:
+                if binary:
+                    ws.send_bytes(message.encode("utf-8"))
+                else:
+                    ws.send_text(message)
+                while True:
+                    received = ws.receive()
+                    if received["type"] == "websocket.close":
+                        break
+                    if received.get("text") is not None:
+                        frame = json.loads(received["text"])
+                        frames.append(frame)
+                        if frame["type"] in ("synthesis_complete", "error"):
+                            break
+                    elif received.get("bytes"):
+                        audio += len(received["bytes"])
+        return frames, audio
+
+    def test_a_binary_frame_synthesizes_audio(self, serve_module) -> None:
+        # The exact shape SageMaker delivers. Before the fix this returned an
+        # error frame with message "'text'" and zero audio.
+        frames, audio = self._synthesize(serve_module, binary=True)
+
+        types_seen = [f["type"] for f in frames]
+        assert "error" not in types_seen, f"error frame: {frames}"
+        assert types_seen == ["synthesis_start", "synthesis_complete"]
+        # 3 fake segments * 2400 samples * 2 bytes, raw PCM with no RIFF header.
+        assert audio == 3 * 2400 * 2
+
+    def test_a_text_frame_still_works(self, serve_module) -> None:
+        frames, audio = self._synthesize(serve_module, binary=False)
+
+        assert [f["type"] for f in frames] == ["synthesis_start", "synthesis_complete"]
+        assert audio == 3 * 2400 * 2
+
+    def test_a_binary_frame_reaches_the_model_with_its_text_intact(self, serve_module) -> None:
+        # Not just "no error": the decoded payload must be what the model
+        # synthesizes, so a mis-decode cannot pass as success.
+        self._synthesize(serve_module, binary=True)
+
+        assert serve_module.pipeline_calls[-1] == "One. Two."
+
+    def test_an_empty_binary_frame_is_rejected_as_missing_text(self, serve_module) -> None:
+        # Decoding to "" must take the handler's own "text required" path rather
+        # than raising, which would look identical to the bug being fixed.
+        import json
+
+        from starlette.testclient import TestClient
+
+        with TestClient(serve_module.app) as client:
+            with client.websocket_connect("/invocations-bidirectional-stream") as ws:
+                ws.send_bytes(json.dumps({"request_id": "r1"}).encode("utf-8"))
+                frame = json.loads(ws.receive_text())
+
+        assert frame["type"] == "error"
+        assert frame["message"] == "text required"
+        assert frame["request_id"] == "r1"
+
+    def test_client_disconnect_closes_cleanly(self, serve_module) -> None:
+        # _receive_message translates a disconnect into WebSocketDisconnect, which
+        # the handler already treats as a normal end of session. Without that
+        # translation it would decode a missing payload and log a spurious error.
+        from starlette.testclient import TestClient
+
+        with TestClient(serve_module.app) as client:
+            with client.websocket_connect("/invocations-bidirectional-stream"):
+                pass
+
+        # Reaching here without an exception propagating out of the app is the
+        # assertion; a leaked error would fail the TestClient context exit.
+        assert True
