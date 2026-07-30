@@ -15,24 +15,35 @@ from typing import Any
 import boto3
 import pytest
 from botocore.stub import Stubber
+from loguru import logger
 
 from tts_bench.fixture import (
+    ENDPOINT_USAGE_QUOTA_CODE,
     SCALABLE_DIMENSION,
     SERVICE_NAMESPACE,
     SUSPEND_ALL,
     EndpointFixture,
     FixtureError,
+    QuotaHeadroom,
     capture,
+    endpoint_quota_headroom,
     freeze,
     frozen,
     require_frozen,
     require_scalable,
     resource_id,
     thaw,
+    variant_instance_type,
 )
 
 ENDPOINT = "speech-kokoro-82m"
 RID = f"endpoint/{ENDPOINT}/variant/primary"
+INSTANCE_TYPE = "ml.g5.xlarge"
+
+#: The other holders of the ml.g5.xlarge quota when this guard was written. Named
+#: because the point of the check is that endpoints we are not benchmarking, and in one
+#: case do not own, consume the allowance this one scales into.
+OTHER_ENDPOINTS = ("speech-orpheus-3b", "speech-chatterbox-turbo")
 
 
 @pytest.fixture
@@ -51,6 +62,30 @@ def sagemaker() -> Any:
     stub.activate()
     yield client, stub
     stub.deactivate()
+
+
+@pytest.fixture
+def quotas() -> Any:
+    client = boto3.client("service-quotas", region_name="us-east-1")
+    stub = Stubber(client)
+    stub.activate()
+    yield client, stub
+    stub.deactivate()
+
+
+@pytest.fixture
+def logged() -> Any:
+    """Captured loguru warnings.
+
+    ``caplog`` does not see these — loguru does not propagate to the stdlib logging
+    tree — so an assertion against it would pass whether or not anything was emitted.
+    """
+    records: list[str] = []
+    sink_id = logger.add(lambda m: records.append(m.record["message"]), level="WARNING")
+    try:
+        yield records
+    finally:
+        logger.remove(sink_id)
 
 
 def _target(
@@ -152,6 +187,88 @@ def _stub_capture(
     sm_stub.add_response(
         "describe_endpoint", _endpoint(desired=desired, current=current), {"EndpointName": ENDPOINT}
     )
+
+
+def _config(*, instance_type: str | None = INSTANCE_TYPE, variant: str = "primary") -> dict:
+    """An endpoint config. The *only* place the instance type is readable."""
+    entry: dict[str, Any] = {"VariantName": variant, "ModelName": "m"}
+    if instance_type is not None:
+        entry["InstanceType"] = instance_type
+        entry["InitialInstanceCount"] = 1
+    return {
+        "EndpointConfigName": f"{ENDPOINT}-config",
+        "EndpointConfigArn": f"arn:aws:sagemaker:us-east-1:1234:endpoint-config/{ENDPOINT}-config",
+        "ProductionVariants": [entry],
+        "CreationTime": "2026-06-18T17:19:51Z",
+    }
+
+
+def _stub_variant_instance_type(
+    sm_stub: Stubber, *, instance_type: str | None = INSTANCE_TYPE
+) -> None:
+    """Queue the describe_endpoint + describe_endpoint_config pair."""
+    sm_stub.add_response("describe_endpoint", _endpoint(), {"EndpointName": ENDPOINT})
+    sm_stub.add_response(
+        "describe_endpoint_config",
+        _config(instance_type=instance_type),
+        {"EndpointConfigName": f"{ENDPOINT}-config"},
+    )
+
+
+def _summary(name: str, *, status: str = "InService") -> dict:
+    return {
+        "EndpointName": name,
+        "EndpointArn": f"arn:aws:sagemaker:us-east-1:1234:endpoint/{name}",
+        "CreationTime": "2026-06-18T17:19:51Z",
+        "LastModifiedTime": "2026-06-18T17:19:51Z",
+        "EndpointStatus": status,
+    }
+
+
+def _stub_headroom(
+    sm_stub: Stubber,
+    quotas_stub: Stubber,
+    *,
+    limit: float | None = 4.0,
+    others: tuple[str, ...] = OTHER_ENDPOINTS,
+    self_current: int = 1,
+    self_desired: int | None = None,
+    self_type: str = INSTANCE_TYPE,
+) -> None:
+    """Queue one endpoint_quota_headroom() pass: the quota read, then every endpoint."""
+    if limit is None:
+        quotas_stub.add_client_error("list_service_quotas", service_error_code="AccessDenied")
+    else:
+        quotas_stub.add_response(
+            "list_service_quotas",
+            {
+                "Quotas": [
+                    {
+                        "QuotaCode": ENDPOINT_USAGE_QUOTA_CODE,
+                        "QuotaName": f"{INSTANCE_TYPE} for endpoint usage",
+                        "Value": limit,
+                    }
+                ]
+            },
+            {"ServiceCode": "sagemaker", "QuotaCode": ENDPOINT_USAGE_QUOTA_CODE},
+        )
+
+    names = (ENDPOINT, *others)
+    sm_stub.add_response("list_endpoints", {"Endpoints": [_summary(n) for n in names]})
+    for name in names:
+        is_self = name == ENDPOINT
+        described = _endpoint(
+            desired=self_desired if (is_self and self_desired is not None) else 1,
+            current=self_current if is_self else 1,
+        )
+        described["EndpointName"] = name
+        described["EndpointConfigName"] = f"{name}-config"
+        sm_stub.add_response("describe_endpoint", described, {"EndpointName": name})
+        config = _config(instance_type=self_type if is_self else INSTANCE_TYPE)
+        config["EndpointConfigName"] = f"{name}-config"
+        sm_stub.add_response(
+            "describe_endpoint_config", config, {"EndpointConfigName": f"{name}-config"}
+        )
 
 
 class TestResourceId:
@@ -606,13 +723,33 @@ class TestRequireFrozen:
 
 
 class TestRequireScalable:
-    def test_passes_when_a_scale_event_is_possible(self, appscaling, sagemaker) -> None:
+    def test_passes_when_a_scale_event_is_possible(self, appscaling, sagemaker, quotas) -> None:
         aas, aas_stub = appscaling
         sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        _stub_capture(aas_stub, sm_stub, targets=[_target(max_capacity=4)], policies=["p1"])
+        _stub_variant_instance_type(sm_stub)
+        # Room for the full jump to max_capacity=4 from 1: limit 8, three others in use.
+        _stub_headroom(sm_stub, q_stub, limit=8.0)
+
+        state = require_scalable(ENDPOINT, appscaling=aas, sagemaker=sm, quotas=q)
+        assert state.max_capacity == 4
+        q_stub.assert_no_pending_responses()
+
+    def test_the_quota_read_is_skipped_when_not_asked_for(
+        self, appscaling, sagemaker, quotas
+    ) -> None:
+        # Stubber raises on any unstubbed call, so nothing being queued is the assertion.
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
         _stub_capture(aas_stub, sm_stub, targets=[_target(max_capacity=4)], policies=["p1"])
 
-        state = require_scalable(ENDPOINT, appscaling=aas, sagemaker=sm)
+        state = require_scalable(
+            ENDPOINT, appscaling=aas, sagemaker=sm, quotas=q, require_quota_headroom=0
+        )
         assert state.max_capacity == 4
+        sm_stub.assert_no_pending_responses()
 
     def test_raises_without_a_scalable_target(self, appscaling, sagemaker) -> None:
         aas, aas_stub = appscaling
@@ -650,6 +787,293 @@ class TestRequireScalable:
 
         with pytest.raises(FixtureError, match="no scaling policies"):
             require_scalable(ENDPOINT, appscaling=aas, sagemaker=sm)
+
+
+class TestQuotaHeadroomArithmetic:
+    def test_available_is_the_remainder(self) -> None:
+        h = QuotaHeadroom(instance_type=INSTANCE_TYPE, limit=4, in_use=3)
+        assert h.available == 1
+        assert h.room_for(1) is True
+        assert h.room_for(2) is False
+
+    def test_an_unknown_limit_is_not_headroom(self) -> None:
+        # Absence of evidence. Returning True here would defeat the guard silently on
+        # any account whose role lacks servicequotas:ListServiceQuotas.
+        h = QuotaHeadroom(instance_type=INSTANCE_TYPE, limit=None, in_use=3)
+        assert h.available is None
+        assert h.room_for(1) is None
+
+    def test_over_quota_does_not_report_negative_room(self) -> None:
+        # Reachable: a quota can be lowered under running endpoints.
+        h = QuotaHeadroom(instance_type=INSTANCE_TYPE, limit=2, in_use=5)
+        assert h.available == 0
+        assert h.room_for(1) is False
+
+
+class TestVariantInstanceType:
+    def test_reads_it_from_the_endpoint_config(self, sagemaker) -> None:
+        # DescribeEndpoint omits InstanceType entirely, which is why this is two calls.
+        sm, sm_stub = sagemaker
+        _stub_variant_instance_type(sm_stub)
+
+        assert variant_instance_type(ENDPOINT, sagemaker=sm) == INSTANCE_TYPE
+
+    def test_a_serverless_variant_has_none(self, sagemaker) -> None:
+        # No instances, so no instance quota to check.
+        sm, sm_stub = sagemaker
+        _stub_variant_instance_type(sm_stub, instance_type=None)
+
+        assert variant_instance_type(ENDPOINT, sagemaker=sm) is None
+
+    def test_an_unknown_variant_has_none(self, sagemaker) -> None:
+        sm, sm_stub = sagemaker
+        _stub_variant_instance_type(sm_stub)
+
+        assert variant_instance_type(ENDPOINT, variant="other", sagemaker=sm) is None
+
+    def test_a_read_failure_raises(self, sagemaker) -> None:
+        sm, sm_stub = sagemaker
+        sm_stub.add_client_error("describe_endpoint", service_error_code="ValidationException")
+
+        with pytest.raises(FixtureError, match="could not read the endpoint config"):
+            variant_instance_type(ENDPOINT, sagemaker=sm)
+
+
+class TestEndpointQuotaHeadroom:
+    """The account-wide read.
+
+    The quota is per instance type, per region, and counts *every* endpoint — so the
+    total has to come from listing them all, not from the one under test.
+    """
+
+    def test_totals_every_endpoint_holding_the_type(self, sagemaker, quotas) -> None:
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        _stub_headroom(sm_stub, q_stub, limit=4.0)
+
+        h = endpoint_quota_headroom(INSTANCE_TYPE, quotas=q, sagemaker=sm)
+
+        assert h.limit == 4
+        assert h.in_use == 3
+        assert h.endpoints_in_use == tuple(
+            sorted(f"{n}/primary" for n in (ENDPOINT, *OTHER_ENDPOINTS))
+        )
+        assert h.available == 1
+
+    def test_ignores_endpoints_on_other_instance_types(self, sagemaker, quotas) -> None:
+        # The quota is per type: a g5 benchmark is not blocked by c5 endpoints.
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        _stub_headroom(sm_stub, q_stub, limit=4.0, self_type="ml.c5.large")
+
+        h = endpoint_quota_headroom(INSTANCE_TYPE, quotas=q, sagemaker=sm)
+
+        assert h.in_use == 2
+        assert all(ENDPOINT not in name for name in h.endpoints_in_use)
+
+    def test_counts_a_scale_out_in_flight_at_its_desired_count(self, sagemaker, quotas) -> None:
+        # Slots are claimed when desired rises, not when the instance appears. Counting
+        # current only would report room that a pending activity has already taken.
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        _stub_headroom(sm_stub, q_stub, limit=8.0, self_current=1, self_desired=4)
+
+        assert endpoint_quota_headroom(INSTANCE_TYPE, quotas=q, sagemaker=sm).in_use == 6
+
+    def test_a_failed_endpoint_holds_nothing(self, sagemaker, quotas) -> None:
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        q_stub.add_response(
+            "list_service_quotas",
+            {
+                "Quotas": [
+                    {
+                        "QuotaCode": ENDPOINT_USAGE_QUOTA_CODE,
+                        "QuotaName": f"{INSTANCE_TYPE} for endpoint usage",
+                        "Value": 4.0,
+                    }
+                ]
+            },
+        )
+        sm_stub.add_response(
+            "list_endpoints", {"Endpoints": [_summary("dead-endpoint", status="Failed")]}
+        )
+
+        h = endpoint_quota_headroom(INSTANCE_TYPE, quotas=q, sagemaker=sm)
+
+        assert h.in_use == 0
+        assert h.endpoints_in_use == ()
+
+    def test_an_unreadable_quota_degrades_to_unknown(self, sagemaker, quotas, logged) -> None:
+        # A missing servicequotas permission must not be the thing that stops a
+        # measurement — but it must not read as headroom either.
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        _stub_headroom(sm_stub, q_stub, limit=None)
+
+        h = endpoint_quota_headroom(INSTANCE_TYPE, quotas=q, sagemaker=sm)
+
+        assert h.limit is None
+        assert h.in_use == 3
+        assert any("quota" in m for m in logged)
+
+    def test_an_unlistable_account_degrades_to_zero_in_use(self, sagemaker, quotas, logged) -> None:
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        q_stub.add_response(
+            "list_service_quotas",
+            {
+                "Quotas": [
+                    {
+                        "QuotaCode": ENDPOINT_USAGE_QUOTA_CODE,
+                        "QuotaName": f"{INSTANCE_TYPE} for endpoint usage",
+                        "Value": 4.0,
+                    }
+                ]
+            },
+        )
+        sm_stub.add_client_error("list_endpoints", service_error_code="AccessDenied")
+
+        h = endpoint_quota_headroom(INSTANCE_TYPE, quotas=q, sagemaker=sm)
+
+        assert h.in_use == 0
+        assert any("list endpoints" in m for m in logged)
+
+    def test_a_differently_named_quota_is_not_matched(self, sagemaker, quotas) -> None:
+        # One QuotaCode covers every instance type, so the name is the discriminator.
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        q_stub.add_response(
+            "list_service_quotas",
+            {
+                "Quotas": [
+                    {
+                        "QuotaCode": ENDPOINT_USAGE_QUOTA_CODE,
+                        "QuotaName": "ml.p4d.24xlarge for endpoint usage",
+                        "Value": 100.0,
+                    }
+                ]
+            },
+        )
+        sm_stub.add_response("list_endpoints", {"Endpoints": []})
+
+        assert endpoint_quota_headroom(INSTANCE_TYPE, quotas=q, sagemaker=sm).limit is None
+
+
+class TestRequireScalableChecksQuota:
+    """The guard that the first live ``ttotal`` run needed and did not have.
+
+    That run drove load for five minutes while Application Auto Scaling logged a
+    ``Failed`` activity every ten seconds: quota 4, three instances in use, and a
+    policy asking for three more at once. Nothing surfaced on the endpoint, which
+    stayed ``InService`` at one instance throughout.
+    """
+
+    def _scalable(self, aas_stub, sm_stub, *, max_capacity: int = 4, current: int = 1) -> None:
+        _stub_capture(
+            aas_stub,
+            sm_stub,
+            targets=[_target(max_capacity=max_capacity)],
+            policies=["p1"],
+            desired=current,
+            current=current,
+        )
+        _stub_variant_instance_type(sm_stub)
+
+    def test_raises_when_the_policys_jump_does_not_fit(self, appscaling, sagemaker, quotas) -> None:
+        # The live case exactly: limit 4, three in use, max_capacity 4 from 1 instance.
+        # A check for one instance would have passed this.
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        self._scalable(aas_stub, sm_stub)
+        _stub_headroom(sm_stub, q_stub, limit=4.0)
+
+        with pytest.raises(FixtureError, match="endpoint usage") as excinfo:
+            require_scalable(ENDPOINT, appscaling=aas, sagemaker=sm, quotas=q)
+
+        message = str(excinfo.value)
+        assert "will ask for 3 more" in message
+        assert ENDPOINT_USAGE_QUOTA_CODE in message
+        # Names the holders, so the operator knows what to stop rather than guessing.
+        for name in OTHER_ENDPOINTS:
+            assert name in message
+
+    def test_the_error_says_what_max_capacity_would_fit(
+        self, appscaling, sagemaker, quotas
+    ) -> None:
+        # Raising the quota is one fix; lowering max_capacity is the other, and it is
+        # the one an operator can apply without an AWS support ticket.
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        self._scalable(aas_stub, sm_stub)
+        _stub_headroom(sm_stub, q_stub, limit=4.0)
+
+        with pytest.raises(FixtureError, match="lower max_capacity to 2"):
+            require_scalable(ENDPOINT, appscaling=aas, sagemaker=sm, quotas=q)
+
+    def test_passes_when_the_whole_jump_fits(self, appscaling, sagemaker, quotas) -> None:
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        self._scalable(aas_stub, sm_stub)
+        _stub_headroom(sm_stub, q_stub, limit=6.0)
+
+        assert require_scalable(ENDPOINT, appscaling=aas, sagemaker=sm, quotas=q).max_capacity == 4
+
+    def test_an_explicit_headroom_overrides_the_derived_jump(
+        self, appscaling, sagemaker, quotas
+    ) -> None:
+        # A caller who knows a step policy adds one at a time asks for one.
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        self._scalable(aas_stub, sm_stub)
+        _stub_headroom(sm_stub, q_stub, limit=4.0)
+
+        state = require_scalable(
+            ENDPOINT, appscaling=aas, sagemaker=sm, quotas=q, require_quota_headroom=1
+        )
+        assert state.max_capacity == 4
+
+    def test_a_serverless_variant_skips_the_quota_read(self, appscaling, sagemaker, quotas) -> None:
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        _stub_capture(aas_stub, sm_stub, targets=[_target(max_capacity=4)], policies=["p1"])
+        _stub_variant_instance_type(sm_stub, instance_type=None)
+
+        require_scalable(ENDPOINT, appscaling=aas, sagemaker=sm, quotas=q)
+        q_stub.assert_no_pending_responses()
+
+    def test_an_unverifiable_quota_warns_and_proceeds(
+        self, appscaling, sagemaker, quotas, logged
+    ) -> None:
+        # Refusing here would make a missing IAM permission fatal to a measurement that
+        # would otherwise work. The warning names the command that shows the truth.
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        self._scalable(aas_stub, sm_stub)
+        _stub_headroom(sm_stub, q_stub, limit=None)
+
+        state = require_scalable(ENDPOINT, appscaling=aas, sagemaker=sm, quotas=q)
+
+        assert state.max_capacity == 4
+        assert any("describe-scaling-activities" in m for m in logged)
+
+    def test_an_already_scaled_out_variant_needs_only_the_remainder(
+        self, appscaling, sagemaker, quotas
+    ) -> None:
+        # At 3 of max 4, the policy can only ask for one more, so one slot is enough.
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        q, q_stub = quotas
+        self._scalable(aas_stub, sm_stub, current=3)
+        _stub_headroom(sm_stub, q_stub, limit=6.0, self_current=3)
+
+        assert require_scalable(ENDPOINT, appscaling=aas, sagemaker=sm, quotas=q).max_capacity == 4
 
 
 class TestEndpointFixtureProperties:

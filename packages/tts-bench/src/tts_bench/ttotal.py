@@ -951,12 +951,31 @@ def collect_timeline(
         appscaling, endpoint=endpoint, variant=variant, start=window_start, end=window_end
     )
     if activities:
-        first = activities[0]
-        activity_started_at = first.start_time
+        # The first *successful* activity, falling back to the first of any kind. A
+        # policy blocked by an account quota records a Failed activity every ten
+        # seconds, so taking activities[0] unconditionally would time the attempt that
+        # was rejected rather than the one that added capacity.
+        succeeded = [a for a in activities if a.succeeded]
+        chosen = succeeded[0] if succeeded else activities[0]
+        activity_started_at = chosen.start_time
         # The description is carried verbatim rather than pattern-matched: AWS words it
         # differently across capacity changes, and a filter that guessed wrong would
         # silently drop the only record of when the change began.
-        activity_note = f"{first.description} ({first.status_code})"
+        activity_note = f"{chosen.description} ({chosen.status_code})"
+
+        failed = [a for a in activities if not a.succeeded]
+        if failed:
+            # The failure mode is silent from the endpoint's side: it stays InService at
+            # its old count while the policy retries. The StatusMessage is the only place
+            # the reason appears, so it is quoted rather than summarized.
+            report.notes.append(
+                f"{len(failed)} of {len(activities)} scaling activities FAILED. First "
+                f"reason: {failed[0].status_message or failed[0].description!r}. The policy "
+                "acted and SageMaker refused; nothing about this is visible on the endpoint, "
+                "which stays InService at its old count."
+            )
+            if not succeeded:
+                activity_note += " — no activity succeeded"
     elif policy_driven:
         activity_note = "no scaling activity recorded in the window"
         report.notes.append(
@@ -1062,6 +1081,7 @@ def measure(
     appscaling: BaseClient | None = None,
     sagemaker: BaseClient | None = None,
     logs: BaseClient | None = None,
+    quotas: BaseClient | None = None,
 ) -> TTotalReport:
     """Trigger one scale-out and measure the lag, stage by stage.
 
@@ -1102,9 +1122,16 @@ def measure(
 
     if trigger == TRIGGER_DRIVE_LOAD:
         # Cheap precondition: a target exists, is not suspended, can reach at least two
-        # instances, and has policies attached. Raises FixtureError naming the fix.
+        # instances, has policies attached, and the account has quota room for the jump
+        # the policy will request. Raises FixtureError naming the fix. Seconds, against a
+        # run that otherwise costs max_wait_s of load to discover the same thing.
         fixture.require_scalable(
-            endpoint, region=region, variant=variant, appscaling=appscaling, sagemaker=sagemaker
+            endpoint,
+            region=region,
+            variant=variant,
+            appscaling=appscaling,
+            sagemaker=sagemaker,
+            quotas=quotas,
         )
 
     desired_before, current_before = read_capacity(sagemaker, endpoint, variant)
@@ -1182,11 +1209,21 @@ def measure(
     window_end = datetime.now(UTC)
 
     if not event.occurred:
+        # A timeout has two very different causes — the policy never acted, or it acted
+        # and was refused — and only the activity log distinguishes them. Read it here so
+        # the error says which, rather than leaving the operator to guess after a run
+        # that already cost real minutes of load.
         raise TTotalError(
-            f"{endpoint} did not reach more than {current_before} instance(s) within "
-            f"{max_wait_s:.0f}s. With --trigger {TRIGGER_DRIVE_LOAD}, check that the offered "
-            f"concurrency exceeds C_target={scaling_target:.3f} and that `tts-bench drift` "
-            "shows the policy's alarm out of INSUFFICIENT_DATA."
+            _explain_no_scale_out(
+                appscaling,
+                endpoint=endpoint,
+                variant=variant,
+                from_instances=current_before,
+                max_wait_s=max_wait_s,
+                scaling_target=scaling_target,
+                window_start=window_start,
+                window_end=window_end,
+            )
         )
 
     return collect_timeline(
@@ -1206,6 +1243,52 @@ def measure(
         streams_before=streams_before,
         event=event,
         load_events=load_events,
+    )
+
+
+def _explain_no_scale_out(
+    appscaling: BaseClient,
+    *,
+    endpoint: str,
+    variant: str,
+    from_instances: int,
+    max_wait_s: float,
+    scaling_target: float,
+    window_start: datetime,
+    window_end: datetime,
+) -> str:
+    """Why no scale-out happened, distinguishing "never acted" from "was refused".
+
+    The two look identical from the endpoint, which stays ``InService`` at its old count
+    either way. Only ``DescribeScalingActivities`` tells them apart, and a ``Failed``
+    activity's ``StatusMessage`` carries the actual reason — an account quota, a
+    capacity shortage, a bad role. Quoted verbatim rather than classified, because the
+    set of reasons is AWS's to extend.
+    """
+    head = (
+        f"{endpoint} did not reach more than {from_instances} instance(s) within "
+        f"{max_wait_s:.0f}s. "
+    )
+    activities = scaling_activities(
+        appscaling, endpoint=endpoint, variant=variant, start=window_start, end=window_end
+    )
+    failed = [a for a in activities if not a.succeeded]
+    if failed:
+        return head + (
+            f"The policy DID act — {len(failed)} of {len(activities)} scaling activities "
+            f"failed, so this is not a detection problem. AWS gave: "
+            f"{failed[0].status_message or failed[0].description}"
+        )
+    if activities:
+        return head + (
+            f"{len(activities)} scaling activities were recorded and none failed, so "
+            "capacity was still being provisioned when the wait elapsed. Retry with a "
+            "longer --max-wait."
+        )
+    return head + (
+        f"No scaling activity was recorded at all, so the policy never acted. Check that "
+        f"the offered concurrency exceeds C_target={scaling_target:.3f}, and that "
+        "`tts-bench drift` shows the policy's alarm out of INSUFFICIENT_DATA."
     )
 
 

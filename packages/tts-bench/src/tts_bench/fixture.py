@@ -441,24 +441,197 @@ def require_frozen(
     return state
 
 
+#: Service Quotas code for "ml.<type> for endpoint usage". One quota per instance
+#: type, account-wide and per-region, counting *every* endpoint — so an unrelated
+#: team's endpoint consumes the same allowance ours scales into.
+ENDPOINT_USAGE_QUOTA_CODE = "L-1928E07B"
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaHeadroom:
+    """Account-level room to add instances of one type.
+
+    Application Auto Scaling does not consult this before acting: it raises
+    ``DesiredInstanceCount``, SageMaker rejects the change with
+    ``ResourceLimitExceeded``, and the activity is recorded as ``Failed`` while the
+    policy retries every ten seconds. Nothing surfaces on the endpoint, whose status
+    stays ``InService`` at its old count — so a scale-out that cannot happen looks
+    exactly like one that has not happened yet.
+    """
+
+    instance_type: str
+    limit: int | None
+    """``None`` when the quota could not be read — absence of evidence, so callers
+    must not treat it as headroom."""
+
+    in_use: int
+    """Instances of this type across every endpoint in the account and region.
+
+    Counts ``max(current, desired)`` per variant: a scale-out already in flight has
+    claimed its slots even though the instances are not running yet."""
+
+    endpoints_in_use: tuple[str, ...] = field(default=())
+    """Which endpoints hold them, so the operator knows what to stop or move."""
+
+    @property
+    def available(self) -> int | None:
+        return None if self.limit is None else max(self.limit - self.in_use, 0)
+
+    def room_for(self, added: int) -> bool | None:
+        """Whether ``added`` more instances would fit. ``None`` when unknown."""
+        room = self.available
+        return None if room is None else room >= added
+
+
+def _endpoint_instance_types(sagemaker: BaseClient) -> dict[str, tuple[str, int]]:
+    """``{endpoint/variant: (instance_type, instances_held)}`` per live variant.
+
+    ``DescribeEndpoint`` does not return the instance type — only the config does —
+    so this is two calls per endpoint. Worth it: the quota is account-wide, and
+    without the other endpoints' consumption a headroom figure is meaningless.
+
+    ``instances_held`` is ``max(current, desired)``, because a variant mid-scale-out
+    has already claimed the slots its desired count names.
+    """
+    out: dict[str, tuple[str, int]] = {}
+    try:
+        paginator = sagemaker.get_paginator("list_endpoints")
+        for page in paginator.paginate():
+            for summary in page.get("Endpoints", []):
+                name = summary.get("EndpointName")
+                if not name or summary.get("EndpointStatus") == "Failed":
+                    # A failed endpoint holds no instances.
+                    continue
+                try:
+                    described = sagemaker.describe_endpoint(EndpointName=name)
+                    config = sagemaker.describe_endpoint_config(
+                        EndpointConfigName=described["EndpointConfigName"]
+                    )
+                except botocore.exceptions.ClientError as exc:
+                    logger.warning("Could not read instance type for endpoint {}: {}", name, exc)
+                    continue
+                counts = {
+                    v.get("VariantName"): max(
+                        int(v.get("CurrentInstanceCount", 0)),
+                        int(v.get("DesiredInstanceCount", 0)),
+                    )
+                    for v in described.get("ProductionVariants", [])
+                }
+                for variant in config.get("ProductionVariants", []):
+                    instance_type = variant.get("InstanceType")
+                    if not instance_type:
+                        # Serverless or async variant: no instances, no quota use.
+                        continue
+                    out[f"{name}/{variant.get('VariantName')}"] = (
+                        instance_type,
+                        counts.get(variant.get("VariantName"), 0),
+                    )
+    except botocore.exceptions.ClientError as exc:
+        logger.warning("Could not list endpoints to total quota usage: {}", exc)
+    return out
+
+
+def endpoint_quota_headroom(
+    instance_type: str,
+    *,
+    region: str = "us-east-1",
+    quotas: BaseClient | None = None,
+    sagemaker: BaseClient | None = None,
+) -> QuotaHeadroom:
+    """Read the account's remaining room for instances of one type.
+
+    Read-only. Both halves degrade to a warning rather than raising, because a
+    missing ``servicequotas:ListServiceQuotas`` permission must not be the thing
+    that stops a measurement — an unknown limit is reported as unknown.
+    """
+    import boto3
+
+    quotas = quotas or boto3.client("service-quotas", region_name=region)
+    sm = sagemaker or boto3.client("sagemaker", region_name=region)
+
+    limit: int | None = None
+    wanted = f"{instance_type} for endpoint usage"
+    try:
+        paginator = quotas.get_paginator("list_service_quotas")
+        for page in paginator.paginate(
+            ServiceCode="sagemaker", QuotaCode=ENDPOINT_USAGE_QUOTA_CODE
+        ):
+            for quota in page.get("Quotas", []):
+                if quota.get("QuotaName") == wanted and quota.get("Value") is not None:
+                    limit = int(quota["Value"])
+    except botocore.exceptions.ClientError as exc:
+        logger.warning("Could not read the {} quota: {}", wanted, exc)
+
+    holders = {
+        key: count
+        for key, (found_type, count) in _endpoint_instance_types(sm).items()
+        if found_type == instance_type and count > 0
+    }
+    return QuotaHeadroom(
+        instance_type=instance_type,
+        limit=limit,
+        in_use=sum(holders.values()),
+        endpoints_in_use=tuple(sorted(holders)),
+    )
+
+
+def variant_instance_type(
+    endpoint_name: str,
+    *,
+    region: str = "us-east-1",
+    variant: str = DEFAULT_VARIANT,
+    sagemaker: BaseClient | None = None,
+) -> str | None:
+    """The instance type one variant runs on, or ``None`` if it has none.
+
+    ``DescribeEndpoint`` omits it, so this reads the endpoint config. ``None`` means
+    serverless or async, which consume no instance quota.
+    """
+    import boto3
+
+    sm = sagemaker or boto3.client("sagemaker", region_name=region)
+    try:
+        described = sm.describe_endpoint(EndpointName=endpoint_name)
+        config = sm.describe_endpoint_config(EndpointConfigName=described["EndpointConfigName"])
+    except botocore.exceptions.ClientError as exc:
+        raise FixtureError(
+            f"could not read the endpoint config for {endpoint_name}: {exc}"
+        ) from exc
+
+    for entry in config.get("ProductionVariants", []):
+        if entry.get("VariantName") == variant:
+            return entry.get("InstanceType")
+    return None
+
+
 def require_scalable(
     endpoint_name: str,
     *,
     region: str = "us-east-1",
     variant: str = DEFAULT_VARIANT,
     min_max_capacity: int = 2,
+    require_quota_headroom: int | None = None,
     appscaling: BaseClient | None = None,
     sagemaker: BaseClient | None = None,
+    quotas: BaseClient | None = None,
 ) -> EndpointFixture:
     """Assert a scale event is actually possible. The inverse of :func:`require_frozen`.
 
     ``ttotal`` needs scaling live. Without this check it would drive load for
     twenty minutes waiting for an event that cannot happen.
 
+    Args:
+        require_quota_headroom: Instances the account must be able to add. ``None``
+            derives it from ``max_capacity - current`` — the jump a target-tracking
+            policy actually requests when the metric overshoots, which it does by
+            design here. Checking only for 1 would have passed the case that motivated
+            this guard: quota 4, three in use, and a policy that asked for three more
+            at once. ``0`` skips the read.
+
     Raises:
         FixtureError: If no scalable target or policy exists, ``max_capacity`` is
-            too low, or scale-out is suspended (e.g. left over from an aborted
-            freeze).
+            too low, scale-out is suspended (e.g. left over from an aborted freeze),
+            or the account has no room for the instances the policy will request.
     """
     state = capture(
         endpoint_name, region=region, variant=variant, appscaling=appscaling, sagemaker=sagemaker
@@ -482,6 +655,51 @@ def require_scalable(
             f"{state.resource_id}: no scaling policies attached, so nothing will "
             "trigger a scale event"
         )
+
+    # The delta a target-tracking policy asks for, not +1. Its activities read "Setting
+    # desired instance count to <max_capacity>" when the metric overshoots the target,
+    # and SageMaker refuses the *whole* request rather than granting part of it — so the
+    # room needed is the jump, not one instance.
+    needed = (
+        max((state.max_capacity or 0) - state.current_instance_count, 1)
+        if require_quota_headroom is None
+        else require_quota_headroom
+    )
+    if needed > 0:
+        # The failure this catches is invisible from the endpoint: the policy fires,
+        # SageMaker refuses on quota, the activity is logged Failed, and the endpoint
+        # stays InService at its old count while the policy retries every 10s. Load
+        # would run to its timeout against a scale-out that cannot occur.
+        instance_type = variant_instance_type(
+            endpoint_name, region=region, variant=variant, sagemaker=sagemaker
+        )
+        if instance_type is not None:
+            headroom = endpoint_quota_headroom(
+                instance_type, region=region, quotas=quotas, sagemaker=sagemaker
+            )
+            fits = headroom.room_for(needed)
+            if fits is False:
+                raise FixtureError(
+                    f"{state.resource_id}: the account-level quota '{instance_type} for "
+                    f"endpoint usage' is {headroom.limit} in {region}, with "
+                    f"{headroom.in_use} already in use by "
+                    f"{', '.join(headroom.endpoints_in_use)}. The policy will ask for "
+                    f"{needed} more (max_capacity={state.max_capacity} from "
+                    f"{state.current_instance_count}) and SageMaker will reject the whole "
+                    "request with ResourceLimitExceeded — the endpoint stays InService at "
+                    "its current count and nothing surfaces there. Request an increase for "
+                    f"quota {ENDPOINT_USAGE_QUOTA_CODE}, delete an endpoint holding one, or "
+                    f"lower max_capacity to {state.current_instance_count + (headroom.available or 0)}."
+                )
+            if fits is None:
+                logger.warning(
+                    "Could not read the '{} for endpoint usage' quota, so headroom for {} "
+                    "more instance(s) is unverified. If the policy fires and no instance "
+                    "appears, check `aws application-autoscaling "
+                    "describe-scaling-activities` for ResourceLimitExceeded.",
+                    instance_type,
+                    needed,
+                )
     return state
 
 

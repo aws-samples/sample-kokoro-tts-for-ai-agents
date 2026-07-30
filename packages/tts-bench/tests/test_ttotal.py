@@ -34,6 +34,7 @@ from tts_bench.ttotal import (
     TimelineStage,
     TTotalError,
     TTotalReport,
+    _explain_no_scale_out,
     assemble_timeline,
     collect_timeline,
     container_timeline,
@@ -656,6 +657,41 @@ class TestPolicyReads:
         assert policy_alarm_names(client, endpoint=ENDPOINT) == []
 
 
+#: Verbatim from the ``StatusMessage`` of the activity that blocked the first live run.
+#: The wording is AWS's, which is why the module quotes it rather than classifying it.
+QUOTA_REFUSAL = (
+    "Failed to set desired instance count to 4. Reason: The account-level service limit "
+    "'ml.g5.xlarge for endpoint usage' is 4 Instances, with current utilization of 3 "
+    "Instances and a request delta of 3 Instances. Please use AWS Service Quotas to "
+    "request an increase for this quota."
+)
+
+
+def _activity(
+    *,
+    at_s: float,
+    status: str = "Successful",
+    activity_id: str = "act-1",
+    description: str = "Setting desired instance count to 2.",
+    status_message: str | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "ActivityId": activity_id,
+        "ServiceNamespace": "sagemaker",
+        "ResourceId": RID,
+        "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+        "Description": description,
+        "Cause": "monitor alarm TargetTracking-AlarmHigh in state ALARM",
+        "StartTime": T0 + timedelta(seconds=at_s),
+        "StatusCode": status,
+    }
+    if status == "Successful":
+        entry["EndTime"] = T0 + timedelta(seconds=at_s + 185)
+    if status_message is not None:
+        entry["StatusMessage"] = status_message
+    return entry
+
+
 def _stub_collect(
     cloudwatch: Any,
     appscaling: Any,
@@ -664,6 +700,7 @@ def _stub_collect(
     log_lines: list[str],
     concurrency: float = 2.0,
     new_stream: bool = True,
+    activities: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, Any, Any]:
     """Queue one full pass of ``collect_timeline``'s reads, in call order."""
     cw_client, cw_stub = cloudwatch
@@ -699,21 +736,7 @@ def _stub_collect(
     )
     aas_stub.add_response(
         "describe_scaling_activities",
-        {
-            "ScalingActivities": [
-                {
-                    "ActivityId": "act-1",
-                    "ServiceNamespace": "sagemaker",
-                    "ResourceId": RID,
-                    "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
-                    "Description": "Setting desired instance count to 2.",
-                    "Cause": "monitor alarm TargetTracking-AlarmHigh in state ALARM",
-                    "StartTime": T0 + timedelta(seconds=55),
-                    "EndTime": T0 + timedelta(seconds=240),
-                    "StatusCode": "Successful",
-                }
-            ]
-        },
+        {"ScalingActivities": activities if activities is not None else [_activity(at_s=55)]},
     )
     streams = [
         {
@@ -903,3 +926,157 @@ class TestCollectTimeline:
         assert any("floor" in n for n in report.notes)
         # Still reports a number, ending at in_service.
         assert report.t_total_s == pytest.approx(240.0)
+
+    def test_times_the_activity_that_worked_not_the_ones_refused(
+        self, cloudwatch: Any, appscaling: Any, logs: Any
+    ) -> None:
+        # A quota-blocked policy retries every ten seconds, so the *first* activity in
+        # the window is a rejection. Timing it would attribute the whole AWS half to an
+        # attempt that changed nothing — here, 55s early.
+        cw, aas, lg = _stub_collect(
+            cloudwatch,
+            appscaling,
+            logs,
+            log_lines=LOG_LINES,
+            activities=[
+                _activity(at_s=0, status="Failed", activity_id="f1", status_message=QUOTA_REFUSAL),
+                _activity(at_s=10, status="Failed", activity_id="f2", status_message=QUOTA_REFUSAL),
+                _activity(at_s=55, activity_id="ok"),
+            ],
+        )
+
+        report = self._call(cw, aas, lg)
+
+        assert report.at(TimelineStage.ACTIVITY_STARTED) == T0 + timedelta(seconds=55)
+
+    def test_failed_activities_are_reported_in_awss_own_words(
+        self, cloudwatch: Any, appscaling: Any, logs: Any
+    ) -> None:
+        # The StatusMessage is the only place the reason appears anywhere in AWS, so it
+        # is quoted rather than summarized — the set of reasons is AWS's to extend.
+        cw, aas, lg = _stub_collect(
+            cloudwatch,
+            appscaling,
+            logs,
+            log_lines=LOG_LINES,
+            activities=[
+                _activity(at_s=0, status="Failed", activity_id="f1", status_message=QUOTA_REFUSAL),
+                _activity(at_s=55, activity_id="ok"),
+            ],
+        )
+
+        report = self._call(cw, aas, lg)
+
+        note = next(n for n in report.notes if "FAILED" in n)
+        assert "1 of 2" in note
+        assert "ml.g5.xlarge for endpoint usage" in note
+        assert "InService at its old count" in note
+
+    def test_an_all_failed_window_still_reports_a_timeline(
+        self, cloudwatch: Any, appscaling: Any, logs: Any
+    ) -> None:
+        # Reachable: capacity came from somewhere else — a manual bump, or a scale-in
+        # reversing — while every policy attempt was refused. The report says so instead
+        # of implying the policy delivered the instance.
+        cw, aas, lg = _stub_collect(
+            cloudwatch,
+            appscaling,
+            logs,
+            log_lines=LOG_LINES,
+            activities=[
+                _activity(at_s=0, status="Failed", activity_id="f1", status_message=QUOTA_REFUSAL)
+            ],
+        )
+
+        report = self._call(cw, aas, lg)
+
+        entry = next(e for e in report.timeline if e.stage == str(TimelineStage.ACTIVITY_STARTED))
+        assert entry.note is not None and "no activity succeeded" in entry.note
+        assert report.at(TimelineStage.IN_SERVICE) == T0 + timedelta(seconds=240)
+
+
+class TestExplainNoScaleOut:
+    """The error text after a timeout.
+
+    A run that reaches this has already spent ``max_wait_s`` of real load. Two causes
+    are indistinguishable from the endpoint — which stays ``InService`` at its old count
+    either way — so the message has to name which one it was, or the operator pays for
+    another run to find out.
+    """
+
+    def _explain(self, client: Any, **overrides: Any) -> str:
+        kwargs: dict[str, Any] = {
+            "endpoint": ENDPOINT,
+            "variant": VARIANT,
+            "from_instances": 1,
+            "max_wait_s": 1500.0,
+            "scaling_target": 0.713,
+            "window_start": T0,
+            "window_end": T0 + timedelta(seconds=1500),
+        }
+        kwargs.update(overrides)
+        return _explain_no_scale_out(client, **kwargs)
+
+    def test_a_refusal_is_quoted_and_named_as_one(self, appscaling: Any) -> None:
+        client, stub = appscaling
+        stub.add_response(
+            "describe_scaling_activities",
+            {
+                "ScalingActivities": [
+                    _activity(
+                        at_s=100,
+                        status="Failed",
+                        activity_id="f1",
+                        description="Setting desired instance count to 4.",
+                        status_message=QUOTA_REFUSAL,
+                    )
+                ]
+            },
+        )
+
+        message = self._explain(client)
+
+        assert "The policy DID act" in message
+        assert "not a detection problem" in message
+        assert "ml.g5.xlarge for endpoint usage" in message
+
+    def test_a_slow_provision_is_told_apart_from_a_refusal(self, appscaling: Any) -> None:
+        # Same visible outcome, opposite fix: wait longer rather than change the account.
+        client, stub = appscaling
+        stub.add_response(
+            "describe_scaling_activities",
+            {"ScalingActivities": [_activity(at_s=100, activity_id="ok")]},
+        )
+
+        message = self._explain(client)
+
+        assert "none failed" in message
+        assert "--max-wait" in message
+
+    def test_no_activity_at_all_points_at_the_offered_load(self, appscaling: Any) -> None:
+        # The policy never decided, so the fault is upstream: too little load, or an
+        # alarm still in INSUFFICIENT_DATA.
+        client, stub = appscaling
+        stub.add_response("describe_scaling_activities", {"ScalingActivities": []})
+
+        message = self._explain(client)
+
+        assert "the policy never acted" in message
+        assert "C_target=0.713" in message
+        assert "tts-bench drift" in message
+
+    def test_every_message_states_the_count_it_never_passed(self, appscaling: Any) -> None:
+        client, stub = appscaling
+        stub.add_response("describe_scaling_activities", {"ScalingActivities": []})
+
+        message = self._explain(client, from_instances=2, max_wait_s=600.0)
+
+        assert "more than 2 instance(s) within 600s" in message
+
+    def test_an_unreadable_activity_log_does_not_mask_the_timeout(self, appscaling: Any) -> None:
+        # scaling_activities() degrades to [] on AccessDenied, so this reads as "never
+        # acted". The timeout itself still has to survive being reported.
+        client, stub = appscaling
+        stub.add_client_error("describe_scaling_activities", service_error_code="AccessDenied")
+
+        assert "did not reach more than 1 instance(s)" in self._explain(client)
