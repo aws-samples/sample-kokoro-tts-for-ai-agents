@@ -221,6 +221,17 @@ class TestResolvingS:
         assert result.exit_code != 0
         assert "--s-mean is required" in result.output
 
+    def test_force_desired_does_not_need_one(self, runner: CliRunner) -> None:
+        # It starts no load driver, so there is no arrival rate to convert. Requiring S
+        # here would make the cheapest probe available -- can this endpoint get a second
+        # instance at all? -- wait on a C_max measurement it does not use.
+        result, calls = _run(runner, "--trigger", TTOTAL_TRIGGER_FORCE_DESIRED)
+        assert result.exit_code == 0
+        assert calls[0]["s_mean_s"] == 0.0
+        # And it must not print a service time it never had.
+        assert "S=0ms" not in result.output
+        assert "do not apply" in result.output
+
 
 class TestResolvingTheBudget:
     def test_takes_the_loosest_budget_in_the_curve(self, runner: CliRunner, tmp_path) -> None:

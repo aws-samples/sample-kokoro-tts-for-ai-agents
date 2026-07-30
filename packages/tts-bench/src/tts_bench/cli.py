@@ -567,12 +567,17 @@ def ttotal(
             )
 
     if s_mean_s is None:
-        raise click.UsageError(
-            "--s-mean is required (or pass --measured <cmax artifact> to read it). It "
-            "converts a target concurrency into the arrival rate the open-loop driver "
-            "needs, and guessing it would offer the wrong load."
-        )
-    if s_mean_s <= 0:
+        if trigger == TTOTAL_TRIGGER_DRIVE_LOAD:
+            raise click.UsageError(
+                "--s-mean is required (or pass --measured <cmax artifact> to read it). It "
+                "converts a target concurrency into the arrival rate the open-loop driver "
+                "needs, and guessing it would offer the wrong load."
+            )
+        # force-desired starts no load driver, so there is no rate to convert. Requiring a
+        # service time here would make the cheapest probe available -- can this endpoint
+        # get another instance at all? -- depend on having already measured C_max.
+        s_mean_s = 0.0
+    elif s_mean_s <= 0:
         raise click.BadParameter("--s-mean must be positive")
     if load_multiple <= 1.0:
         raise click.BadParameter(
@@ -604,15 +609,20 @@ def ttotal(
             "budget, so there is no recovery without one."
         )
 
-    click.echo(
-        f"{model} ({endpoint}): trigger={trigger}, C_target={scaling_target:.3f}, "
-        f"offering {scaling_target * load_multiple:.2f} concurrency, "
-        f"S={s_mean_s * 1000:.0f}ms, budget={ttfab_budget_ms:.0f}ms, transport={transport}"
-    )
     if trigger == TTOTAL_TRIGGER_FORCE_DESIRED:
+        click.echo(
+            f"{model} ({endpoint}): trigger={trigger}, budget={ttfab_budget_ms:.0f}ms. "
+            "No load is offered, so C_target and S do not apply."
+        )
         click.echo(
             "NOTE: --trigger force-desired measures the container half only. The result is "
             "a lower bound on T_total, not T_total."
+        )
+    else:
+        click.echo(
+            f"{model} ({endpoint}): trigger={trigger}, C_target={scaling_target:.3f}, "
+            f"offering {scaling_target * load_multiple:.2f} concurrency, "
+            f"S={s_mean_s * 1000:.0f}ms, budget={ttfab_budget_ms:.0f}ms, transport={transport}"
         )
 
     from contextlib import nullcontext

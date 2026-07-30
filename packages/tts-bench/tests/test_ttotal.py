@@ -1195,6 +1195,29 @@ class TestExplainNoScaleOut:
         assert "none failed and none is still in flight" in message
         assert "describe-scaling-activities" in message
 
+    def test_force_desired_is_not_diagnosed_from_the_activity_log(self, appscaling: Any) -> None:
+        # That mode sets DesiredInstanceCount directly, so no policy runs and the activity
+        # log is silent by design. Reading "the policy never acted" out of that silence
+        # would send the operator to check a C_target the run never used -- and the Stubber
+        # proves the point: no describe_scaling_activities response is queued, so any call
+        # fails the test.
+        client, _ = appscaling
+
+        message = self._explain(client, trigger=TRIGGER_FORCE_DESIRED, endpoint_status="Updating")
+
+        assert "no policy was involved" in message or "still Updating" in message
+        assert "C_target" not in message
+        assert "instance capacity for the type" in message
+
+    def test_force_desired_back_in_service_means_aws_gave_up(self, appscaling: Any) -> None:
+        # The observed ending: SageMaker returns the endpoint to InService at the old count
+        # and records no FailureReason anywhere. Nothing else in the account says so.
+        client, _ = appscaling
+
+        message = self._explain(client, trigger=TRIGGER_FORCE_DESIRED, endpoint_status="InService")
+
+        assert "abandoned the change without recording a failure" in message
+
     def test_no_activity_at_all_points_at_the_offered_load(self, appscaling: Any) -> None:
         # The policy never decided, so the fault is upstream: too little load, or an
         # alarm still in INSUFFICIENT_DATA.

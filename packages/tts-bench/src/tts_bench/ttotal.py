@@ -764,6 +764,18 @@ def wait_for_scale_out(
     )
 
 
+def _endpoint_status(sagemaker: BaseClient, endpoint: str) -> str | None:
+    """``EndpointStatus``, or ``None`` if it cannot be read.
+
+    Only used to explain a timeout, so a failure here must not replace the diagnosis with
+    its own traceback.
+    """
+    try:
+        return str(sagemaker.describe_endpoint(EndpointName=endpoint).get("EndpointStatus", ""))
+    except Exception:  # noqa: BLE001 - a diagnosis is worth more than this detail
+        return None
+
+
 def set_desired_count(
     sagemaker: BaseClient,
     *,
@@ -1288,6 +1300,8 @@ def measure(
                 scaling_target=scaling_target,
                 window_start=window_start,
                 window_end=window_end,
+                trigger=trigger,
+                endpoint_status=_endpoint_status(sagemaker, endpoint),
             )
         restore_desired_count(
             sagemaker, endpoint=endpoint, variant=variant, to_instances=desired_before
@@ -1330,20 +1344,45 @@ def _explain_no_scale_out(
     scaling_target: float,
     window_start: datetime,
     window_end: datetime,
+    trigger: str = TRIGGER_DRIVE_LOAD,
+    endpoint_status: str | None = None,
 ) -> str:
     """Why no scale-out happened, distinguishing "never acted" from "was refused".
 
-    Three outcomes, not two, and they are ordered by how much they cost to fix. The
+    Several outcomes, not two, and they are ordered by how much they cost to fix. The
     endpoint looks the same in all of them — ``InService`` or ``Updating`` at its old
     count — but a refusal needs the account changed, an in-flight activity needs only a
     longer wait, and no activity at all means the policy never decided. A ``Failed``
     activity's ``StatusMessage`` carries AWS's own reason, quoted rather than classified
     because the set of reasons is AWS's to extend.
+
+    Under ``force-desired`` there is no policy in the path at all, so the activity log is
+    silent by design and reading anything into its silence would be wrong. That mode is
+    diagnosed from the endpoint's own status instead.
     """
     head = (
         f"{endpoint} did not reach more than {from_instances} instance(s) within "
         f"{max_wait_s:.0f}s. "
     )
+    if trigger == TRIGGER_FORCE_DESIRED:
+        # No policy was involved, so "no scaling activity" is expected rather than a
+        # finding. Updating means SageMaker took the change and is trying to place the
+        # instance; that it can take this long with the quota free is what makes the mode
+        # worth running — it isolates provisioning from everything upstream of it.
+        if endpoint_status == "Updating":
+            return head + (
+                "DesiredInstanceCount was set directly and the endpoint is still Updating, "
+                "so SageMaker accepted the change and has not placed the instance. With "
+                "quota free, that points at instance capacity for the type rather than at "
+                "anything in the scaling config. Check `aws sagemaker describe-endpoint` "
+                "for a FailureReason, and consider another instance type or region."
+            )
+        return head + (
+            f"DesiredInstanceCount was set directly, so no policy was involved and the "
+            f"scaling activity log is silent by design. The endpoint reports "
+            f"{endpoint_status or 'an unknown status'}: if it is back to InService at the "
+            "old count, SageMaker abandoned the change without recording a failure."
+        )
     activities = scaling_activities(
         appscaling, endpoint=endpoint, variant=variant, start=window_start, end=window_end
     )
