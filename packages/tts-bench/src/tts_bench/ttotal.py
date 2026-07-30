@@ -84,6 +84,18 @@ DEFAULT_POLL_INTERVAL_S = 10.0
 new count up to one interval late — so it is short enough not to dominate the container
 stages it sits next to."""
 
+SLOW_PROVISION_SUSPICION_S = 900.0
+"""Past this, an in-flight activity is more likely blocked on instance capacity than on a
+slow image pull. Set from the observed extremes: cold container starts in this repo run 5-10
+minutes, while a run that never got its instance at all sat InProgress for 34. The two need
+opposite responses — wait longer, versus stop waiting — so the message changes here."""
+
+DEFAULT_RESTORE_WAIT_S = 900.0
+"""How long the restore waits out an ``Updating`` endpoint. Longer than it sounds because
+this is the tail of a run that already timed out: SageMaker has been observed holding
+``Updating`` for half an hour while it tries to place instances, and the cost of giving up
+early is a fleet left at the raised count."""
+
 DEFAULT_SETTLE_S = 180.0
 """Load held past the scale event, so the recovery bound has traffic on the far side of
 it. Without this the run ends at ``in_service`` and ``T_total`` stops short of the thing
@@ -775,25 +787,65 @@ def restore_desired_count(
     endpoint: str,
     variant: str = DEFAULT_VARIANT,
     to_instances: int,
+    max_wait_s: float = DEFAULT_RESTORE_WAIT_S,
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Put ``DesiredInstanceCount`` back. Best-effort, never raises.
 
     Runs on every exit path including Ctrl-C: a measurement must not leave an endpoint
     parked at four instances. A failure here is logged rather than raised, because raising
     from a ``finally`` would mask whatever actually went wrong.
+
+    Waits out ``Updating`` first. A run that times out mid-scale-out leaves the endpoint
+    exactly there, and SageMaker answers a capacity change in that state with
+    ``ValidationException: Cannot update in-progress endpoint`` — so the naive restore
+    fails at the one moment it is most needed, and the fleet keeps billing at the raised
+    count. On giving up it says what to run by hand, since nothing else will shrink it:
+    ``DesiredInstanceCount`` is not what a scale-in policy reads.
     """
+    deadline = time.monotonic() + max_wait_s
     try:
-        desired, _ = read_capacity(sagemaker, endpoint, variant)
-        if desired == to_instances:
-            return
+        while True:
+            described = sagemaker.describe_endpoint(EndpointName=endpoint)
+            status = described.get("EndpointStatus", "")
+            desired = next(
+                (
+                    int(v.get("DesiredInstanceCount", 0))
+                    for v in described.get("ProductionVariants", [])
+                    if v.get("VariantName") == variant
+                ),
+                None,
+            )
+            if desired == to_instances:
+                return
+            if status != "Updating":
+                break
+            if time.monotonic() >= deadline:
+                raise TTotalError(
+                    f"{endpoint} was still Updating after {max_wait_s:.0f}s, so its capacity "
+                    f"could not be changed back"
+                )
+            logger.info(
+                "{} is Updating; waiting {:.0f}s to restore {} instance(s)",
+                endpoint,
+                poll_interval_s,
+                to_instances,
+            )
+            sleep(poll_interval_s)
         set_desired_count(sagemaker, endpoint=endpoint, variant=variant, to_instances=to_instances)
     except Exception as exc:  # noqa: BLE001 - restoration must not mask a real failure
         logger.error(
-            "Could not restore {} to {} instance(s): {}. Check it manually; the scale-in "
-            "policy will not shrink the fleet until its cooldown elapses.",
+            "Could not restore {} to {} instance(s): {}. It is still billing at the raised "
+            "count and no policy will shrink it — run: aws sagemaker "
+            "update-endpoint-weights-and-capacities --endpoint-name {} "
+            "--desired-weights-and-capacities VariantName={},DesiredInstanceCount={}",
             endpoint,
             to_instances,
             exc,
+            endpoint,
+            variant,
+            to_instances,
         )
 
 
@@ -1159,6 +1211,15 @@ def measure(
     load_events: list[LoadEvent] = []
     stop_event = threading.Event()
     driver: threading.Thread | None = None
+    # Bound before the try so the finally can read them on any exit path, Ctrl-C included.
+    event = ScaleEvent(
+        from_instances=current_before,
+        to_instances=current_before,
+        desired_changed_at=None,
+        in_service_at=None,
+    )
+    timed_out = False
+    diagnosis: str | None = None
 
     try:
         if trigger == TRIGGER_FORCE_DESIRED:
@@ -1195,6 +1256,7 @@ def measure(
             max_wait_s=max_wait_s,
             poll_interval_s=poll_interval_s,
         )
+        timed_out = not event.occurred
         if event.occurred and driver is not None:
             # Keep offering load past the event so the recovery bound has data on the far
             # side of it. Without this, T_total stops at in_service.
@@ -1209,19 +1271,15 @@ def measure(
                     "Load driver still running after 120s; requests may still be arriving at {}",
                     endpoint,
                 )
-        restore_desired_count(
-            sagemaker, endpoint=endpoint, variant=variant, to_instances=desired_before
-        )
-
-    window_end = datetime.now(UTC)
-
-    if not event.occurred:
-        # A timeout has two very different causes — the policy never acted, or it acted
-        # and was refused — and only the activity log distinguishes them. Read it here so
-        # the error says which, rather than leaving the operator to guess after a run
-        # that already cost real minutes of load.
-        raise TTotalError(
-            _explain_no_scale_out(
+        # Read the activities BEFORE restoring. Restoring is itself a capacity change, and
+        # Application Auto Scaling marks a still-running activity Overridden when one
+        # arrives — so a restore that works destroys the evidence of why the run timed out,
+        # turning "InProgress for 34 minutes" into an ambiguous "Overridden".
+        window_end = datetime.now(UTC)
+        # Only on a timeout: a Ctrl-C never sets this, so an interrupted run restores
+        # immediately instead of spending API calls explaining a scale-out nobody waited for.
+        if timed_out:
+            diagnosis = _explain_no_scale_out(
                 appscaling,
                 endpoint=endpoint,
                 variant=variant,
@@ -1231,7 +1289,16 @@ def measure(
                 window_start=window_start,
                 window_end=window_end,
             )
+        restore_desired_count(
+            sagemaker, endpoint=endpoint, variant=variant, to_instances=desired_before
         )
+
+    if diagnosis is not None:
+        # A timeout has several very different causes — the policy never acted, it acted
+        # and was refused, or AWS took the change and never delivered — and only the
+        # activity log distinguishes them. Say which, rather than leaving the operator to
+        # guess after a run that already cost real minutes of load.
+        raise TTotalError(diagnosis)
 
     return collect_timeline(
         cloudwatch=cloudwatch,
@@ -1292,12 +1359,29 @@ def _explain_no_scale_out(
         # Not a failure: AWS accepted the change and is still applying it. Pulling a
         # multi-GB image onto several instances at once routinely outlasts the default
         # wait, and calling that an error would send the operator after the wrong thing.
+        #
+        # Past a point, though, "still provisioning" stops being the likely story. A live
+        # run sat InProgress for 34 minutes while EC2 could not place the instances, and
+        # SageMaker neither failed the activity nor set a FailureReason — it simply
+        # returned the endpoint to InService at the old count. Waiting longer would not
+        # have helped, so beyond the threshold this says capacity, not patience.
         waited = (window_end - in_flight[0].start_time).total_seconds()
+        aws_said = in_flight[0].status_message or in_flight[0].description
+        if waited >= SLOW_PROVISION_SUSPICION_S:
+            return head + (
+                f"The change was ACCEPTED and has been {in_flight[0].status_code} for "
+                f"{waited / 60:.0f}min — far longer than an image pull. AWS reserves the "
+                f"quota when it accepts, so this reads as instance capacity being "
+                f"unavailable for the type rather than a slow start, and it is reported "
+                f"neither as a failed activity nor as an endpoint FailureReason. Check "
+                f"whether CurrentInstanceCount ever moved; if not, try another instance "
+                f"type or region rather than a longer --max-wait. AWS gave: {aws_said}"
+            )
         return head + (
             f"The change was ACCEPTED and is still {in_flight[0].status_code} after "
             f"{waited:.0f}s — AWS is provisioning, not refusing. Retry with a longer "
             f"--max-wait, or lower max_capacity so fewer instances are pulled at once. "
-            f"AWS gave: {in_flight[0].status_message or in_flight[0].description}"
+            f"AWS gave: {aws_said}"
         )
     if activities:
         return head + (

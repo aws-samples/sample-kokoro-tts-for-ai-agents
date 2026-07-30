@@ -21,6 +21,7 @@ from typing import Any
 import boto3
 import pytest
 from botocore.stub import Stubber
+from loguru import logger
 
 from shared.stages import format_stage_marker, parse_stage_markers
 from tts_bench.loadgen import LoadEvent
@@ -152,12 +153,27 @@ def logs() -> Any:
     stub.deactivate()
 
 
-def _variant(*, desired: int, current: int) -> dict[str, Any]:
+@pytest.fixture
+def logged() -> Any:
+    """Captured loguru messages.
+
+    ``caplog`` does not see these — loguru does not propagate to the stdlib ``logging``
+    tree, so a ``caplog`` assertion would pass whether or not anything was logged.
+    """
+    records: list[str] = []
+    sink_id = logger.add(lambda message: records.append(message.record["message"]), level="WARNING")
+    try:
+        yield records
+    finally:
+        logger.remove(sink_id)
+
+
+def _variant(*, desired: int, current: int, status: str = "InService") -> dict[str, Any]:
     return {
         "EndpointName": ENDPOINT,
         "EndpointArn": f"arn:aws:sagemaker:us-east-1:1234:endpoint/{ENDPOINT}",
         "EndpointConfigName": f"{ENDPOINT}-config",
-        "EndpointStatus": "InService",
+        "EndpointStatus": status,
         "CreationTime": T0,
         "LastModifiedTime": T0,
         "ProductionVariants": [
@@ -595,6 +611,55 @@ class TestRestoreDesiredCount:
         stub.add_client_error("describe_endpoint", service_error_code="ValidationException")
 
         restore_desired_count(client, endpoint=ENDPOINT, to_instances=1)
+
+    def test_it_waits_out_an_updating_endpoint(self, sagemaker: Any) -> None:
+        # The failure this exists for: a run that times out mid-scale-out leaves the
+        # endpoint Updating, and SageMaker answers a capacity change in that state with
+        # "Cannot update in-progress endpoint" — so the restore failed at the one moment
+        # it mattered and the fleet kept billing at four instances.
+        client, stub = sagemaker
+        stub.add_response("describe_endpoint", _variant(desired=4, current=1, status="Updating"))
+        stub.add_response("describe_endpoint", _variant(desired=4, current=1, status="Updating"))
+        stub.add_response("describe_endpoint", _variant(desired=4, current=1))
+        stub.add_response(
+            "update_endpoint_weights_and_capacities",
+            {"EndpointArn": f"arn:aws:sagemaker:us-east-1:1234:endpoint/{ENDPOINT}"},
+            {
+                "EndpointName": ENDPOINT,
+                "DesiredWeightsAndCapacities": [
+                    {"VariantName": VARIANT, "DesiredInstanceCount": 1}
+                ],
+            },
+        )
+        slept: list[float] = []
+
+        restore_desired_count(
+            client, endpoint=ENDPOINT, to_instances=1, sleep=slept.append, poll_interval_s=5.0
+        )
+
+        stub.assert_no_pending_responses()
+        assert slept == [5.0, 5.0]
+
+    def test_it_gives_up_and_says_what_to_run(self, sagemaker: Any, logged: list[str]) -> None:
+        # Waiting forever in a `finally` would hang the CLI. Giving up silently would
+        # leave an endpoint at the raised count with nothing to shrink it, since
+        # DesiredInstanceCount is not what a scale-in policy reads.
+        client, stub = sagemaker
+        for _ in range(3):
+            stub.add_response(
+                "describe_endpoint", _variant(desired=4, current=1, status="Updating")
+            )
+
+        restore_desired_count(
+            client,
+            endpoint=ENDPOINT,
+            to_instances=1,
+            sleep=lambda _: None,
+            max_wait_s=0.0,
+        )
+
+        assert any("still billing at the raised count" in line for line in logged)
+        assert any("update-endpoint-weights-and-capacities" in line for line in logged)
 
 
 def _policy(*, target_value: float | None = 0.713, alarms: list[str] | None = None) -> dict:
@@ -1041,9 +1106,35 @@ class TestExplainNoScaleOut:
         assert "ml.g5.xlarge for endpoint usage" in message
 
     def test_a_slow_provision_is_told_apart_from_a_refusal(self, appscaling: Any) -> None:
-        # The live case: AWS accepted "set desired to 4" and was still pulling images
-        # 24 minutes later. Reporting that as a failure sent the reader after the quota,
-        # which had already been fixed. Opposite fix: wait longer.
+        # AWS accepted "set desired to 4" and is still pulling images. Reporting that as a
+        # failure sent one live run's reader after the quota, which had already been fixed.
+        # Opposite fix: wait longer.
+        client, stub = appscaling
+        stub.add_response(
+            "describe_scaling_activities",
+            {"ScalingActivities": [_activity(at_s=50, status="InProgress", activity_id="live")]},
+        )
+
+        message = self._explain(client, window_end=T0 + timedelta(seconds=500))
+
+        assert "ACCEPTED" in message
+        assert "not refusing" in message
+        assert "--max-wait" in message
+        assert "lower max_capacity" in message
+        # The elapsed figure, so "still provisioning" can be judged against how long.
+        assert "450s" in message
+        # And emphatically NOT the word that sent the last read astray.
+        assert "failed" not in message.lower()
+
+    def test_a_very_long_in_flight_reads_as_capacity_not_patience(self, appscaling: Any) -> None:
+        """The live outcome, and the one a longer ``--max-wait`` cannot fix.
+
+        AWS accepted "set desired instance count to 4", ``AWS/Usage`` for
+        ``endpoint/ml.g5.xlarge`` went to 4 — the quota *was* reserved — and then no
+        instance ever arrived. 34 minutes later the endpoint returned to ``InService`` at
+        its old count with no ``FailureReason`` and the activity never left ``InProgress``.
+        Advising a longer wait there burns another run for the same nothing.
+        """
         client, stub = appscaling
         stub.add_response(
             "describe_scaling_activities",
@@ -1066,13 +1157,12 @@ class TestExplainNoScaleOut:
         message = self._explain(client)
 
         assert "ACCEPTED" in message
-        assert "not refusing" in message
-        assert "--max-wait" in message
-        assert "lower max_capacity" in message
-        # The elapsed figure, so "still provisioning" can be judged against how long.
-        assert "1450s" in message
-        # And emphatically NOT the word that sent the last read astray.
-        assert "failed" not in message.lower()
+        assert "capacity being unavailable" in message
+        assert "24min" in message
+        # The advice has to invert, or the reader pays for the same 25 minutes again.
+        assert "another instance type or region rather than a longer --max-wait" in message
+        # It may say AWS did not *report* a failure; it must not claim one occurred.
+        assert "scaling activities failed" not in message
 
     def test_a_refusal_wins_over_a_later_retry_in_flight(self, appscaling: Any) -> None:
         # A window can hold both. The refusal is the more expensive finding, so it leads.
