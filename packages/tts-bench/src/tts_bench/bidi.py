@@ -318,12 +318,15 @@ async def invoke_bidi_async(
         await stream.input_stream.send(
             RequestStreamEventPayloadPart(value=RequestPayloadPart(bytes_=message))
         )
-        # Closed immediately: the benchmark sends one synthesis per session, so
-        # holding the input open would make the container wait on a request that
-        # is never coming. One session == one request keeps this transport's
-        # results comparable with the response-stream path's.
-        await stream.input_stream.close()
 
+        # The input stream stays open until the audio is drained. Closing it
+        # right after the send — which reads as the natural "one request per
+        # session" shape — makes SageMaker tear the WebSocket down before the
+        # container reads the payload: the handler logs connection open then
+        # connection closed, synthesizes nothing, and the stream ends with zero
+        # audio and no error frame to explain it. Verified against
+        # speech-kokoro-82m, where closing early yields 0 bytes and holding the
+        # input open yields a full synthesis for the same request.
         _, output_stream = await stream.await_output()
         return await _consume_output(
             output_stream,
@@ -390,13 +393,22 @@ async def _consume_output(
         # every sample counts. Hence the fall-through rather than `continue`.
         decoded = _decode_control_frame(chunk) if chunk[0:1] == b"{" else None
         if decoded is not None:
-            if decoded.get("type") == "error":
+            frame_type = decoded.get("type")
+            if frame_type == "error":
                 message = str(decoded.get("message", ""))
                 return result(
                     classify_error_frame(message),
                     error_class="ErrorFrame",
                     error_message=message,
                 )
+            if frame_type == "synthesis_complete":
+                # This frame, not a closed stream, is what ends a request. The
+                # containers keep the session open for a further synthesis (they
+                # accept an explicit {"type": "close"}), so receive() would block
+                # here until the read timeout on every otherwise-successful
+                # request. Returning on the frame is also what keeps latency
+                # measuring synthesis rather than the teardown that follows it.
+                break
             continue
 
         if state.ttfab_ms is None:
@@ -506,21 +518,31 @@ def _pcm_duration_s(pcm_bytes: int) -> float:
 
 
 async def _close_quietly(stream: Any) -> None:
-    """Close a stream, logging rather than raising on failure.
+    """Close a stream and its input half, logging rather than raising on failure.
 
     A close error must not overwrite the measurement: the request already has an
     outcome by this point, and losing it to a teardown fault would silently
     remove a sample from the run.
+
+    The input half is closed here rather than after the send, because closing it
+    early makes SageMaker drop the session before the container reads the
+    payload. Doing it in teardown still releases it on every path — including an
+    abandoned deadline — so a ladder does not leak a half-open stream per
+    request and run out of connections before its highest step.
     """
-    close = getattr(stream, "close", None)
-    if close is None:
-        return
-    try:
-        outcome = close()
-        if _is_awaitable(outcome):
-            await outcome
-    except Exception as exc:  # noqa: BLE001 - teardown must never lose a result
-        logger.debug("bidi stream close failed: {}", exc)
+    input_stream = getattr(stream, "input_stream", None)
+    for target in (input_stream, stream):
+        if target is None:
+            continue
+        close = getattr(target, "close", None)
+        if close is None:
+            continue
+        try:
+            outcome = close()
+            if _is_awaitable(outcome):
+                await outcome
+        except Exception as exc:  # noqa: BLE001 - teardown must never lose a result
+            logger.debug("bidi stream close failed: {}", exc)
 
 
 def _is_awaitable(value: Any) -> bool:

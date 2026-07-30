@@ -109,18 +109,43 @@ class FakeInputStream:
 
 
 class FakeOutputStream:
-    """Yields scripted events, then ``None`` for end-of-stream."""
+    """Yields scripted events, then ``None`` for end-of-stream.
 
-    def __init__(self, events: list[Any], *, on_receive: Any = None) -> None:
+    ``hangs_after_events`` models what the live containers actually do: they keep
+    the session open after ``synthesis_complete`` awaiting a further request, so
+    ``receive()`` never returns ``None``. The default of ``None``-terminating is
+    kept for the tests that only care about frame classification, but any test
+    asserting a request *finishes* should use it — a fake that always ends the
+    stream cannot tell a working client from one that would block forever.
+    """
+
+    def __init__(
+        self,
+        events: list[Any],
+        *,
+        on_receive: Any = None,
+        hangs_after_events: bool = False,
+    ) -> None:
         self._events = list(events)
         self._on_receive = on_receive
+        self._hangs = hangs_after_events
         self.receives = 0
+        self.blocked = False
 
     async def receive(self) -> Any:
         self.receives += 1
         if self._on_receive is not None:
             self._on_receive(self.receives)
         if not self._events:
+            if self._hangs:
+                # A real hang would stall the suite, so record the fact and raise
+                # instead. Any test that trips this was relying on end-of-stream
+                # the container does not send.
+                self.blocked = True
+                raise AssertionError(
+                    "receive() was called after the last event: the container keeps "
+                    "the session open, so this request would block until timeout"
+                )
             return None
         return self._events.pop(0)
 
@@ -135,9 +160,12 @@ class FakeStream:
         on_receive: Any = None,
         send_error: BaseException | None = None,
         close_error: BaseException | None = None,
+        hangs_after_events: bool = False,
     ) -> None:
         self.input_stream = FakeInputStream()
-        self.output_stream = FakeOutputStream(events or [], on_receive=on_receive)
+        self.output_stream = FakeOutputStream(
+            events or [], on_receive=on_receive, hangs_after_events=hangs_after_events
+        )
         self._send_error = send_error
         self._close_error = close_error
         self.closed = False
@@ -497,10 +525,11 @@ class TestInvokeBidiSuccess:
         assert result.outcome is InvokeOutcome.OK
         assert result.chunks == 1
 
-    def test_sends_exactly_one_request_then_closes_the_input(self) -> None:
-        # One session == one request. Leaving the input open would make the
-        # container wait on a request that is never coming, and would make a
-        # bidi step incomparable with a response-stream step.
+    def test_sends_exactly_one_request_and_releases_the_input(self) -> None:
+        # One session == one request, which keeps a bidi step comparable with a
+        # response-stream step. The input is still released by the end of the
+        # call so a ladder does not leak a half-open stream per request -- but
+        # see TestInputStreamStaysOpenUntilDrained for *when* that happens.
         client = FakeBidiClient(FakeStream([_payload_event(PCM_100MS)]))
         before = time.time()
         _run(client, text="hello", voice="af_bella")
@@ -527,6 +556,210 @@ class TestInvokeBidiSuccess:
         client = FakeBidiClient(FakeStream([_payload_event(PCM_100MS)]))
         _run(client)
         assert client.stream.closed
+
+
+# --------------------------------------------------------------------------- #
+# Session shape — the two things the live endpoint disproved
+# --------------------------------------------------------------------------- #
+
+
+class TestSynthesisCompleteEndsTheRequest:
+    """The completion frame ends a request; a closed stream does not.
+
+    The containers keep the WebSocket open after ``synthesis_complete`` awaiting a
+    further synthesis — they accept an explicit ``{"type": "close"}`` — so
+    ``receive()`` never returns ``None`` for a successful request. Draining until
+    end-of-stream therefore blocked until the read timeout on *every* request that
+    worked, which at ladder rates reads as universal saturation.
+
+    Verified live against speech-kokoro-82m before and after the fix.
+    """
+
+    def test_returns_on_the_completion_frame_without_awaiting_end_of_stream(self) -> None:
+        client = FakeBidiClient(
+            FakeStream(
+                [
+                    _payload_event(PCM_100MS),
+                    _frame(type="synthesis_complete", request_id="r1", total_duration_s=0.1),
+                ],
+                # The container will not end the stream; if the client waits for
+                # that, this fake raises rather than hanging the suite.
+                hangs_after_events=True,
+            )
+        )
+
+        result = _run(client)
+
+        assert result.outcome is InvokeOutcome.OK
+        assert result.audio_bytes == len(PCM_100MS)
+        assert not client.stream.output_stream.blocked
+
+    def test_stops_reading_immediately_after_the_completion_frame(self) -> None:
+        # Exactly 2 receives: the audio and the frame. A third would be the
+        # blocking read that the live hang consisted of.
+        client = FakeBidiClient(
+            FakeStream(
+                [
+                    _payload_event(PCM_100MS),
+                    _frame(type="synthesis_complete", request_id="r1"),
+                ],
+                hangs_after_events=True,
+            )
+        )
+
+        _run(client)
+
+        assert client.stream.output_stream.receives == 2
+
+    def test_audio_after_the_completion_frame_is_not_counted(self) -> None:
+        # Nothing follows completion in practice; asserting it explicitly pins
+        # the frame as the boundary rather than a hint.
+        client = FakeBidiClient(
+            FakeStream(
+                [
+                    _payload_event(PCM_100MS),
+                    _frame(type="synthesis_complete", request_id="r1"),
+                    _payload_event(PCM_100MS),
+                ]
+            )
+        )
+
+        result = _run(client)
+
+        assert result.chunks == 1
+        assert result.audio_bytes == len(PCM_100MS)
+
+    def test_completion_with_no_audio_is_still_a_failure(self) -> None:
+        # A completion frame does not launder an empty synthesis into a success:
+        # zero audio at a ladder step is the signature of a container that
+        # accepted the session and produced nothing.
+        client = FakeBidiClient(
+            FakeStream(
+                [_frame(type="synthesis_complete", request_id="r1")],
+                hangs_after_events=True,
+            )
+        )
+
+        result = _run(client)
+
+        assert result.outcome is InvokeOutcome.MODEL_ERROR
+        assert result.error_class == "EmptyResponse"
+
+    def test_a_stream_that_does_end_is_still_handled(self) -> None:
+        # Not every peer behaves like kokoro; end-of-stream must remain a valid
+        # terminator so the transport works against a container that closes.
+        client = FakeBidiClient(FakeStream([_payload_event(PCM_100MS)]))
+
+        result = _run(client)
+
+        assert result.outcome is InvokeOutcome.OK
+        assert result.audio_bytes == len(PCM_100MS)
+
+    def test_other_control_frames_do_not_end_the_request(self) -> None:
+        # synthesis_start arrives before the audio; treating any frame as
+        # terminal would truncate every request to zero bytes.
+        client = FakeBidiClient(
+            FakeStream(
+                [
+                    _frame(type="synthesis_start", request_id="r1"),
+                    _payload_event(PCM_100MS),
+                    _frame(type="synthesis_complete", request_id="r1"),
+                ],
+                hangs_after_events=True,
+            )
+        )
+
+        result = _run(client)
+
+        assert result.outcome is InvokeOutcome.OK
+        assert result.audio_bytes == len(PCM_100MS)
+
+
+class TestInputStreamStaysOpenUntilDrained:
+    """Closing the input right after the send loses the whole request.
+
+    SageMaker tears the WebSocket down when the input half closes, and it does so
+    before the container reads the payload: the handler logs connection open then
+    connection closed, synthesizes nothing, and the output stream ends with zero
+    audio and no error frame to explain why. Verified live -- closing early gave
+    0 bytes, holding the input open gave a full 190800-byte synthesis for the
+    same request.
+
+    So the close must happen in teardown, after the audio is drained.
+    """
+
+    def test_the_input_is_not_closed_before_the_output_is_read(self) -> None:
+        closed_at_first_receive: list[bool] = []
+        stream = FakeStream([_payload_event(PCM_100MS)])
+
+        def _record(_n: int) -> None:
+            closed_at_first_receive.append(stream.input_stream.closed)
+
+        stream.output_stream._on_receive = _record
+
+        _run(FakeBidiClient(stream))
+
+        assert closed_at_first_receive, "the output stream was never read"
+        assert not closed_at_first_receive[0], (
+            "the input half was closed before the first output read; SageMaker "
+            "drops the session before the container reads the payload"
+        )
+
+    def test_the_input_is_closed_by_the_time_the_call_returns(self) -> None:
+        # Deferred, not skipped: a ladder that leaks a half-open input per
+        # request runs out of connections before its highest step.
+        client = FakeBidiClient(FakeStream([_payload_event(PCM_100MS)]))
+
+        _run(client)
+
+        assert client.stream.input_stream.closed
+
+    def test_the_input_is_closed_even_when_the_request_fails(self) -> None:
+        client = FakeBidiClient(
+            FakeStream([_frame(type="error", request_id="r1", message="queue_saturated")])
+        )
+
+        result = _run(client)
+
+        assert not result.ok
+        assert client.stream.input_stream.closed
+
+    def test_the_input_is_closed_when_the_deadline_abandons_the_request(self) -> None:
+        client = FakeBidiClient(FakeStream([_payload_event(PCM_100MS)]))
+
+        result = _run(client, deadline_ts=time.time() - 1.0)
+
+        assert result.outcome is InvokeOutcome.CLIENT_TIMEOUT
+        assert client.stream.input_stream.closed
+
+    def test_a_failure_to_close_the_input_does_not_lose_the_result(self) -> None:
+        # Teardown runs after the measurement exists; losing it to a close fault
+        # would silently drop a sample from the run.
+        stream = FakeStream([_payload_event(PCM_100MS)])
+
+        async def _boom() -> None:
+            raise RuntimeError("input already gone")
+
+        stream.input_stream.close = _boom  # type: ignore[method-assign]
+
+        result = _run(FakeBidiClient(stream))
+
+        assert result.outcome is InvokeOutcome.OK
+        assert result.audio_bytes == len(PCM_100MS)
+
+    def test_the_outer_stream_is_still_closed_when_the_input_close_raises(self) -> None:
+        # The input is closed first; an exception there must not skip the stream
+        # close that actually releases the HTTP/2 connection.
+        stream = FakeStream([_payload_event(PCM_100MS)])
+
+        async def _boom() -> None:
+            raise RuntimeError("input already gone")
+
+        stream.input_stream.close = _boom  # type: ignore[method-assign]
+
+        _run(FakeBidiClient(stream))
+
+        assert stream.closed
 
 
 # --------------------------------------------------------------------------- #
