@@ -871,6 +871,87 @@ class TestInvokeBidiFailures:
         assert result.audio_bytes == len(PCM_100MS)
         assert result.audio_duration_s > 0
 
+    def test_going_late_after_the_last_chunk_is_not_ok(self) -> None:
+        """A deadline blown between the final chunk and completion must not be OK.
+
+        The in-loop check only runs after an audio chunk, so it cannot see time
+        that passes while the container finishes up and emits
+        ``synthesis_complete``. Kokoro sends its whole utterance as one chunk,
+        which makes that the *only* window where a late request goes unnoticed —
+        and counting it OK would credit a late response as throughput at exactly
+        the rates where the deadline separates saturation from capacity.
+
+        The deadline is moved into the past as the completion frame is read, which
+        is the one thing a fixed ``deadline_ts`` cannot express.
+        """
+        deadline = time.time() + 3600.0
+        holder = {"deadline": deadline}
+
+        def _expire_before_completion(n: int) -> None:
+            # Receive 1 is the audio, receive 2 is the completion frame. Expiring
+            # here means the in-loop check already passed for the chunk.
+            if n == 2:
+                holder["deadline"] = time.time() - 1.0
+
+        stream = FakeStream(
+            [
+                _payload_event(PCM_100MS),
+                _frame(type="synthesis_complete", request_id="r1"),
+            ],
+            on_receive=_expire_before_completion,
+            hangs_after_events=True,
+        )
+
+        # Deliberately not a float subclass: `time.time() > deadline_ts` would
+        # then use float.__gt__ on the left operand and never consult the
+        # override. A plain object forces Python to defer to __lt__ here.
+        class _MovingDeadline:
+            def __lt__(self, other: float) -> bool:
+                # Reached as the reflected form of `time.time() > deadline_ts`.
+                return float(holder["deadline"]) < other
+
+            def __gt__(self, other: float) -> bool:
+                return float(holder["deadline"]) > other
+
+        result = _run(FakeBidiClient(stream), deadline_ts=_MovingDeadline())
+
+        assert result.outcome is InvokeOutcome.CLIENT_TIMEOUT
+        assert not result.ok
+        # The audio is retained: a request that streamed then went late is a
+        # different capacity signal from one refused outright.
+        assert result.audio_bytes == len(PCM_100MS)
+
+    def test_a_request_inside_its_deadline_is_still_ok(self) -> None:
+        # The exit check must not fail requests that met their deadline.
+        client = FakeBidiClient(
+            FakeStream(
+                [
+                    _payload_event(PCM_100MS),
+                    _frame(type="synthesis_complete", request_id="r1"),
+                ],
+                hangs_after_events=True,
+            )
+        )
+
+        result = _run(client, deadline_ts=time.time() + 60.0)
+
+        assert result.outcome is InvokeOutcome.OK
+
+    def test_an_empty_response_past_the_deadline_stays_a_model_error(self) -> None:
+        # Zero audio is the more specific diagnosis and must not be relabelled a
+        # timeout: the endpoint accepted the work and returned nothing.
+        client = FakeBidiClient(
+            FakeStream(
+                [_frame(type="synthesis_complete", request_id="r1")],
+                hangs_after_events=True,
+            )
+        )
+
+        result = _run(client, deadline_ts=0.0)
+
+        assert result.outcome is InvokeOutcome.MODEL_ERROR
+        assert result.error_class == "EmptyResponse"
+
     def test_open_failure_is_classified_not_raised(self) -> None:
         from aws_sdk_sagemaker_runtime_http2.models import ModelError
 

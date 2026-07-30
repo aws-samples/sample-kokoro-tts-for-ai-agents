@@ -431,6 +431,15 @@ async def _consume_output(
             error_message="bidi stream completed with no audio bytes",
         )
 
+    if deadline_ts is not None and time.time() > deadline_ts:
+        # Re-checked on the way out, not only after each audio chunk. Kokoro's
+        # bidi path synthesizes the whole utterance before sending, so a request
+        # that blew its deadline waiting arrives as a single chunk followed by
+        # synthesis_complete and never trips the in-loop check. Counting it OK
+        # would credit a late response as throughput at exactly the rates where
+        # the deadline is what distinguishes saturation from capacity.
+        return result(InvokeOutcome.CLIENT_TIMEOUT)
+
     return result(InvokeOutcome.OK)
 
 
