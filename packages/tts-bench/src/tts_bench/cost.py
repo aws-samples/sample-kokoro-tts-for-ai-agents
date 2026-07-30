@@ -38,6 +38,45 @@ POLLY_COST_PER_M_CHARS: dict[str, float] = {
 
 SATURATION_LEVELS = [2, 4, 8, 16, 32]
 
+DEFAULT_INSTANCE_TYPE = "ml.g5.xlarge"
+
+
+def cost_per_m_chars(
+    chars_per_hr: float,
+    instance_type: str,
+    instance_count: int = 1,
+) -> float:
+    """Dollars per million characters.
+
+    ``chars_per_hr`` is the throughput of the **whole fleet**, not of one
+    instance, and ``instance_count`` scales only the cost side. Deliberately no
+    linear-scaling assumption: a planned fleet runs at ``derate / k``
+    utilization, not saturated, so its useful throughput is well below
+    ``instance_count x saturated_per_instance``. Passing per-instance throughput
+    with ``instance_count=N`` would divide by an ``N`` that never appears in the
+    numerator's reality and report the saturated unit cost for an idle fleet.
+
+    ``calculate_cost`` measures one instance and passes ``instance_count=1``;
+    the planner passes the derated fleet throughput alongside ``N_peak``, which
+    is why the surge reserve shows up as a higher unit cost.
+
+    Returns:
+        ``inf`` when throughput is zero — an endpoint that produces nothing has
+        no meaningful cost per character, and returning 0.0 would make a broken
+        model look free.
+
+    Raises:
+        ValueError: If ``instance_count`` < 1.
+    """
+    if instance_count < 1:
+        raise ValueError(f"instance_count must be >= 1, got {instance_count}")
+    if chars_per_hr <= 0:
+        return float("inf")
+    hourly = INSTANCE_COST_PER_HOUR.get(
+        instance_type, INSTANCE_COST_PER_HOUR[DEFAULT_INSTANCE_TYPE]
+    )
+    return (hourly * instance_count / chars_per_hr) * 1_000_000
+
 
 def find_saturation_concurrency(
     client: SynthesisClient,
@@ -51,6 +90,15 @@ def find_saturation_concurrency(
     concurrent streaming requests. Measures throughput (chars/sec) at
     each level. Returns the level where throughput plateaus — adding
     more concurrency yields < 20% improvement.
+
+    .. warning::
+        Not suitable for capacity planning; use ``tts_bench.cmax`` instead.
+        Two reasons. The ladder is geometric, so it cannot resolve a ``C_max``
+        of 1 from 2 — on Kokoro (capacity 1) throughput pins at every level, the
+        20% plateau test trips immediately, and this returns 4. And the burst is
+        closed-loop: each worker waits for its own response, so the offered rate
+        is set by the server rather than by us, which is exactly the coordinated
+        omission that hides a latency knee.
     """
     prev_throughput = 0.0
     best_level = 1
@@ -196,8 +244,10 @@ def calculate_cost(
             "window_s": 0,
         }
 
-    instance_type = MODEL_INSTANCE_TYPES.get(model, "ml.g5.xlarge")
-    instance_cost = INSTANCE_COST_PER_HOUR.get(instance_type, 1.408)
+    instance_type = MODEL_INSTANCE_TYPES.get(model, DEFAULT_INSTANCE_TYPE)
+    instance_cost = INSTANCE_COST_PER_HOUR.get(
+        instance_type, INSTANCE_COST_PER_HOUR[DEFAULT_INSTANCE_TYPE]
+    )
 
     probe_text = texts[0] if texts else "The birch canoe slid on the smooth planks."
     saturation = find_saturation_concurrency(
@@ -209,9 +259,8 @@ def calculate_cost(
     )
 
     chars_per_hr = throughput["chars_per_hr"]
-    cost_per_m_chars = (
-        (instance_cost / chars_per_hr) * 1_000_000 if chars_per_hr > 0 else float("inf")
-    )
+    # Single instance here; the planner calls cost_per_m_chars with N_peak.
+    unit_cost = cost_per_m_chars(chars_per_hr, instance_type, instance_count=1)
 
     return {
         "model": model.value,
@@ -220,7 +269,7 @@ def calculate_cost(
         "saturation_concurrency": saturation,
         "chars_per_hr": round(chars_per_hr, 0),
         "chars_per_min": round(chars_per_hr / 60, 1),
-        "cost_per_m_chars": round(cost_per_m_chars, 2),
+        "cost_per_m_chars": round(unit_cost, 2),
         "total_requests": throughput["total_requests"],
         "window_s": throughput["wall_time_s"],
     }

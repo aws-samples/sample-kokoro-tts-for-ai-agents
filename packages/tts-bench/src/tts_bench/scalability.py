@@ -34,6 +34,20 @@ def measure_scalability(
 
     Returns:
         List of dicts with results per concurrency level.
+
+    .. warning::
+        Closed-loop, so not usable for capacity planning; use
+        ``tts_bench.loadgen`` / ``tts_bench.cmax`` for that. Each of the N
+        workers sends its next request only after the previous one returns
+        (``_run_concurrent`` below), which makes the offered rate
+        ``N / mean_latency`` — the *server* sets the arrival rate, and a slower
+        server is sent less work. The queueing delay a real user would
+        experience is therefore never generated, so no latency knee appears.
+        Errors are also swallowed rather than classified, so a 503 becomes a hot
+        retry loop and ``total_requests`` counts successes only.
+
+        Kept as-is because ``tts_eval.cli._run_benchmarks`` wires its untyped
+        dict contract into the eval report.
     """
     client = SynthesisClient(region=region)
     model = TTSModelName(model)
