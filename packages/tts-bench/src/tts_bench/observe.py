@@ -1,6 +1,6 @@
 """Read-only observation of CloudWatch, Application Auto Scaling, and SageMaker.
 
-Three jobs, all strictly read-only:
+Four jobs, all strictly read-only:
 
 1. **Join server-side metrics to a load step** (:func:`fetch_window`). ``cmax``
    measures concurrency client-side; AWS publishes ``ConcurrentRequestsPerModel``
@@ -12,6 +12,9 @@ Three jobs, all strictly read-only:
    a timestamp from a different API; this module fetches them, ``ttotal.py``
    assembles them.
 3. **Audit deployed scaling config against source** (:func:`audit_scaling`).
+4. **Read container startup logs** (:func:`list_log_streams`, :func:`stage_markers`).
+   ``T_total``'s second half happens inside the container, where no metric reaches;
+   the only externally visible record is what the container printed.
 
 Nothing here mutates anything. Freeze/thaw lives in :mod:`tts_bench.fixture`.
 
@@ -28,11 +31,15 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import botocore.exceptions
 import numpy as np
 from botocore.client import BaseClient
 from loguru import logger
+
+if TYPE_CHECKING:
+    from shared.stages import StageMarker
 
 SAGEMAKER_NAMESPACE = "AWS/SageMaker"
 """Invocation metrics. Published by SageMaker itself, no instrumentation needed."""
@@ -1046,3 +1053,178 @@ def check_drift(
 def utc_window(end: datetime, duration_s: float) -> tuple[datetime, datetime]:
     """``(start, end)`` for a window of ``duration_s`` ending at ``end``."""
     return end - timedelta(seconds=duration_s), end
+
+
+# --------------------------------------------------------------------------- #
+# CloudWatch Logs — the container half of T_total
+# --------------------------------------------------------------------------- #
+
+LOG_GROUP_PREFIX = "/aws/sagemaker/Endpoints"
+"""Log group root. Note this string also names a *metric* namespace
+(:data:`ENDPOINT_NAMESPACE`); they are unrelated APIs that happen to share it."""
+
+
+def log_group_name(endpoint: str) -> str:
+    """Log group for one endpoint's containers."""
+    return f"{LOG_GROUP_PREFIX}/{endpoint}"
+
+
+@dataclass(frozen=True, slots=True)
+class LogStream:
+    """One container's log stream, named ``<variant>/i-<instance-id>``."""
+
+    name: str
+    first_event_at: datetime | None
+    last_event_at: datetime | None
+
+    @property
+    def instance_id(self) -> str | None:
+        """The ``i-...`` part, or None if the name does not follow the convention."""
+        _, _, tail = self.name.partition("/")
+        return tail if tail.startswith("i-") else None
+
+    @property
+    def variant(self) -> str | None:
+        head, sep, _ = self.name.partition("/")
+        return head if sep else None
+
+
+def _epoch_ms_to_dt(value: object) -> datetime | None:
+    if not isinstance(value, int | float):
+        return None
+    return datetime.fromtimestamp(value / 1000.0, tz=UTC)
+
+
+def list_log_streams(
+    logs: BaseClient,
+    *,
+    endpoint: str,
+    variant: str | None = DEFAULT_VARIANT,
+    since: datetime | None = None,
+    limit: int = 50,
+) -> list[LogStream]:
+    """Streams for an endpoint, most recently active first.
+
+    Args:
+        variant: Restrict to one variant via the stream-name prefix. ``None``
+            lists every variant.
+        since: Drop streams whose last event predates this. Filters on
+            ``lastEventTimestamp`` rather than ``firstEventTimestamp`` because a
+            long-lived instance started days ago is still serving now.
+
+    Returns:
+        Empty list if the group does not exist — true for an endpoint that has
+        never run, and not an error worth raising here.
+    """
+    group = log_group_name(endpoint)
+    # orderBy=LastEventTime and logStreamNamePrefix are mutually exclusive in the
+    # API, and the ordering is what makes `limit` mean "most recent", so the
+    # variant prefix is applied client-side below.
+    kwargs: dict[str, object] = {
+        "logGroupName": group,
+        "orderBy": "LastEventTime",
+        "descending": True,
+    }
+
+    streams: list[LogStream] = []
+    try:
+        paginator = logs.get_paginator("describe_log_streams")
+        for page in paginator.paginate(**kwargs):
+            for raw in page.get("logStreams", []):
+                streams.append(
+                    LogStream(
+                        name=raw.get("logStreamName", ""),
+                        first_event_at=_epoch_ms_to_dt(raw.get("firstEventTimestamp")),
+                        last_event_at=_epoch_ms_to_dt(raw.get("lastEventTimestamp")),
+                    )
+                )
+            if len(streams) >= limit:
+                break
+    except botocore.exceptions.ClientError as exc:
+        logger.warning("Could not list log streams for {}: {}", group, exc)
+        return []
+
+    if variant:
+        streams = [s for s in streams if s.name.startswith(f"{variant}/")]
+    if since is not None:
+        streams = [s for s in streams if s.last_event_at is None or s.last_event_at >= since]
+    return streams[:limit]
+
+
+def new_streams_since(
+    before: Iterable[LogStream],
+    after: Iterable[LogStream],
+) -> list[LogStream]:
+    """Streams present in ``after`` but not ``before``.
+
+    How a scale-out's new instance is identified. SageMaker does not report which
+    instance was added, but each one opens its own log stream, so the set
+    difference across the event names it.
+    """
+    known = {s.name for s in before}
+    return [s for s in after if s.name not in known]
+
+
+def read_log_lines(
+    logs: BaseClient,
+    *,
+    endpoint: str,
+    stream: str,
+    limit: int = 1000,
+) -> list[str]:
+    """Read a stream from its beginning, oldest first.
+
+    From the head deliberately: every stage marker is emitted during startup, so
+    the tail of a long-running container holds nothing this needs.
+
+    Returns:
+        Empty list if the stream or group is gone. A stream that aged out is a
+        bounded-estimate case for ``ttotal``, not a failure.
+    """
+    lines: list[str] = []
+    token: str | None = None
+    try:
+        while len(lines) < limit:
+            kwargs: dict[str, object] = {
+                "logGroupName": log_group_name(endpoint),
+                "logStreamName": stream,
+                "startFromHead": True,
+                "limit": min(limit - len(lines), 1000),
+            }
+            if token is not None:
+                kwargs["nextToken"] = token
+            response = logs.get_log_events(**kwargs)
+            events = response.get("events", [])
+            lines.extend(str(e.get("message", "")) for e in events)
+            next_token = response.get("nextForwardToken")
+            # GetLogEvents returns the same token at the end of a stream rather
+            # than omitting it; without this check the loop never terminates.
+            if not events or next_token == token or next_token is None:
+                break
+            token = next_token
+    except botocore.exceptions.ClientError as exc:
+        logger.warning("Could not read log stream {}/{}: {}", endpoint, stream, exc)
+        return lines
+
+    return lines
+
+
+def stage_markers(
+    logs: BaseClient,
+    *,
+    endpoint: str,
+    stream: str,
+    limit: int = 1000,
+) -> list[StageMarker]:
+    """Parse the startup stage markers a container emitted, in order.
+
+    The format contract lives in :mod:`shared.stages`, which is the single
+    definition shared by four separately-built container images.
+
+    Returns:
+        Empty list when the container predates the markers, or its startup lines
+        aged out. ``ttotal`` degrades to a bounded estimate rather than failing.
+    """
+    from shared.stages import parse_stage_markers
+
+    return parse_stage_markers(read_log_lines(logs, endpoint=endpoint, stream=stream, limit=limit))

@@ -175,6 +175,12 @@ def _load_texts(samples: str | None, max_samples: int) -> list[str]:
 CMAX_LADDER_DEFAULT = "0.5,1,1.5,2,3,4,6,8,12,16"
 CMAX_BUDGETS_DEFAULT = "50,150,300,500"
 
+# Duplicated from `tts_bench.ttotal` for the same reason: a click.Choice is evaluated at
+# import time, so referencing the module here would defeat the lazy import.
+# `test_cli_ttotal.py` asserts these match the module constants.
+TTOTAL_TRIGGER_DRIVE_LOAD = "drive-load"
+TTOTAL_TRIGGER_FORCE_DESIRED = "force-desired"
+
 
 @main.command()
 @click.option("--model", required=True, help="Model name, e.g. kokoro-82m")
@@ -431,6 +437,245 @@ def cmax(
         Path(output).write_text(report.model_dump_json(indent=2))
         click.echo(f"\nArtifact: {output}")
     click.echo("Next: tts-bench ttotal, then tts-bench plan --measured <artifact>")
+
+
+@main.command()
+@click.option("--model", required=True, help="Model name, e.g. kokoro-82m")
+@click.option("--region", default="us-east-1")
+@click.option("--variant", default="primary")
+@click.option("--voice", default=None, help="Override the model's default voice")
+@click.option(
+    "--trigger",
+    type=click.Choice([TTOTAL_TRIGGER_DRIVE_LOAD, TTOTAL_TRIGGER_FORCE_DESIRED]),
+    default=TTOTAL_TRIGGER_DRIVE_LOAD,
+    help="How to cause the scale-out. force-desired skips the policy entirely.",
+)
+@click.option(
+    "--scaling-target",
+    default=None,
+    type=float,
+    help="C_target to drive past. Defaults to the deployed policy's TargetValue.",
+)
+@click.option(
+    "--load-multiple",
+    default=3.0,
+    type=float,
+    help="Offered concurrency as a multiple of C_target",
+)
+@click.option(
+    "--s-mean",
+    "s_mean_s",
+    default=None,
+    type=float,
+    help="Mean service time in seconds, converting target concurrency to a rate",
+)
+@click.option(
+    "--measured",
+    default=None,
+    type=click.Path(exists=True),
+    help="A cmax artifact to read S and the TTFAB budget from",
+)
+@click.option(
+    "--ttfab-budget-ms",
+    default=None,
+    type=float,
+    help="Budget the recovery bound is judged against. Defaults from --measured or config.",
+)
+@click.option("--max-wait", "max_wait_s", default=1500.0, type=float, help="Scale-out timeout")
+@click.option(
+    "--settle",
+    "settle_s",
+    default=180.0,
+    type=float,
+    help="Seconds of load held past the event, so recovery can be bounded",
+)
+@click.option("--poll-interval", "poll_interval_s", default=10.0, type=float)
+@click.option("--transport", type=click.Choice(["response-stream", "bidi"]), default="bidi")
+@click.option("--arrival-seed", "seed", default=1234, type=int)
+@click.option("--max-samples", default=50, type=int, help="Texts drawn into the pool")
+@click.option("--samples", default=None, type=click.Path(), help="Override the sample JSON path")
+@click.option("--output", default=None, type=click.Path(), help="Write the report JSON here")
+@click.option("--events", default=None, type=click.Path(), help="Write per-request JSONL here")
+def ttotal(
+    model: str,
+    region: str,
+    variant: str,
+    voice: str | None,
+    trigger: str,
+    scaling_target: float | None,
+    load_multiple: float,
+    s_mean_s: float | None,
+    measured: str | None,
+    ttfab_budget_ms: float | None,
+    max_wait_s: float,
+    settle_s: float,
+    poll_interval_s: float,
+    transport: str,
+    seed: int,
+    max_samples: int,
+    samples: str | None,
+    output: str | None,
+    events: str | None,
+) -> None:
+    """Measure T_total: the lag from load arriving to new capacity serving it.
+
+    Drives load past C_target so the deployed policy fires, then attributes the lag
+    stage by stage — metric publication, alarm evaluation, scaling activity, instance
+    provisioning, container startup, and traffic recovery — each from the API that
+    timestamps it.
+
+    T_total is the input the capacity plan is most sensitive to: it sets how much
+    standing headroom a surge needs and how much of one a queue can absorb. It is also
+    the number most often guessed.
+
+    `--trigger force-desired` sets DesiredInstanceCount directly. That needs no policy
+    and measures only the container half, so its result is NOT a full T_total — it exists
+    for iterating quickly on the container stages.
+
+    Restores the starting desired instance count on exit, Ctrl-C included.
+    """
+    import boto3
+
+    from tts_bench import ttotal as ttotal_mod
+    from tts_bench.fixture import FixtureError
+    from tts_bench.invoke import resolve_endpoint, resolve_voice
+
+    try:
+        endpoint = resolve_endpoint(model)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--model") from exc
+
+    # S and the TTFAB budget both come from a cmax artifact when there is one: they are
+    # measured properties of this model on this transport, and re-deriving them here
+    # would let a T_total run silently disagree with the C_max it will be planned with.
+    artifact: dict[str, object] | None = None
+    if measured:
+        artifact = json.loads(Path(measured).read_text())
+        if s_mean_s is None and isinstance(artifact.get("s_mean_s"), int | float):
+            s_mean_s = float(artifact["s_mean_s"])  # type: ignore[arg-type]
+        if ttfab_budget_ms is None:
+            curve = artifact.get("c_max_curve")
+            if isinstance(curve, dict) and curve:
+                # The largest budget in the curve: the loosest SLO the C_max run
+                # measured, so recovery is judged against a bound the model can meet.
+                ttfab_budget_ms = float(max(int(k) for k in curve))
+        if artifact.get("transport") and artifact["transport"] != transport:
+            click.echo(
+                f"WARNING: --measured was taken on transport {artifact['transport']!r} but "
+                f"this run uses {transport!r}. S differs per transport, so the offered rate "
+                "may not reach C_target."
+            )
+
+    if s_mean_s is None:
+        raise click.UsageError(
+            "--s-mean is required (or pass --measured <cmax artifact> to read it). It "
+            "converts a target concurrency into the arrival rate the open-loop driver "
+            "needs, and guessing it would offer the wrong load."
+        )
+    if s_mean_s <= 0:
+        raise click.BadParameter("--s-mean must be positive")
+    if load_multiple <= 1.0:
+        raise click.BadParameter(
+            "--load-multiple must exceed 1.0, or the offered load never crosses C_target "
+            "and no scale-out can occur"
+        )
+
+    appscaling = boto3.client("application-autoscaling", region_name=region)
+    if scaling_target is None:
+        scaling_target = ttotal_mod.deployed_target_value(
+            appscaling, endpoint=endpoint, variant=variant
+        )
+    if scaling_target is None:
+        if trigger == TTOTAL_TRIGGER_DRIVE_LOAD:
+            raise click.UsageError(
+                f"{endpoint} has no target-tracking policy to read a TargetValue from, so "
+                "there is nothing to drive load past. Deploy scaling first, or pass "
+                "--scaling-target explicitly."
+            )
+        # force-desired never reads the metric, so any value is inert here.
+        scaling_target = 0.0
+
+    if ttfab_budget_ms is None:
+        ttfab_budget_ms = _config_ttfab_budget_ms(endpoint)
+    if ttfab_budget_ms is None:
+        raise click.UsageError(
+            "--ttfab-budget-ms is required (or pass --measured, or configure "
+            "ttfab_budget_ms for this model). Recovery is defined as p95 back inside a "
+            "budget, so there is no recovery without one."
+        )
+
+    click.echo(
+        f"{model} ({endpoint}): trigger={trigger}, C_target={scaling_target:.3f}, "
+        f"offering {scaling_target * load_multiple:.2f} concurrency, "
+        f"S={s_mean_s * 1000:.0f}ms, budget={ttfab_budget_ms:.0f}ms, transport={transport}"
+    )
+    if trigger == TTOTAL_TRIGGER_FORCE_DESIRED:
+        click.echo(
+            "NOTE: --trigger force-desired measures the container half only. The result is "
+            "a lower bound on T_total, not T_total."
+        )
+
+    from contextlib import nullcontext
+
+    from tts_bench.loadgen import JsonlWriter
+
+    try:
+        with JsonlWriter(events) if events else nullcontext() as writer:
+            report = ttotal_mod.measure(
+                model_name=model,
+                endpoint=endpoint,
+                variant=variant,
+                region=region,
+                scaling_target=scaling_target,
+                ttfab_budget_ms=ttfab_budget_ms,
+                s_mean_s=s_mean_s,
+                texts=_load_texts(samples, max_samples),
+                voice=resolve_voice(model, voice),
+                trigger=trigger,
+                load_multiple=load_multiple,
+                max_wait_s=max_wait_s,
+                settle_s=settle_s,
+                poll_interval_s=poll_interval_s,
+                transport=transport,
+                seed=seed,
+                event_sink=writer,
+                appscaling=appscaling,
+            )
+    except (ttotal_mod.TTotalError, FixtureError) as exc:
+        # Both are the tool refusing to report a lag it did not observe. A traceback
+        # would read as a bug rather than as the guard doing its job.
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo("")
+    click.echo(ttotal_mod.render_text(report))
+
+    if events:
+        click.echo(f"\nEvents: {events}")
+    if output:
+        Path(output).write_text(json.dumps(report.to_dict(), indent=2))
+        click.echo(f"Report: {output}")
+    click.echo(
+        f"\nNext: tts-bench plan --model {model} --t-total {report.t_total_s or 0:.0f} "
+        "--measured <cmax artifact>"
+    )
+
+
+def _config_ttfab_budget_ms(endpoint: str) -> float | None:
+    """The TTFAB budget configured for an endpoint, if speech_infra is importable.
+
+    A fallback for `ttotal` run without a cmax artifact. Lazy and forgiving for the same
+    reason as :func:`_expected_scaling`: `speech_infra` pulls in aws-cdk-lib, which the
+    measurement path has no other use for.
+    """
+    try:
+        from speech_infra.config import TTS_MODEL_CONFIGS
+    except ImportError:  # pragma: no cover - depends on install layout
+        return None
+
+    for config in TTS_MODEL_CONFIGS.values():
+        if config.endpoint_name == endpoint:
+            return float(config.ttfab_budget_ms)
+    return None
 
 
 def _expected_scaling() -> dict[str, ExpectedScaling]:
