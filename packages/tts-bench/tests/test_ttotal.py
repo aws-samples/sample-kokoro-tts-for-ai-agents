@@ -318,6 +318,31 @@ class TestRecoveryBound:
         assert at is None
         assert "0 completion(s)" in note
 
+    def test_the_budget_has_to_discriminate_overload_from_recovery(self) -> None:
+        # Why this threshold is the *measured* budget and not the 3s end-to-end SLO the
+        # planner promises against. Kokoro overloaded at 3x C_target reaches a p95 TTFAB of
+        # 818ms -- already inside 3000ms. At that threshold the very first window passes and
+        # recovery is dated to in_service, so the stage measures nothing; at the 300ms
+        # budget the overloaded windows fail and the real boundary is found.
+        in_service = T0 + timedelta(seconds=10)
+        events = [
+            *_events(in_service, 60, ttfab_ms=818.0, every_s=2.0),
+            *_events(in_service + timedelta(seconds=120), 60, ttfab_ms=165.0, every_s=2.0),
+        ]
+
+        inside_the_slo, _ = recovery_bound(events, in_service_at=in_service, budget_ms=3000.0)
+        inside_the_budget, _ = recovery_bound(events, in_service_at=in_service, budget_ms=300.0)
+
+        # Dated to in_service itself: the very first window already passed, so every second
+        # of the overload was scored as recovered.
+        assert inside_the_slo == in_service
+        # Against the measured budget the overloaded windows fail, and the boundary lands
+        # where the latency actually changed. Asserted as a span rather than an instant
+        # because the 60s window straddles the transition, so the first passing window
+        # opens one sample before the last bad completion.
+        assert inside_the_budget is not None
+        assert inside_the_budget - in_service > timedelta(seconds=100)
+
     def test_a_sparse_tail_does_not_read_as_a_recovery(self) -> None:
         # Two good requests at the very end of a run would otherwise satisfy any budget
         # once every later window is shorter than min_samples.
@@ -510,6 +535,42 @@ class TestTTotalReport:
         report.timeline = []
         text = render_text(report)
         assert "not measurable" in text
+
+
+class TestTheReportCarriesItsConfiguration:
+    """A lag belongs to a configuration, the same way a C_max curve does.
+
+    ``plan`` consumes the two together, so a fingerprint on only one side would leave
+    the pairing check with nothing to compare — and container start, which dominates
+    this measurement, is a property of the image the digest pins.
+    """
+
+    def test_the_slug_comes_off_the_fingerprint(self) -> None:
+        report = _report()
+        report.deployed_config = {
+            "instance_type": "ml.g6.12xlarge",
+            "image_digest": "139b9068c5eb1f03",
+            "container_env": {},
+        }
+        assert report.config_slug == "g612xlarge-139b9068"
+
+    def test_no_fingerprint_cannot_pass_for_a_real_one(self) -> None:
+        # A report rebuilt from a historical window has no configuration to read. It
+        # must not compare equal to a measured fingerprint, so the slug says so.
+        assert _report().config_slug == "unknown-nodigest"
+
+    def test_to_dict_emits_both_the_fingerprint_and_the_slug(self) -> None:
+        report = _report()
+        report.deployed_config = {
+            "instance_type": "ml.g5.xlarge",
+            "image_digest": "deadbeefcafe",
+            "container_env": {"MAX_REQUEST_AGE_S": "56"},
+        }
+        payload = report.to_dict()
+        # The dict for the machine check, the slug so a human reading the JSON can see
+        # what it was measured against without reassembling it.
+        assert payload["deployed_config"]["container_env"] == {"MAX_REQUEST_AGE_S": "56"}
+        assert payload["config_slug"] == "g5xlarge-deadbeef"
 
 
 class TestWaitForScaleOut:
@@ -918,6 +979,37 @@ class TestCollectTimeline:
         assert report.p95_before_ms == pytest.approx(1200.0)
         assert report.p95_after_ms == pytest.approx(120.0)
         assert report.requests_before > 0 and report.requests_after > 0
+
+    def test_stamps_the_configuration_it_was_given(
+        self, cloudwatch: Any, appscaling: Any, logs: Any
+    ) -> None:
+        cw, aas, lg = _stub_collect(cloudwatch, appscaling, logs, log_lines=LOG_LINES)
+
+        report = self._call(
+            cw,
+            aas,
+            lg,
+            deployed_config={
+                "instance_type": "ml.g5.xlarge",
+                "image_digest": "139b9068c5eb",
+                "container_env": {},
+            },
+        )
+
+        assert report.config_slug == "g5xlarge-139b9068"
+
+    def test_a_rebuild_with_no_configuration_still_assembles(
+        self, cloudwatch: Any, appscaling: Any, logs: Any
+    ) -> None:
+        # Optional so a report can be rebuilt from a window whose endpoint has since
+        # changed. The slug then refuses to match a real fingerprint rather than
+        # inventing one, which is what makes the planner's pairing check safe.
+        cw, aas, lg = _stub_collect(cloudwatch, appscaling, logs, log_lines=LOG_LINES)
+
+        report = self._call(cw, aas, lg)
+
+        assert report.deployed_config == {}
+        assert report.config_slug == "unknown-nodigest"
 
     def test_a_stream_with_no_markers_is_a_gap_not_a_failure(
         self, cloudwatch: Any, appscaling: Any, logs: Any

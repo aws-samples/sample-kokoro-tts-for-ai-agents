@@ -604,6 +604,305 @@ def variant_instance_type(
     return None
 
 
+#: Environment keys SageMaker or the CDK stack sets on every container, so they carry
+#: no information about *this* configuration. Excluded from the fingerprint: including
+#: them would make the endpoint name part of the identity, and then an artifact could
+#: never be compared across two endpoints running the same build.
+_AMBIENT_ENV_KEYS = frozenset({"ENDPOINT_NAME", "SM_MODEL_ID"})
+
+#: Number of image-tag characters in :attr:`DeployedConfig.slug`. The CDK asset tag is a
+#: 64-char SHA-256; 8 hex chars is 4 billion values, which is plenty to tell apart the
+#: handful of builds one model ever has, and short enough to read in a filename.
+_SLUG_DIGEST_CHARS = 8
+
+
+@dataclass(frozen=True, slots=True)
+class DeployedConfig:
+    """What a benchmark was actually measured against.
+
+    ``C_max``, ``S`` and ``T_total`` are properties of a *configuration*, not of a
+    model. Three things move them, and all three are read here:
+
+    * ``instance_type`` — the GPU. Also the GPU *count*: a container driving four
+      GPUs runs on a different instance type, so multi-GPU serving is covered by
+      this field rather than needing one of its own.
+    * ``image_digest`` — the serving code. CDK tags container assets by a content
+      hash of the build context, so this changes exactly when the container does,
+      which is what makes an admission queue or a batching change visible here.
+    * ``container_env`` — the knobs. ``MAX_REQUEST_AGE_S`` and a future queue depth
+      are set this way, and either would move the knee without touching the image.
+
+    Recorded on every artifact and checked before one is replayed; see
+    :meth:`assert_matches`.
+    """
+
+    instance_type: str | None
+    image_digest: str | None
+    container_env: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def slug(self) -> str:
+        """Short, stable, filename-safe identifier, e.g. ``g6xl-139b9068``.
+
+        Used to default one artifact path per configuration, so measuring a second
+        configuration cannot overwrite the first by forgetting ``--output``.
+        """
+        family = (self.instance_type or "unknown").removeprefix("ml.").replace(".", "")
+        digest = (self.image_digest or "nodigest")[:_SLUG_DIGEST_CHARS]
+        return f"{family}-{digest}"
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-ready form, for embedding in an artifact."""
+        return {
+            "instance_type": self.instance_type,
+            "image_digest": self.image_digest,
+            "container_env": dict(self.container_env),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> DeployedConfig:
+        """Rebuild from an artifact. Missing keys become ``None``/empty, not errors."""
+        env = raw.get("container_env")
+        return cls(
+            instance_type=raw.get("instance_type"),
+            image_digest=raw.get("image_digest"),
+            container_env=dict(env) if isinstance(env, dict) else {},
+        )
+
+    def differences(self, other: DeployedConfig) -> list[str]:
+        """Human-readable field-by-field differences, empty when the two agree.
+
+        ``self`` is the recorded configuration, ``other`` the live one.
+        """
+        out: list[str] = []
+        if self.instance_type != other.instance_type:
+            out.append(
+                f"instance_type: artifact {self.instance_type!r}, deployed "
+                f"{other.instance_type!r} — S and TTFAB are properties of the GPU, so "
+                "the whole knee moves"
+            )
+        if self.image_digest != other.image_digest:
+            out.append(
+                f"image_digest: artifact {_short(self.image_digest)}, deployed "
+                f"{_short(other.image_digest)} — the serving code differs, which can move "
+                "C_max on identical hardware"
+            )
+        if self.container_env != other.container_env:
+            out.append(
+                f"container_env: artifact {self.container_env}, deployed "
+                f"{other.container_env} — these knobs bound queueing and request age"
+            )
+        return out
+
+    def assert_matches(
+        self,
+        other: DeployedConfig,
+        *,
+        allow_mismatch: bool = False,
+        artifact_label: str = "the measured artifact",
+    ) -> None:
+        """Refuse to reuse a measurement taken against a different configuration.
+
+        A hard error rather than a warning: every downstream number — ``C_target``,
+        the fleet size, the queue depth, the cost — is derived from inputs that only
+        hold for the configuration they were measured on, and a warning scrolls past.
+
+        Args:
+            other: The live configuration, from :func:`describe_deployed_config`.
+            allow_mismatch: Downgrade to a warning. For the case where the operator
+                knows the difference is irrelevant to what they are measuring.
+            artifact_label: Named in the message, so the operator knows which file.
+
+        Raises:
+            FixtureError: If any field differs and ``allow_mismatch`` is false.
+        """
+        diffs = self.differences(other)
+        if not diffs:
+            return
+        detail = "; ".join(diffs)
+        if allow_mismatch:
+            logger.warning(
+                "{} was measured on a different configuration ({}). Proceeding because "
+                "the mismatch was explicitly allowed.",
+                artifact_label,
+                detail,
+            )
+            return
+        raise FixtureError(
+            f"{artifact_label} was measured on a different configuration than the one "
+            f"deployed now. {detail}. Re-measure against the deployed configuration, or "
+            "pass --allow-config-mismatch to proceed anyway."
+        )
+
+
+def _short(digest: str | None) -> str:
+    """A digest trimmed for a message. Full hashes make the diff unreadable."""
+    if not digest:
+        return "none"
+    return digest[:12] if len(digest) > 12 else digest
+
+
+def describe_deployed_config(
+    endpoint_name: str,
+    *,
+    region: str = "us-east-1",
+    variant: str = DEFAULT_VARIANT,
+    sagemaker: BaseClient | None = None,
+) -> DeployedConfig:
+    """Read the live configuration fingerprint of one endpoint variant.
+
+    Three calls, because SageMaker splits the answer three ways: the endpoint names
+    its config, the config names the instance type and the model, and the model names
+    the image and its environment.
+
+    Raises:
+        FixtureError: If the endpoint, its config, or its model cannot be read. This
+            is deliberately fatal — a run that cannot identify what it is measuring
+            produces an artifact nobody can trust later.
+    """
+    import boto3
+
+    sm = sagemaker or boto3.client("sagemaker", region_name=region)
+    try:
+        described = sm.describe_endpoint(EndpointName=endpoint_name)
+        config = sm.describe_endpoint_config(EndpointConfigName=described["EndpointConfigName"])
+    except botocore.exceptions.ClientError as exc:
+        raise FixtureError(
+            f"could not read the endpoint config for {endpoint_name}: {exc}"
+        ) from exc
+
+    entry: dict[str, Any] = {}
+    for candidate in config.get("ProductionVariants", []):
+        if candidate.get("VariantName") == variant:
+            entry = candidate
+            break
+    else:
+        raise FixtureError(
+            f"{endpoint_name} has no variant named {variant!r}, so there is no "
+            "configuration to fingerprint"
+        )
+
+    model_name = entry.get("ModelName")
+    image, env = None, {}
+    if model_name:
+        try:
+            model = sm.describe_model(ModelName=model_name)
+        except botocore.exceptions.ClientError as exc:
+            raise FixtureError(
+                f"could not read model {model_name} behind {endpoint_name}: {exc}"
+            ) from exc
+        container = model.get("PrimaryContainer") or {}
+        image = container.get("Image")
+        env = {
+            key: value
+            for key, value in (container.get("Environment") or {}).items()
+            # AWS_* are injected by the runtime, and the ambient keys are set from the
+            # endpoint's own name — neither describes the configuration under test.
+            if not key.startswith("AWS_") and key not in _AMBIENT_ENV_KEYS
+        }
+
+    return DeployedConfig(
+        instance_type=entry.get("InstanceType"),
+        image_digest=_image_digest(image),
+        container_env=env,
+    )
+
+
+def registry_instance_type(model: str) -> str:
+    """Instance type from the benchmark registry, not from ``speech_infra``.
+
+    ``cost.MODEL_INSTANCE_TYPES`` is kept in step with ``TTS_MODEL_CONFIGS`` by a
+    consistency test, so this avoids pulling ``aws-cdk-lib`` in for one lookup.
+
+    Only a fallback for :func:`fingerprint_or_registry`. A registry is a statement of
+    what *should* be deployed, and a benchmark has to record what *is*.
+    """
+    from tts_bench.cost import DEFAULT_INSTANCE_TYPE, MODEL_INSTANCE_TYPES
+
+    instance_type = MODEL_INSTANCE_TYPES.get(str(model))
+    if instance_type is None:
+        logger.warning(
+            "{} is not in MODEL_INSTANCE_TYPES; costing against {}",
+            model,
+            DEFAULT_INSTANCE_TYPE,
+        )
+        return DEFAULT_INSTANCE_TYPE
+    return instance_type
+
+
+def fingerprint_or_registry(
+    model: str,
+    *,
+    endpoint: str,
+    region: str = "us-east-1",
+    variant: str = DEFAULT_VARIANT,
+    sagemaker: BaseClient | None = None,
+) -> DeployedConfig:
+    """The live configuration under test, falling back to the registry.
+
+    Read from the endpoint rather than from ``MODEL_INSTANCE_TYPES`` because the
+    registry can be stale in exactly the situation this harness exists to support:
+    redeploy on a new instance type, re-measure, and the static dict would stamp the
+    fresh artifact with the *old* type. That artifact then passes every downstream
+    check while describing hardware it was never measured on.
+
+    A disagreement between the two is logged at ERROR — it means the registry and
+    the account have diverged, which also makes ``tts-bench drift`` and the cost
+    model wrong, not just this artifact.
+
+    Falls back to a registry-only fingerprint if the read fails: an unreadable
+    endpoint should not lose a whole measurement run, and the resulting artifact is
+    still honest, since a fallback fingerprint has no image digest and so can never
+    silently compare equal to a real one.
+
+    Shared by ``cmax`` and ``ttotal`` rather than owned by either, because a
+    ``C_max`` curve and a ``T_total`` lag are both properties of a configuration and
+    the planner refuses to combine two artifacts that disagree about which one.
+    """
+    registry_type = registry_instance_type(model)
+    try:
+        deployed = describe_deployed_config(
+            endpoint, region=region, variant=variant, sagemaker=sagemaker
+        )
+    except FixtureError as exc:
+        logger.warning(
+            "Could not read the deployed configuration of {}: {}. Falling back to the "
+            "registry type {}; this artifact will record no image digest and will not "
+            "compare equal to one measured against a known configuration.",
+            endpoint,
+            exc,
+            registry_type,
+        )
+        return DeployedConfig(instance_type=registry_type, image_digest=None)
+
+    if deployed.instance_type and deployed.instance_type != registry_type:
+        logger.error(
+            "{} is deployed on {} but cost.MODEL_INSTANCE_TYPES says {}. Measuring "
+            "against the deployed type; update the registry, or drift and the cost "
+            "model will keep pricing this model wrong.",
+            endpoint,
+            deployed.instance_type,
+            registry_type,
+        )
+    return deployed
+
+
+def _image_digest(image: str | None) -> str | None:
+    """The tag or digest off an ECR image URI, without the repository path.
+
+    CDK publishes container assets tagged with a content hash of the build context,
+    so the tag alone identifies the build. Keeping only the tag means an artifact
+    stays comparable after an ECR repository is renamed or the account changes.
+    """
+    if not image:
+        return None
+    # A digest reference (@sha256:...) wins over a tag when both could appear.
+    if "@" in image:
+        return image.rsplit("@", 1)[1].removeprefix("sha256:")
+    tail = image.rsplit("/", 1)[-1]
+    return tail.rsplit(":", 1)[1] if ":" in tail else None
+
+
 def require_scalable(
     endpoint_name: str,
     *,

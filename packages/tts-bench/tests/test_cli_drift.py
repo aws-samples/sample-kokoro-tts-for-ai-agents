@@ -171,6 +171,26 @@ class TestDriftCommand:
         assert result.exit_code == 0
         assert "No drift" in result.output
 
+    def test_a_clean_account_points_at_the_measurement(self, runner: CliRunner) -> None:
+        # drift is the preflight for cmax, and saying so is what makes the sequence
+        # discoverable. Only on a clean account: with findings on screen, the next step
+        # is to fix them, not to start a 45-minute measurement against them.
+        result = _run_drift(
+            runner,
+            _fake_appscaling(targets=_baseline_targets(), policies=[]),
+            _fake_cloudwatch(metrics=[], alarms=[]),
+        )
+        assert "Next: tts-bench cmax" in result.output
+        assert "--require-frozen" in result.output
+
+    def test_findings_do_not_point_at_the_measurement(self, runner: CliRunner) -> None:
+        result = _run_drift(
+            runner,
+            _fake_appscaling(targets=[], policies=[]),
+            _fake_cloudwatch(metrics=[], alarms=[]),
+        )
+        assert "Next: tts-bench cmax" not in result.output
+
     def test_missing_target_is_reported_but_does_not_fail(self, runner: CliRunner) -> None:
         # An endpoint whose config enables scaling but has no live target cannot
         # scale at all. That is worth saying, but it is a deploy gap rather than

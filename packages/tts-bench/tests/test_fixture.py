@@ -22,13 +22,17 @@ from tts_bench.fixture import (
     SCALABLE_DIMENSION,
     SERVICE_NAMESPACE,
     SUSPEND_ALL,
+    DeployedConfig,
     EndpointFixture,
     FixtureError,
     QuotaHeadroom,
     capture,
+    describe_deployed_config,
     endpoint_quota_headroom,
+    fingerprint_or_registry,
     freeze,
     frozen,
+    registry_instance_type,
     require_frozen,
     require_scalable,
     resource_id,
@@ -39,6 +43,13 @@ from tts_bench.fixture import (
 ENDPOINT = "speech-kokoro-82m"
 RID = f"endpoint/{ENDPOINT}/variant/primary"
 INSTANCE_TYPE = "ml.g5.xlarge"
+
+#: A CDK container-asset tag, which is a content hash of the build context — the
+#: property that makes it a usable fingerprint for "did the serving code change".
+#: Shape copied from the live kokoro endpoint.
+IMAGE_DIGEST = "139b9068c5eb1f03c8312c17391dc35838e43e2417ae80d61e628e6ffb3d6a28"
+ECR_REPO = "1234.dkr.ecr.us-east-1.amazonaws.com/cdk-hnb659fds-container-assets-1234-us-east-1"
+MODEL_NAME = "m"
 
 #: The other holders of the ml.g5.xlarge quota when this guard was written. Named
 #: because the point of the check is that endpoints we are not benchmarking, and in one
@@ -212,6 +223,48 @@ def _stub_variant_instance_type(
         "describe_endpoint_config",
         _config(instance_type=instance_type),
         {"EndpointConfigName": f"{ENDPOINT}-config"},
+    )
+
+
+def _stub_deployed_config(
+    sm_stub: Stubber,
+    *,
+    instance_type: str | None = INSTANCE_TYPE,
+    image: str | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Queue the describe_endpoint + _config + describe_model trio."""
+    sm_stub.add_response("describe_endpoint", _endpoint(), {"EndpointName": ENDPOINT})
+    sm_stub.add_response(
+        "describe_endpoint_config",
+        _config(instance_type=instance_type),
+        {"EndpointConfigName": f"{ENDPOINT}-config"},
+    )
+    sm_stub.add_response(
+        "describe_model",
+        {
+            "ModelName": MODEL_NAME,
+            "ModelArn": f"arn:aws:sagemaker:us-east-1:1234:model/{MODEL_NAME}",
+            "CreationTime": "2026-06-18T17:19:51Z",
+            "PrimaryContainer": {
+                "Image": image if image is not None else f"{ECR_REPO}:{IMAGE_DIGEST}",
+                "Environment": {"MAX_REQUEST_AGE_S": "56"} if env is None else env,
+            },
+        },
+        {"ModelName": MODEL_NAME},
+    )
+
+
+def _deployed(
+    *,
+    instance_type: str | None = INSTANCE_TYPE,
+    image_digest: str | None = IMAGE_DIGEST,
+    env: dict[str, str] | None = None,
+) -> DeployedConfig:
+    return DeployedConfig(
+        instance_type=instance_type,
+        image_digest=image_digest,
+        container_env={"MAX_REQUEST_AGE_S": "56"} if env is None else env,
     )
 
 
@@ -837,6 +890,231 @@ class TestVariantInstanceType:
 
         with pytest.raises(FixtureError, match="could not read the endpoint config"):
             variant_instance_type(ENDPOINT, sagemaker=sm)
+
+
+class TestDescribeDeployedConfig:
+    """Reading what a benchmark is actually measuring against.
+
+    Three API calls, because SageMaker splits the answer three ways. The point of
+    the fingerprint is that a re-deployed endpoint produces a *different* one, so
+    these tests care about which fields move and which deliberately do not.
+    """
+
+    def test_it_reads_type_image_and_env(self, sagemaker) -> None:
+        sm, sm_stub = sagemaker
+        _stub_deployed_config(sm_stub)
+
+        cfg = describe_deployed_config(ENDPOINT, sagemaker=sm)
+
+        assert cfg.instance_type == INSTANCE_TYPE
+        assert cfg.image_digest == IMAGE_DIGEST
+        assert cfg.container_env == {"MAX_REQUEST_AGE_S": "56"}
+
+    def test_ambient_env_is_excluded(self, sagemaker) -> None:
+        # ENDPOINT_NAME and SM_MODEL_ID are set from the endpoint's own identity, and
+        # AWS_* by the runtime. Including them would make the fingerprint endpoint-
+        # specific, so the same build measured on two endpoints would never compare.
+        sm, sm_stub = sagemaker
+        _stub_deployed_config(
+            sm_stub,
+            env={
+                "AWS_REGION": "us-east-1",
+                "AWS_DEFAULT_REGION": "us-east-1",
+                "ENDPOINT_NAME": ENDPOINT,
+                "SM_MODEL_ID": "kokoro-82m",
+                "MAX_REQUEST_AGE_S": "56",
+            },
+        )
+
+        cfg = describe_deployed_config(ENDPOINT, sagemaker=sm)
+
+        assert cfg.container_env == {"MAX_REQUEST_AGE_S": "56"}
+
+    def test_the_slug_is_short_and_filename_safe(self, sagemaker) -> None:
+        sm, sm_stub = sagemaker
+        _stub_deployed_config(sm_stub, instance_type="ml.g6.12xlarge")
+
+        slug = describe_deployed_config(ENDPOINT, sagemaker=sm).slug
+
+        assert slug == f"g612xlarge-{IMAGE_DIGEST[:8]}"
+        assert "/" not in slug and ":" not in slug and "." not in slug
+
+    def test_an_unknown_variant_raises(self, sagemaker) -> None:
+        # Unlike variant_instance_type, which returns None: a fingerprint of nothing
+        # would be recorded on the artifact as though it described the run.
+        sm, sm_stub = sagemaker
+        _stub_deployed_config(sm_stub)
+
+        with pytest.raises(FixtureError, match="no variant named 'other'"):
+            describe_deployed_config(ENDPOINT, variant="other", sagemaker=sm)
+
+    def test_an_unreadable_model_raises(self, sagemaker) -> None:
+        sm, sm_stub = sagemaker
+        sm_stub.add_response("describe_endpoint", _endpoint(), {"EndpointName": ENDPOINT})
+        sm_stub.add_response(
+            "describe_endpoint_config",
+            _config(),
+            {"EndpointConfigName": f"{ENDPOINT}-config"},
+        )
+        sm_stub.add_client_error("describe_model", service_error_code="ValidationException")
+
+        with pytest.raises(FixtureError, match="could not read model"):
+            describe_deployed_config(ENDPOINT, sagemaker=sm)
+
+    def test_a_digest_reference_beats_a_tag(self, sagemaker) -> None:
+        sm, sm_stub = sagemaker
+        _stub_deployed_config(sm_stub, image=f"{ECR_REPO}:latest@sha256:{'a' * 64}")
+
+        assert describe_deployed_config(ENDPOINT, sagemaker=sm).image_digest == "a" * 64
+
+    def test_an_untagged_image_has_no_digest(self, sagemaker) -> None:
+        # Not an error: it still fingerprints on instance type, and a missing digest
+        # is honestly reported rather than invented.
+        sm, sm_stub = sagemaker
+        _stub_deployed_config(sm_stub, image=ECR_REPO)
+
+        cfg = describe_deployed_config(ENDPOINT, sagemaker=sm)
+
+        assert cfg.image_digest is None
+        assert cfg.slug.endswith("-nodigest")
+
+
+class TestFingerprintOrRegistry:
+    """The read every measurement command makes before it starts.
+
+    Shared by `cmax` and `ttotal` rather than owned by either, because both produce
+    per-configuration artifacts and the planner refuses to pair two that disagree.
+    The behaviour worth pinning is the precedence: the endpoint wins over the
+    registry, loudly, because a stale registry is silent in exactly the workflow this
+    harness exists for — redeploy on new hardware, re-measure, and a static dict
+    stamps the fresh artifact with the old type.
+    """
+
+    def test_the_endpoint_wins_and_the_divergence_is_loud(self, sagemaker, logged) -> None:
+        # ERROR rather than WARNING: the same divergence also makes `drift` and the
+        # cost model wrong, not just this one artifact.
+        sm, sm_stub = sagemaker
+        _stub_deployed_config(sm_stub, instance_type="ml.g6.xlarge")
+
+        cfg = fingerprint_or_registry("kokoro-82m", endpoint=ENDPOINT, sagemaker=sm)
+
+        assert cfg.instance_type == "ml.g6.xlarge"
+        assert any("MODEL_INSTANCE_TYPES says ml.g5.xlarge" in m for m in logged)
+
+    def test_an_agreeing_registry_is_silent(self, sagemaker, logged) -> None:
+        sm, sm_stub = sagemaker
+        _stub_deployed_config(sm_stub)
+
+        cfg = fingerprint_or_registry("kokoro-82m", endpoint=ENDPOINT, sagemaker=sm)
+
+        assert cfg.instance_type == INSTANCE_TYPE
+        assert not any("MODEL_INSTANCE_TYPES" in m for m in logged)
+
+    def test_an_unreadable_endpoint_falls_back_without_losing_the_run(
+        self, sagemaker, logged
+    ) -> None:
+        # A failed describe must not cost a whole measurement. The fallback stays
+        # honest: no image digest, so it can never compare equal to a real fingerprint.
+        sm, sm_stub = sagemaker
+        sm_stub.add_client_error("describe_endpoint", service_error_code="ValidationException")
+
+        cfg = fingerprint_or_registry("kokoro-82m", endpoint=ENDPOINT, sagemaker=sm)
+
+        assert cfg.instance_type == INSTANCE_TYPE
+        assert cfg.image_digest is None
+        assert cfg.slug.endswith("-nodigest")
+        assert any("Falling back to the registry type" in m for m in logged)
+
+    def test_an_unknown_model_is_costed_loudly_rather_than_crashing(
+        self, sagemaker, logged
+    ) -> None:
+        sm, sm_stub = sagemaker
+        _stub_deployed_config(sm_stub)
+
+        cfg = fingerprint_or_registry("not-a-model", endpoint=ENDPOINT, sagemaker=sm)
+
+        # The live read still succeeded, so the artifact is correct; the warning is
+        # about the registry lookup that would have been the fallback.
+        assert cfg.instance_type == INSTANCE_TYPE
+        assert any("not in MODEL_INSTANCE_TYPES" in m for m in logged)
+
+
+class TestRegistryInstanceType:
+    def test_a_known_model_resolves(self) -> None:
+        assert registry_instance_type("kokoro-82m") == INSTANCE_TYPE
+
+    def test_an_unknown_model_warns_and_defaults(self, logged) -> None:
+        from tts_bench.cost import DEFAULT_INSTANCE_TYPE
+
+        assert registry_instance_type("not-a-model") == DEFAULT_INSTANCE_TYPE
+        assert any("not in MODEL_INSTANCE_TYPES" in m for m in logged)
+
+
+class TestDeployedConfigMatching:
+    """The guard that stops a measurement being replayed on other hardware.
+
+    A hard error, not a warning: C_target, fleet size, queue depth and cost are all
+    derived from inputs that only hold for the configuration measured, and a warning
+    scrolls past.
+    """
+
+    def test_identical_configurations_pass(self) -> None:
+        _deployed().assert_matches(_deployed())
+
+    def test_a_different_instance_type_is_refused(self) -> None:
+        with pytest.raises(FixtureError, match="properties of the GPU"):
+            _deployed().assert_matches(_deployed(instance_type="ml.g6.xlarge"))
+
+    def test_a_different_image_is_refused(self) -> None:
+        # The case a type-only check would miss: same GPU, different serving code.
+        # An admission queue lands here, and it moves C_max.
+        with pytest.raises(FixtureError, match="serving code differs"):
+            _deployed().assert_matches(_deployed(image_digest="f" * 64))
+
+    def test_a_different_env_is_refused(self) -> None:
+        with pytest.raises(FixtureError, match="container_env"):
+            _deployed().assert_matches(_deployed(env={"MAX_REQUEST_AGE_S": "30"}))
+
+    def test_the_message_names_every_difference(self) -> None:
+        with pytest.raises(FixtureError) as excinfo:
+            _deployed().assert_matches(
+                _deployed(instance_type="ml.g6.xlarge", image_digest="f" * 64, env={})
+            )
+
+        message = str(excinfo.value)
+        assert "instance_type" in message
+        assert "image_digest" in message
+        assert "container_env" in message
+        # And it says what to do about it, since re-measuring is the intended fix.
+        assert "--allow-config-mismatch" in message
+
+    def test_the_override_warns_instead(self, logged) -> None:
+        _deployed().assert_matches(_deployed(instance_type="ml.g6.xlarge"), allow_mismatch=True)
+
+        assert any("different configuration" in m for m in logged)
+
+    def test_a_full_digest_is_trimmed_in_the_message(self) -> None:
+        # 64-char hashes on both sides make the difference unreadable.
+        with pytest.raises(FixtureError) as excinfo:
+            _deployed().assert_matches(_deployed(image_digest="f" * 64))
+
+        assert "f" * 64 not in str(excinfo.value)
+        assert "f" * 12 in str(excinfo.value)
+
+    def test_it_round_trips_through_an_artifact(self) -> None:
+        original = _deployed()
+
+        assert DeployedConfig.from_dict(original.to_dict()) == original
+
+    def test_a_pre_fingerprint_artifact_does_not_match(self) -> None:
+        # Artifacts written before fingerprinting have no configuration recorded.
+        # Treating that as a match is exactly the hole this closes, so an empty
+        # fingerprint must differ from any real one.
+        empty = DeployedConfig.from_dict({})
+
+        assert empty != _deployed()
+        with pytest.raises(FixtureError):
+            empty.assert_matches(_deployed())
 
 
 class TestEndpointQuotaHeadroom:

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -41,7 +42,7 @@ from tts_bench.cli import (
     main,
 )
 from tts_bench.fixture import FixtureError
-from tts_bench.types import CMaxReport, KneePoint, StepSummary
+from tts_bench.types import CMaxReport, KneePoint, StepSummary, ThroughputCeiling
 from tts_inference.types import TTSModelName
 
 MODEL = "kokoro-82m"
@@ -76,6 +77,36 @@ def _knee(budget: int, concurrency: float, *, bracketed: bool = True) -> KneePoi
     )
 
 
+def _ceiling(
+    *,
+    rps: float = 4.0,
+    concurrency: float = 1.0,
+    observed: float | None = None,
+    bracketed: bool = True,
+    dispatch_skipped: int = 0,
+    runs_contributing: int = 1,
+    spread: float = 0.0,
+) -> ThroughputCeiling:
+    """A throughput ceiling, defaulting to one that needs no caveats printed.
+
+    `concurrency` is left independent of `rps` here rather than derived: the renderer
+    prints both, and a helper that computed one from the other could not produce the
+    mismatch a stale artifact would have.
+    """
+    return ThroughputCeiling(
+        max_sustained_rps=rps,
+        concurrency=concurrency,
+        observed_concurrency=observed,
+        offered_rps=rps * 1.02,
+        p95_ttfab_ms=551.0,
+        step_index=2,
+        bracketed=bracketed,
+        dispatch_skipped=dispatch_skipped,
+        runs_contributing=runs_contributing,
+        spread=spread,
+    )
+
+
 def _summary_at(
     *,
     step_index: int,
@@ -97,6 +128,15 @@ def _summary_at(
         settled=True,
         usable=usable,
     )
+
+
+def _config(instance_type: str, digest: str) -> dict[str, object]:
+    """A fingerprint as `measure` records it, for the artifact-naming tests."""
+    return {
+        "instance_type": instance_type,
+        "image_digest": digest,
+        "container_env": {"MAX_REQUEST_AGE_S": "56"},
+    }
 
 
 def _report(**kwargs) -> CMaxReport:
@@ -130,6 +170,11 @@ def _run(
 
     Patching `boto3.client` rather than trusting the stub is deliberate: it is
     the assertion that no code path reached for a client on its own.
+
+    Runs in an isolated filesystem because `--output` now defaults to a *relative*
+    `artifacts/` path, so without this the suite would write real artifacts into the
+    checkout — and one of them would sit next to the measurements it is meant to
+    protect.
     """
     calls: list[dict] = []
 
@@ -145,6 +190,7 @@ def _run(
     with (
         patch.object(cmax_mod, "measure", fake_measure),
         patch("boto3.client", side_effect=no_clients),
+        runner.isolated_filesystem(),
     ):
         result = runner.invoke(main, ["cmax", "--model", model, *args])
     return result, calls
@@ -168,6 +214,7 @@ class TestDefaultsMatchTheModule:
         "derate": "derate",
         "seed": "seed",
         "pin_to": "pin_to",
+        "max_workers": "max_workers",
         "require_frozen": "require_frozen",
         "cloudwatch_join": "cloudwatch_join",
         "region": "region",
@@ -403,6 +450,32 @@ class TestOptionsReachMeasure:
         assert calls[0]["event_sink"] is None
 
 
+class TestMaxWorkersFlag:
+    """The one flag whose absence makes a ceiling unmeasurable.
+
+    The pool is derived from the top of the ladder, and on bidi the server's backlog
+    pushes real in-flight far above the target, so the derived pool runs out and skips
+    dispatches. A skipped dispatch means the client was the limit, and a ceiling
+    measured under a client limit describes the benchmark rather than the endpoint.
+    Raising the pool is the only way a re-run can tell the two apart.
+    """
+
+    def test_absent_by_default_so_the_derived_size_stands(self, runner: CliRunner) -> None:
+        # None, not a number: `worker_count` owns the default, and duplicating it here
+        # would let the two drift with nothing to catch it.
+        _, calls = _run(runner)
+        assert calls[0]["max_workers"] is None
+
+    def test_reaches_measure(self, runner: CliRunner) -> None:
+        _, calls = _run(runner, "--max-workers", "64")
+        assert calls[0]["max_workers"] == 64
+
+    def test_the_help_says_it_only_raises(self) -> None:
+        # A flag that reads as "set the pool size" invites lowering it, which would
+        # make the client the limit deliberately.
+        assert "Only raises" in (_param("max_workers").help or "")
+
+
 class TestTransportFlag:
     def test_defaults_to_response_stream(self, runner: CliRunner) -> None:
         # Every C_max measured so far came from this path; changing the default
@@ -476,13 +549,116 @@ class TestEventsAndArtifact:
         assert raw["provenance"]["origin"] == "measured"
         assert raw["run_id"] == "abc123def456"
 
-    def test_without_output_the_curve_is_still_printed(self, runner: CliRunner) -> None:
-        # The artifact is optional; a run that only wants to see the knee should
-        # not have to name a file for it.
+    def test_without_output_the_artifact_is_still_saved(self, runner: CliRunner) -> None:
+        # The lesson from the run this defaulting exists for: a 45-minute measurement
+        # is not something to lose to a forgotten flag. Keeping it is the default and
+        # discarding it takes --no-save.
         result, _ = _run(runner)
         assert result.exit_code == 0, result.output
         assert "C_max curve" in result.output
+        assert "Artifact: artifacts/cmax-kokoro-82m-response-stream-" in result.output
+
+    def test_no_save_writes_nothing_and_says_so(self, runner: CliRunner, tmp_path) -> None:
+        # The escape hatch has to be visible in stdout, or a smoke test looks like a
+        # kept measurement.
+        result, _ = _run(runner, "--no-save")
+        assert result.exit_code == 0, result.output
+        assert "nothing written" in result.output
         assert "Artifact:" not in result.output
+
+
+class TestTheArtifactNamesItsConfiguration:
+    """A curve belongs to a configuration, and stdout has to say which one.
+
+    Two configurations' curves are two measurements, not two attempts at one, so the
+    realistic mistake in this workflow — re-run after a redeploy, reuse the previous
+    `--output`, lose the old hardware's curve — is worth a warning.
+    """
+
+    def test_the_slug_is_echoed_beside_the_artifact_path(self, runner: CliRunner, tmp_path) -> None:
+        path = tmp_path / "cmax.json"
+        result, _ = _run(
+            runner,
+            "--output",
+            str(path),
+            report=_report(deployed_config=_config("ml.g6.xlarge", "139b9068c5eb")),
+        )
+        assert result.exit_code == 0, result.output
+        assert "Configuration measured: g6xlarge-139b9068" in result.output
+
+    def test_the_default_name_carries_the_slug(self, runner: CliRunner) -> None:
+        # The slug in the default filename is the whole mechanism: two configurations
+        # land in two files, so re-measuring after a redeploy cannot overwrite the
+        # curve it should be compared against.
+        result, _ = _run(
+            runner, report=_report(deployed_config=_config("ml.g6.xlarge", "139b9068c5eb"))
+        )
+        assert result.exit_code == 0, result.output
+        assert "artifacts/cmax-kokoro-82m-response-stream-g6xlarge-139b9068.json" in result.output
+
+    def test_two_configurations_do_not_collide(self, runner: CliRunner) -> None:
+        # The property the naming exists for, asserted directly rather than inferred
+        # from the string: measuring g5 then g6 leaves two curves, not one.
+        with runner.isolated_filesystem():
+            for instance_type in ("ml.g5.xlarge", "ml.g6.xlarge"):
+                report = _report(deployed_config=_config(instance_type, "139b9068c5eb"))
+                # _run has its own isolated_filesystem, so drive the command directly
+                # to keep both writes in one directory.
+                with (
+                    patch.object(cmax_mod, "measure", return_value=report),
+                    patch("boto3.client", side_effect=AssertionError),
+                ):
+                    result = runner.invoke(main, ["cmax", "--model", MODEL])
+                assert result.exit_code == 0, result.output
+            written = sorted(p.name for p in Path("artifacts").iterdir())
+        assert written == [
+            "cmax-kokoro-82m-response-stream-g5xlarge-139b9068.json",
+            "cmax-kokoro-82m-response-stream-g6xlarge-139b9068.json",
+        ]
+
+    def test_overwriting_a_different_configuration_warns(self, runner: CliRunner, tmp_path) -> None:
+        path = tmp_path / "cmax.json"
+        path.write_text(
+            _report(deployed_config=_config("ml.g5.xlarge", "aaaaaaaaaaaa")).model_dump_json()
+        )
+
+        result, _ = _run(
+            runner,
+            "--output",
+            str(path),
+            report=_report(deployed_config=_config("ml.g6.xlarge", "139b9068c5eb")),
+        )
+        assert result.exit_code == 0, result.output
+        assert "WARNING" in result.output
+        assert "g5xlarge-aaaaaaaa" in result.output
+        assert "ml.g5.xlarge" in result.output
+        # And it still wrote: the warning is advice, not a refusal.
+        assert json.loads(path.read_text())["deployed_config"]["instance_type"] == "ml.g6.xlarge"
+
+    def test_overwriting_the_same_configuration_is_silent(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        # Re-measuring the same configuration is the normal way to check a curve's
+        # repeatability, so it must not be nagged about.
+        config = _config("ml.g6.xlarge", "139b9068c5eb")
+        path = tmp_path / "cmax.json"
+        path.write_text(_report(deployed_config=config).model_dump_json())
+
+        result, _ = _run(runner, "--output", str(path), report=_report(deployed_config=config))
+        assert result.exit_code == 0, result.output
+        assert "WARNING" not in result.output
+
+    def test_an_unreadable_existing_file_does_not_stop_the_write(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        # Losing a finished measurement because the file it is replacing is corrupt
+        # would be a far worse outcome than overwriting something unparseable.
+        path = tmp_path / "cmax.json"
+        path.write_text("not json")
+
+        result, _ = _run(runner, "--output", str(path), report=_report())
+        assert result.exit_code == 0, result.output
+        assert CMaxReport.model_validate_json(path.read_text()).run_id == "abc123def456"
 
 
 class TestRendering:
@@ -569,16 +745,130 @@ class TestRendering:
         assert "not safe to read as per-instance" not in result.output
 
     def test_points_at_the_next_command(self, runner: CliRunner) -> None:
-        # C_max alone plans nothing: T_total is the other half of the input.
+        # C_max alone plans nothing: T_total is the other half of the input, and the
+        # sequence ends at `plan`. Naming both is what makes the three-step workflow
+        # discoverable from the output of step one.
         result, _ = _run(runner)
-        assert "tts-bench ttotal" in result.output
-        assert "tts-bench plan" in result.output
+        assert "tts-bench ttotal --model kokoro-82m" in result.output
+        assert "plan" in result.output
+
+    def test_the_next_command_names_the_file_just_written(self, runner: CliRunner) -> None:
+        # `--measured <artifact>` is only actionable if it is the real path. The slug is
+        # generated, so a placeholder means retyping it from the line above by hand.
+        result, _ = _run(
+            runner, report=_report(deployed_config=_config("ml.g5.xlarge", "139b9068c5eb"))
+        )
+        written = "artifacts/cmax-kokoro-82m-response-stream-g5xlarge-139b9068.json"
+        assert f"--measured {written}" in result.output
+
+    def test_no_save_still_names_the_sequence(self, runner: CliRunner) -> None:
+        # Nothing was written, so there is no path to name -- but the sequence is still
+        # what comes next, and a smoke test is exactly when you want to be told.
+        result, _ = _run(runner, "--no-save")
+        assert "tts-bench ttotal --model kokoro-82m" in result.output
+        assert "artifacts/" not in result.output
 
     def test_the_curve_header_names_the_transport(self, runner: CliRunner) -> None:
         # Nobody opens the JSON before reading the table, and a curve read as
         # response-stream when it is bidi sizes the fleet from the wrong number.
         result, _ = _run(runner, report=_report(transport="bidi"))
         assert "via bidi" in result.output
+
+
+class TestRenderingTheThroughputCeiling:
+    """The second C_max, and the four things about it an operator cannot infer.
+
+    It prints as its own block rather than a row in the curve because it has no budget
+    to key it by, and because the point of it is that it is *not* a latency
+    measurement. The curve table above it can look entirely healthy — every budget met,
+    tight spread — on a ladder whose top steps were pure backlog.
+    """
+
+    def test_prints_the_rate_and_the_concurrency_it_implies(self, runner: CliRunner) -> None:
+        result, _ = _run(runner, report=_report(throughput_ceiling=_ceiling(rps=13.03)))
+        assert "Throughput ceiling: 13.03 rps sustained" in result.output
+        assert "C_max 1.00" in result.output
+        # Named in the output, not only in the docstring: the number is not the same
+        # unit as the curve's, and the two sit ten lines apart on screen.
+        assert "useful concurrency" in result.output
+
+    def test_a_missing_ceiling_says_not_measured_and_why_it_matters(
+        self, runner: CliRunner
+    ) -> None:
+        # Absent must not read as "checked and clean". Silence here would let a run
+        # whose every step was already past capacity print a normal-looking curve.
+        result, _ = _run(runner)
+        assert "Throughput ceiling: not measured" in result.output
+        assert "lower --target-concurrency" in result.output
+
+    def test_names_the_queueing_multiple_when_residence_is_mostly_wait(
+        self, runner: CliRunner
+    ) -> None:
+        # kokoro on bidi: 2.93 observed against 1.38 useful. The scaling policy tracks
+        # the observed figure, so an operator comparing this C_max against
+        # scaling_target_value has to be told they are different units.
+        report = _report(throughput_ceiling=_ceiling(concurrency=1.38, observed=2.93))
+        result, _ = _run(runner, report=report)
+        assert "observed in-flight there was 2.93" in result.output
+        assert "2.1x the useful figure" in result.output
+        assert "ConcurrentRequestsPerModel" in result.output
+
+    def test_a_small_multiple_is_stated_without_the_lecture(self, runner: CliRunner) -> None:
+        # Little queueing at the ceiling is the ordinary case, and the paragraph about
+        # units would train the reader to skip the block.
+        report = _report(throughput_ceiling=_ceiling(concurrency=1.0, observed=1.1))
+        result, _ = _run(runner, report=report)
+        assert "1.1x useful" in result.output
+        assert "ConcurrentRequestsPerModel" not in result.output
+
+    def test_no_observed_figure_prints_no_multiple(self, runner: CliRunner) -> None:
+        # The 1Hz monitor can produce no samples on a short step. A 0.0x would read as
+        # an instance doing no work at its own ceiling.
+        result, _ = _run(runner, report=_report(throughput_ceiling=_ceiling(observed=None)))
+        assert "observed in-flight" not in result.output
+        assert "Throughput ceiling: 4.00 rps" in result.output
+
+    def test_warns_when_a_knee_sits_above_the_ceiling(self, runner: CliRunner) -> None:
+        # The finding that motivates the whole block: nothing failed at those steps, so
+        # the curve reports them as knees, but the server had stopped keeping up.
+        report = _report(throughput_ceiling=_ceiling(concurrency=1.5))
+        result, _ = _run(runner, report=report)
+        assert "budgets [300] report a knee ABOVE this ceiling" in result.output
+        assert "backlog, not capacity" in result.output
+        assert "Plan on the ceiling" in result.output
+
+    def test_a_curve_entirely_below_the_ceiling_gets_no_warning(self, runner: CliRunner) -> None:
+        report = _report(throughput_ceiling=_ceiling(concurrency=9.0))
+        result, _ = _run(runner, report=report)
+        assert "ABOVE this ceiling" not in result.output
+
+    def test_an_unbracketed_ceiling_advises_a_longer_ladder(self, runner: CliRunner) -> None:
+        report = _report(throughput_ceiling=_ceiling(concurrency=9.0, bracketed=False))
+        result, _ = _run(runner, report=report)
+        assert "LOWER bound" in result.output
+        assert "extend --target-concurrency" in result.output
+        assert "raise --max-workers" not in result.output
+
+    def test_a_client_throttled_ceiling_advises_raising_the_pool(self, runner: CliRunner) -> None:
+        # The two causes of a lower bound want opposite fixes, and this is the one the
+        # live bidi run actually hit. Advising a longer ladder there measures nothing.
+        report = _report(throughput_ceiling=_ceiling(concurrency=9.0, dispatch_skipped=2))
+        result, _ = _run(runner, report=report)
+        assert "LOWER bound" in result.output
+        assert "2 dispatch(es) were skipped" in result.output
+        assert "raise --max-workers" in result.output
+
+    def test_a_bracketed_unthrottled_ceiling_carries_no_caveat(self, runner: CliRunner) -> None:
+        result, _ = _run(runner, report=_report(throughput_ceiling=_ceiling(concurrency=9.0)))
+        assert "LOWER bound" not in result.output
+
+    def test_prints_the_run_count_and_spread(self, runner: CliRunner) -> None:
+        # A ceiling from one pass of a 3-run ladder is a single sample, and its 0%
+        # spread would otherwise read as three runs agreeing.
+        report = _report(runs=3, throughput_ceiling=_ceiling(concurrency=9.0, runs_contributing=1))
+        result, _ = _run(runner, report=report)
+        assert "1/3 runs" in result.output
+        assert "spread 0%" in result.output
 
 
 class TestRefusalsExitCleanly:

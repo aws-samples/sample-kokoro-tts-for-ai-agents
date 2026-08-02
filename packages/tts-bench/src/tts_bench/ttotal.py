@@ -240,6 +240,16 @@ class TTotalReport:
     run_id: str
     trigger: str
 
+    deployed_config: dict[str, Any] = field(default_factory=dict)
+    """Fingerprint of the configuration this lag was measured against, read from the
+    endpoint. See ``fixture.DeployedConfig``.
+
+    Carried for the same reason ``CMaxReport`` carries one, and for one more: the
+    planner consumes a ``C_max`` curve and a ``T_total`` lag *together*, so without a
+    fingerprint on both sides there is nothing to compare and a g5 curve can be paired
+    with a g6 lag silently. Container start dominates this measurement and is a
+    property of the image, which is exactly what the digest pins."""
+
     timeline: list[StageTime] = field(default_factory=list)
     instance_id: str | None = None
     from_instances: int = 0
@@ -263,6 +273,18 @@ class TTotalReport:
     def entry(self, stage: TimelineStage | str) -> StageTime | None:
         name = str(stage)
         return next((e for e in self.timeline if e.stage == name), None)
+
+    @property
+    def config_slug(self) -> str:
+        """Short identifier of the configuration measured, for an artifact filename.
+
+        Mirrors :attr:`tts_bench.types.CMaxReport.config_slug` so the two artifact
+        families are named on the same axis and a matching pair is recognisable by
+        filename before anything opens them.
+        """
+        from tts_bench.fixture import DeployedConfig
+
+        return DeployedConfig.from_dict(self.deployed_config).slug
 
     @property
     def observed_stages(self) -> list[StageTime]:
@@ -408,6 +430,8 @@ class TTotalReport:
             "endpoint": self.endpoint,
             "run_id": self.run_id,
             "trigger": self.trigger,
+            "deployed_config": dict(self.deployed_config),
+            "config_slug": self.config_slug,
             "t_total_s": total,
             "t_total_from_metric_s": self.t_total_from_metric_s,
             "t_total_bounded": self.t_total_bounded,
@@ -942,17 +966,27 @@ def collect_timeline(
     streams_before: Sequence[LogStream],
     event: ScaleEvent,
     load_events: Sequence[LoadEvent],
+    deployed_config: dict[str, Any] | None = None,
 ) -> TTotalReport:
     """Fetch every stage boundary for one observed scale event and assemble it.
 
     Split from the driving of load so a report can be rebuilt from a window that has
     already happened — which is also what makes it testable with stub clients.
+
+    Args:
+        deployed_config: Configuration fingerprint to stamp on the report, from
+            :func:`tts_bench.fixture.fingerprint_or_registry`. Optional so a report can
+            still be rebuilt from a historical window whose endpoint has since changed;
+            the resulting slug then says ``unknown-nodigest``, which cannot compare equal
+            to a real fingerprint and so fails the planner's pairing check rather than
+            passing it by accident.
     """
     report = TTotalReport(
         model_name=model_name,
         endpoint=endpoint,
         run_id=run_id,
         trigger=trigger,
+        deployed_config=dict(deployed_config or {}),
         from_instances=event.from_instances,
         to_instances=event.to_instances,
     )
@@ -1205,6 +1239,13 @@ def measure(
             quotas=quotas,
         )
 
+    # Read before the run rather than after: most of this measurement is container start,
+    # so if a redeploy lands mid-run the lag belongs to the image that was serving when it
+    # started, not to whatever replaced it.
+    deployed = fixture.fingerprint_or_registry(
+        model_name, endpoint=endpoint, region=region, variant=variant, sagemaker=sagemaker
+    )
+
     desired_before, current_before = read_capacity(sagemaker, endpoint, variant)
     # Captured before anything changes: the set difference against this is what names the
     # new instance afterwards.
@@ -1331,6 +1372,7 @@ def measure(
         streams_before=streams_before,
         event=event,
         load_events=load_events,
+        deployed_config=deployed.to_dict(),
     )
 
 

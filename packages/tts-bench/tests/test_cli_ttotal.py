@@ -2,7 +2,7 @@
 
 `ttotal` is the one command in this package that both *sends load* and *mutates an
 endpoint's desired instance count*, so the tests here are mostly about what happens
-before either of those. Three concerns:
+before either of those. Four concerns:
 
 - **Every required input is resolved or refused, never guessed.** `S` converts a target
   concurrency into an arrival rate and the TTFAB budget defines what "recovered" means;
@@ -16,6 +16,10 @@ before either of those. Three concerns:
 - **A `force-desired` result is labelled as half a measurement**, on stdout and in the
   artifact both. It skips the metric and alarm stages entirely, and the failure mode —
   planning a surge against a container-only figure — is silent.
+- **An artifact measured on another configuration is refused.** `S` and the budget are
+  properties of a GPU and a container build, not of a model, so replaying a g5 artifact
+  against a g6 endpoint would produce a plan for a fleet that does not exist. Unlike the
+  transport check this stops the run, and `--allow-config-mismatch` is the only way past.
 
 `main.commands["ttotal"]` is inspected directly for the flag defaults, because `cli.py`
 imports `ttotal.py` lazily (numpy and botocore stay out of `--help`) and so restates
@@ -30,6 +34,7 @@ from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
+from loguru import logger
 
 from tts_bench import ttotal as ttotal_mod
 from tts_bench.cli import (
@@ -38,7 +43,7 @@ from tts_bench.cli import (
     _config_ttfab_budget_ms,
     main,
 )
-from tts_bench.fixture import FixtureError
+from tts_bench.fixture import DeployedConfig, FixtureError
 from tts_bench.ttotal import StageTime, TimelineStage, TTotalError, TTotalReport
 
 MODEL = "kokoro-82m"
@@ -49,10 +54,33 @@ T0 = datetime(2026, 7, 30, 11, 0, 0, tzinfo=UTC)
 DEPLOYED_TARGET = 0.713
 S_MEAN_S = 0.10986375146305409
 
+#: The configuration the fake endpoint reports, and the one `_artifact` records — so a
+#: default artifact replays cleanly and only a test that *asks* for a mismatch sees one.
+DEPLOYED = DeployedConfig(
+    instance_type="ml.g5.xlarge",
+    image_digest="139b9068c5eb1f03c8312c17391dc35838e43e2417ae80d61e628e6ffb3d6a28",
+    container_env={"MAX_REQUEST_AGE_S": "56"},
+)
+
 
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
+
+
+@pytest.fixture
+def logged():
+    """Captured loguru warnings.
+
+    ``caplog`` does not see these — loguru does not propagate to the stdlib logging
+    tree — so an assertion against it would pass whether or not anything was emitted.
+    """
+    records: list[str] = []
+    sink_id = logger.add(lambda message: records.append(message.record["message"]), level="WARNING")
+    try:
+        yield records
+    finally:
+        logger.remove(sink_id)
 
 
 def _param(name: str):
@@ -76,6 +104,10 @@ def _report(**overrides) -> TTotalReport:
         p95_after_ms=140.0,
         requests_before=300,
         requests_after=120,
+        # The same fingerprint the fake endpoint reports, since `measure` reads it off
+        # the endpoint. Without it the artifact filename would say `unknown-nodigest`
+        # and the pairing check against a cmax curve could never pass.
+        deployed_config=DEPLOYED.to_dict(),
     )
     report.timeline = [
         StageTime(str(TimelineStage.LOAD_APPLIED), T0, source="load generator start"),
@@ -93,13 +125,19 @@ def _report(**overrides) -> TTotalReport:
 
 
 def _artifact(tmp_path, **overrides) -> str:
-    """A minimal `cmax` artifact, shaped like the committed one."""
+    """A minimal `cmax` artifact, shaped like the committed one.
+
+    Carries the same fingerprint the fake endpoint reports, so the configuration check
+    passes by default. Pass ``deployed_config=`` to make it disagree, or to drop it and
+    stand in for an artifact written before fingerprinting existed.
+    """
     payload = {
         "model_name": MODEL,
         "endpoint": ENDPOINT,
         "s_mean_s": S_MEAN_S,
         "c_max_curve": {"300": 1.6302521008403361, "500": 1.6302521008403361},
         "transport": "bidi",
+        "deployed_config": DEPLOYED.to_dict(),
     }
     payload.update(overrides)
     path = tmp_path / "cmax.json"
@@ -114,13 +152,19 @@ def _run(
     report: TTotalReport | None = None,
     raises=None,
     target_value: float | None = DEPLOYED_TARGET,
+    deployed: DeployedConfig | Exception = DEPLOYED,
 ):
-    """Invoke `ttotal` with `measure` and the policy read replaced.
+    """Invoke `ttotal` with `measure`, the policy read, and the fingerprint replaced.
 
     `boto3.client` is left real but never reached for credentials: `measure` is the only
-    thing that would use the clients, and it is patched. `deployed_target_value` is
-    patched because it is the one AWS read the command makes *itself*, before deciding
-    whether a run is even possible.
+    thing that would use the clients, and it is patched. `deployed_target_value` and
+    `describe_deployed_config` are patched because they are the two AWS reads the command
+    makes *itself*, before deciding whether a run is even possible. Pass an exception as
+    `deployed` to make the fingerprint read fail.
+
+    Runs in an isolated filesystem because `--output` now defaults to a *relative*
+    `artifacts/` path, so without this the suite would write real artifacts into the
+    checkout, beside the measurements they are meant to protect.
     """
     calls: list[dict] = []
 
@@ -130,10 +174,17 @@ def _run(
             raise raises
         return report if report is not None else _report()
 
+    def fake_describe(*_args, **_kwargs) -> DeployedConfig:
+        if isinstance(deployed, Exception):
+            raise deployed
+        return deployed
+
     with (
         patch.object(ttotal_mod, "measure", fake_measure),
         patch.object(ttotal_mod, "deployed_target_value", return_value=target_value),
+        patch("tts_bench.fixture.describe_deployed_config", fake_describe),
         patch("boto3.client"),
+        runner.isolated_filesystem(),
     ):
         result = runner.invoke(main, ["ttotal", "--model", model, *args])
     return result, calls
@@ -262,6 +313,25 @@ class TestResolvingTheBudget:
         assert _config_ttfab_budget_ms(ENDPOINT) == pytest.approx(300.0)
         assert _config_ttfab_budget_ms("not-an-endpoint") is None
 
+    def test_the_budget_is_not_the_end_to_end_slo(self) -> None:
+        # `plan` takes --ttfab-slo-ms and derives W_max from it; this command deliberately
+        # does not, and the reason is measurement resolution rather than tidiness.
+        # Recovery is "p95 came back", so the threshold has to sit *between* the
+        # overloaded p95 and the recovered one. Kokoro at 3x C_target reaches 818ms, which
+        # is already inside a 3000ms SLO -- thresholded there, every run would report
+        # recovery at the instant the instance came into service and measure nothing.
+        assert not any(param.name == "ttfab_slo_ms" for param in main.commands["ttotal"].params)
+        assert _config_ttfab_budget_ms(ENDPOINT) == pytest.approx(300.0)
+
+    def test_the_config_budget_is_far_tighter_than_the_configs_own_slo(self) -> None:
+        # The two live side by side in ModelEndpointConfig and differ by 10x on purpose.
+        # Pinned here because reading the wrong one is a silent failure, not an error.
+        from speech_infra.config import TTS_MODEL_CONFIGS
+
+        config = TTS_MODEL_CONFIGS["kokoro-82m"]
+        assert config.ttfab_budget_ms == 300
+        assert config.ttfab_slo_ms == 3000
+
 
 class TestResolvingCTarget:
     def test_read_off_the_deployed_policy(self, runner: CliRunner) -> None:
@@ -278,6 +348,9 @@ class TestResolvingCTarget:
                 ttotal_mod, "deployed_target_value", side_effect=AssertionError("read anyway")
             ),
             patch("boto3.client"),
+            # Isolated for the same reason `_run` is: the artifact path defaults to a
+            # relative artifacts/, so an un-isolated run writes into the checkout.
+            runner.isolated_filesystem(),
         ):
             result = runner.invoke(
                 main,
@@ -359,6 +432,125 @@ class TestTransport:
         assert calls == []
 
 
+class TestConfigurationMatching:
+    """The artifact's fingerprint against the endpoint it is about to be replayed on.
+
+    Stricter than the transport check above, and deliberately so. A transport mismatch
+    mis-sizes the offered rate, which shows up in the result; a configuration mismatch
+    means `S` and the budget were measured on another GPU or another container build, so
+    every derived number — `C_target`, the fleet size, the queue depth — describes a
+    fleet that does not exist, and nothing in the output looks wrong.
+    """
+
+    def test_a_matching_fingerprint_runs(self, runner: CliRunner, tmp_path) -> None:
+        result, calls = _run(runner, "--measured", _artifact(tmp_path))
+        assert result.exit_code == 0
+        assert calls != []
+
+    def test_a_different_instance_type_stops_the_run(self, runner: CliRunner, tmp_path) -> None:
+        # The g5-artifact-on-g6 case this check exists for.
+        g6 = DeployedConfig(
+            instance_type="ml.g6.xlarge",
+            image_digest=DEPLOYED.image_digest,
+            container_env=dict(DEPLOYED.container_env),
+        )
+        result, calls = _run(runner, "--measured", _artifact(tmp_path), deployed=g6)
+        assert result.exit_code != 0
+        assert "ml.g5.xlarge" in result.output
+        assert "ml.g6.xlarge" in result.output
+        # No load offered and no desired count touched: the refusal has to come first.
+        assert calls == []
+
+    def test_a_different_image_digest_stops_the_run(self, runner: CliRunner, tmp_path) -> None:
+        # Same hardware, rebuilt container — an admission queue lands here.
+        rebuilt = DeployedConfig(
+            instance_type=DEPLOYED.instance_type,
+            image_digest="0000000011112222333344445555666677778888999900001111222233334444",
+            container_env=dict(DEPLOYED.container_env),
+        )
+        result, calls = _run(runner, "--measured", _artifact(tmp_path), deployed=rebuilt)
+        assert result.exit_code != 0
+        assert "serving code differs" in result.output
+        assert calls == []
+
+    def test_a_different_container_env_stops_the_run(self, runner: CliRunner, tmp_path) -> None:
+        retuned = DeployedConfig(
+            instance_type=DEPLOYED.instance_type,
+            image_digest=DEPLOYED.image_digest,
+            container_env={"MAX_REQUEST_AGE_S": "30"},
+        )
+        result, calls = _run(runner, "--measured", _artifact(tmp_path), deployed=retuned)
+        assert result.exit_code != 0
+        assert "container_env" in result.output
+        assert calls == []
+
+    def test_the_override_downgrades_it_to_a_warning(
+        self, runner: CliRunner, tmp_path, logged
+    ) -> None:
+        # For the operator who knows the difference is irrelevant to what they are
+        # measuring -- e.g. T_total, which depends on nothing S depends on.
+        g6 = DeployedConfig(instance_type="ml.g6.xlarge", image_digest=DEPLOYED.image_digest)
+        result, calls = _run(
+            runner,
+            "--measured",
+            _artifact(tmp_path),
+            "--allow-config-mismatch",
+            deployed=g6,
+        )
+        assert result.exit_code == 0
+        assert calls != []
+        assert any("different configuration" in message for message in logged)
+
+    def test_an_artifact_predating_fingerprinting_is_refused(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        # Both committed artifacts look like this. Accepting them silently is the exact
+        # hole this check closes, so "no fingerprint" is a mismatch rather than a pass.
+        result, calls = _run(runner, "--measured", _artifact(tmp_path, deployed_config={}))
+        assert result.exit_code != 0
+        assert "predates configuration fingerprinting" in result.output
+        assert calls == []
+
+    def test_a_pre_fingerprint_artifact_is_allowed_with_the_override(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        result, calls = _run(
+            runner,
+            "--measured",
+            _artifact(tmp_path, deployed_config={}),
+            "--allow-config-mismatch",
+        )
+        assert result.exit_code == 0
+        assert "WARNING" in result.output
+        assert calls != []
+
+    def test_an_unreadable_endpoint_warns_but_runs(self, runner: CliRunner, tmp_path) -> None:
+        # One extra describe call failing is not a reason to refuse a run that is
+        # otherwise viable -- the endpoint is about to be invoked either way, which is a
+        # far better test of whether it is reachable.
+        result, calls = _run(
+            runner,
+            "--measured",
+            _artifact(tmp_path),
+            deployed=FixtureError("no such endpoint"),
+        )
+        assert result.exit_code == 0
+        assert "could not verify the deployed configuration" in result.output
+        assert calls != []
+
+    def test_no_check_without_an_artifact(self, runner: CliRunner) -> None:
+        # Nothing is being replayed, so there is nothing to compare. A run driven
+        # entirely by flags measures whatever is deployed, which is self-consistent.
+        result, calls = _run(
+            runner, "--s-mean", "0.11", deployed=FixtureError("must not be called")
+        )
+        assert result.exit_code == 0
+        assert calls != []
+
+    def test_the_flag_defaults_off(self) -> None:
+        assert _param("allow_config_mismatch").default is False
+
+
 class TestForceDesiredIsLabelled:
     def test_stdout_says_it_is_a_lower_bound(self, runner: CliRunner) -> None:
         result, _ = _run(runner, "--s-mean", "0.11", "--trigger", TTOTAL_TRIGGER_FORCE_DESIRED)
@@ -409,9 +601,52 @@ class TestOutput:
         assert payload["endpoint"] == ENDPOINT
         assert len(payload["timeline"]) == 8
 
-    def test_points_at_the_next_command_with_the_measured_t_total(self, runner: CliRunner) -> None:
+    def test_the_artifact_carries_its_configuration(self, runner: CliRunner, tmp_path) -> None:
+        # `plan` pairs a C_max curve with a T_total lag and refuses to mix two
+        # configurations. Without a fingerprint on this side there would be nothing to
+        # compare, and a g5 curve would pair with a g6 lag silently.
+        out = tmp_path / "ttotal.json"
+        _run(runner, "--s-mean", "0.11", "--output", str(out))
+
+        payload = json.loads(out.read_text())
+        assert payload["deployed_config"]["instance_type"] == "ml.g5.xlarge"
+        assert payload["config_slug"] == "g5xlarge-139b9068"
+
+    def test_without_output_the_artifact_is_still_saved(self, runner: CliRunner) -> None:
+        # A T_total run costs a real scale-out and, on a timeout, most of max_wait_s of
+        # offered load. Keeping the result is the default.
         result, _ = _run(runner, "--s-mean", "0.11")
-        assert "tts-bench plan --model kokoro-82m --t-total 300" in result.output
+        assert result.exit_code == 0, result.output
+        assert "Artifact: artifacts/ttotal-kokoro-82m-drive-load-g5xlarge-139b9068.json" in (
+            result.output
+        )
+
+    def test_the_trigger_is_in_the_default_name(self, runner: CliRunner) -> None:
+        # force-desired measures only the container half, so its result is a different
+        # measurement of the same configuration -- it must not overwrite a driven run.
+        result, _ = _run(runner, "--trigger", TTOTAL_TRIGGER_FORCE_DESIRED)
+        assert result.exit_code == 0, result.output
+        assert "artifacts/ttotal-kokoro-82m-force-desired-" in result.output
+
+    def test_no_save_writes_nothing_and_says_so(self, runner: CliRunner) -> None:
+        result, _ = _run(runner, "--s-mean", "0.11", "--no-save")
+        assert result.exit_code == 0, result.output
+        assert "nothing written" in result.output
+        assert "Artifact:" not in result.output
+
+    def test_points_at_the_next_command(self, runner: CliRunner) -> None:
+        # Names both artifacts rather than a --t-total number, because `plan` consumes
+        # the stage breakdown: the provision stage is swept, not assumed, so a single
+        # total is not the input.
+        result, _ = _run(runner, "--s-mean", "0.11")
+        assert "tts-bench plan --measured" in result.output
+        # The path this run just wrote, not a placeholder: the slug in it is not something
+        # to retype from memory, and pairing the wrong two artifacts is the mistake the
+        # fingerprint exists to catch.
+        assert "--ttotal artifacts/ttotal-kokoro-82m-drive-load-g5xlarge-139b9068.json" in (
+            result.output
+        )
+        assert "--peak-rps" in result.output
 
     def test_a_report_with_no_total_still_prints(self, runner: CliRunner) -> None:
         # Every API came back empty. Worth seeing rather than crashing on a None format.
