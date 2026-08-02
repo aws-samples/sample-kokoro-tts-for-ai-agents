@@ -15,8 +15,15 @@ Symbols used throughout:
     S         mean service time, seconds (measured)
     T_total   scaling lag: metric publication -> instance serving traffic (measured)
     k         growth factor within one T_total (supplied as a scenario argument)
-    W_max     added wait a queued request may absorb, seconds (policy choice)
+    SLO       end-to-end first-byte promise, seconds (stated)
+    W_max     added wait a queued request may absorb, seconds (derived from the SLO)
     C_target  per-instance concurrency the scaling policy should track (derived)
+
+``W_max`` is derived rather than chosen. An end-to-end SLO — "first byte within N
+seconds, queueing included" — fixes it at ``SLO - S_p95``: whatever the promise does
+not spend on service is all the queue has left. Holding it as an independent policy
+knob is how a 300ms budget came to sit beside a 20s wait budget, a combination that
+misses the stated SLO by 7x while every individual field looks defensible.
 """
 
 from __future__ import annotations
@@ -31,6 +38,148 @@ CLOUDWATCH_HIGH_RES_PERIOD_S = 10.0
 #: Fraction of the measured knee to actually target. The knee is where latency
 #: starts degrading, so sitting exactly on it means any jitter crosses the SLO.
 DEFAULT_DERATE = 0.875
+
+#: Hard ceiling on a single SageMaker real-time invocation, seconds. Not a policy
+#: choice and not tunable: the runtime closes the connection at 60s regardless of
+#: what the container is doing. Everything a request spends — queueing wait plus
+#: service — has to fit inside it, so it caps ``W_max`` no matter how generous the
+#: SLO is. Containers set ``MAX_REQUEST_AGE_S`` a few seconds below to shed a
+#: doomed request rather than have the client see a truncated stream.
+SAGEMAKER_INVOCATION_CEILING_S = 60.0
+
+
+def request_deadline_s(max_added_wait_s: float, s_p95_s: float) -> float:
+    """Worst-case wall-clock a queued request occupies, seconds.
+
+    ``W_max + S_p95``: the wait it absorbs in the queue plus the service it then
+    receives. Judged against :data:`SAGEMAKER_INVOCATION_CEILING_S` rather than
+    against the TTFAB budget — TTFAB is when audio *starts*, while this is when
+    the invocation *ends*, and only the latter is what the runtime times out.
+
+    ``s_p95_s``, not ``s_mean_s``: a mean-sized deadline is missed by half the
+    requests that reach it, which is not a deadline.
+
+    Raises:
+        ValueError: If ``s_p95_s`` is not positive or ``max_added_wait_s`` is
+            negative.
+    """
+    if s_p95_s <= 0:
+        raise ValueError(f"s_p95_s must be positive, got {s_p95_s}")
+    if max_added_wait_s < 0:
+        raise ValueError(f"max_added_wait_s must be non-negative, got {max_added_wait_s}")
+    return max_added_wait_s + s_p95_s
+
+
+def fits_invocation_ceiling(
+    max_added_wait_s: float,
+    s_p95_s: float,
+    ceiling_s: float = SAGEMAKER_INVOCATION_CEILING_S,
+) -> tuple[bool, float]:
+    """Whether a queued request can finish before the platform hangs up on it.
+
+    Returns:
+        ``(fits, deadline_s)``. When ``fits`` is false the design is infeasible
+        rather than merely fragile: the queue is admitting requests it cannot
+        serve inside the ceiling, so they wait the full ``W_max`` and then fail
+        anyway, which is worse than rejecting them at admission.
+
+    Raises:
+        ValueError: If ``ceiling_s`` is not positive, or via
+            :func:`request_deadline_s`.
+    """
+    if ceiling_s <= 0:
+        raise ValueError(f"ceiling_s must be positive, got {ceiling_s}")
+    deadline = request_deadline_s(max_added_wait_s, s_p95_s)
+    return deadline <= ceiling_s, deadline
+
+
+def max_added_wait_under_ceiling(
+    s_p95_s: float,
+    ceiling_s: float = SAGEMAKER_INVOCATION_CEILING_S,
+) -> float:
+    """Largest ``W_max`` that still fits inside the invocation ceiling, seconds.
+
+    The inverse of :func:`fits_invocation_ceiling`, so an infeasible plan can be
+    told *what would work* instead of only that it does not. Clamped at zero: a
+    model whose own p95 exceeds the ceiling cannot be rescued by a shorter queue,
+    and a negative budget would read as one.
+
+    Raises:
+        ValueError: If ``s_p95_s`` or ``ceiling_s`` is not positive.
+    """
+    if s_p95_s <= 0:
+        raise ValueError(f"s_p95_s must be positive, got {s_p95_s}")
+    if ceiling_s <= 0:
+        raise ValueError(f"ceiling_s must be positive, got {ceiling_s}")
+    return max(0.0, ceiling_s - s_p95_s)
+
+
+def w_max_for_slo(slo_s: float, s_p95_s: float) -> float:
+    """Queueing budget an end-to-end first-byte SLO leaves over, seconds.
+
+    ``SLO - S_p95``. The SLO is the whole promise — queue plus service — so the queue
+    gets whatever service does not already spend. This makes ``W_max`` derived rather
+    than chosen, which is the point: two independent fields can disagree with the SLO,
+    one derived field cannot.
+
+    ``s_p95_s``, not ``s_mean_s``, for the reason :func:`request_deadline_s` gives — a
+    mean-sized budget is missed by half the requests that reach it. The result is
+    therefore the wait a *tail* request can absorb and still make the promise.
+
+    Clamped at zero, so a model too slow to meet the SLO unqueued reports no budget
+    rather than a negative one. Zero does not mean "a queue-free design is fine" — it
+    means not even an unqueued request makes the promise. Callers wanting that
+    distinction should ask :func:`slo_is_feasible` rather than compare against zero.
+
+    Raises:
+        ValueError: If ``slo_s`` or ``s_p95_s`` is not positive.
+    """
+    if slo_s <= 0:
+        raise ValueError(f"slo_s must be positive, got {slo_s}")
+    if s_p95_s <= 0:
+        raise ValueError(f"s_p95_s must be positive, got {s_p95_s}")
+    return max(0.0, slo_s - s_p95_s)
+
+
+def slo_is_feasible(slo_s: float, s_p95_s: float) -> bool:
+    """Whether the SLO is achievable at all on this model's own service time.
+
+    False when ``S_p95 >= SLO``: the tail of an *unqueued* request already misses the
+    promise, so no queue depth, instance count, or scaling policy can rescue it. Only a
+    faster model, a smaller request, or a looser SLO will. Distinct from a ``W_max`` of
+    zero being merely tight — this says the design cannot work.
+
+    Raises:
+        ValueError: Via :func:`w_max_for_slo`.
+    """
+    return w_max_for_slo(slo_s, s_p95_s) > 0
+
+
+def fits_slo(
+    max_added_wait_s: float,
+    s_p95_s: float,
+    slo_s: float,
+) -> tuple[bool, float]:
+    """Whether a queued request can reach first byte inside the end-to-end SLO.
+
+    The SLO analogue of :func:`fits_invocation_ceiling`, and the check that catches a
+    ``W_max`` set by hand rather than derived. Both bounds apply and neither implies the
+    other: the 60s ceiling is the platform hanging up, this is the promise being broken,
+    and a config can satisfy the ceiling while missing the SLO by an order of magnitude.
+
+    Returns:
+        ``(fits, deadline_s)`` where ``deadline_s`` is :func:`request_deadline_s`. When
+        ``fits`` is false the queue is admitting requests it can only serve *late* —
+        they succeed, so nothing errors, and the SLO is missed silently. That is worse
+        than a ceiling breach, which at least surfaces as a failed invocation.
+
+    Raises:
+        ValueError: If ``slo_s`` is not positive, or via :func:`request_deadline_s`.
+    """
+    if slo_s <= 0:
+        raise ValueError(f"slo_s must be positive, got {slo_s}")
+    deadline = request_deadline_s(max_added_wait_s, s_p95_s)
+    return deadline <= slo_s, deadline
 
 
 def c_target(c_max: float, k: float, derate: float = DEFAULT_DERATE) -> float:

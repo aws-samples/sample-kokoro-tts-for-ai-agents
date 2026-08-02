@@ -13,19 +13,32 @@ import pytest
 from shared.capacity import (
     CLOUDWATCH_HIGH_RES_PERIOD_S,
     DEFAULT_DERATE,
+    SAGEMAKER_INVOCATION_CEILING_S,
     c_slo_cap,
     c_target,
     effective_c_target,
     effective_headroom_lag_s,
+    fits_invocation_ceiling,
+    fits_slo,
     lambda_cap_per_instance,
+    max_added_wait_under_ceiling,
     min_samples_for_k,
     n_instances,
     n_instances_from_streams,
     q_per_instance,
     queue_covers_surge,
+    request_deadline_s,
+    slo_is_feasible,
     utilization_at_k,
     w_absorbed,
+    w_max_for_slo,
 )
+
+#: Kokoro-82M on ml.g5.xlarge, bidi transport, from
+#: artifacts/cmax-kokoro-82m-bidi-g5xlarge-139b9068.json. The numbers the 3s SLO was
+#: actually reasoned about, so a regression here means the worked example moved.
+KOKORO_S_MEAN_S = 0.10602401316328536
+KOKORO_S_P95_S = 0.1645768812391907
 
 
 class TestCTarget:
@@ -81,6 +94,123 @@ class TestCSloCap:
     def test_rejects_negative_wait_budget(self) -> None:
         with pytest.raises(ValueError):
             c_slo_cap(-1.0, s_mean_s=0.5)
+
+
+class TestWMaxForSlo:
+    """``W_max`` derived from the end-to-end SLO instead of chosen."""
+
+    def test_queue_gets_what_service_does_not_spend(self) -> None:
+        # The worked example: a 3s promise on kokoro's 165ms tail leaves 2.835s.
+        assert w_max_for_slo(3.0, KOKORO_S_P95_S) == pytest.approx(2.835, abs=1e-3)
+
+    def test_uses_the_tail_not_the_mean(self) -> None:
+        # A mean-sized budget would hand out 59ms more than the tail can afford,
+        # which is exactly the request that misses the promise.
+        tail_budget = w_max_for_slo(3.0, KOKORO_S_P95_S)
+        mean_budget = w_max_for_slo(3.0, KOKORO_S_MEAN_S)
+        assert tail_budget < mean_budget
+        assert mean_budget - tail_budget == pytest.approx(KOKORO_S_P95_S - KOKORO_S_MEAN_S)
+
+    def test_a_tight_slo_leaves_almost_no_queue(self) -> None:
+        # Why the old 300ms budget was never an end-to-end number: 135ms of slack
+        # is barely one service time, so the queue is not a queue.
+        assert w_max_for_slo(0.3, KOKORO_S_P95_S) == pytest.approx(0.135, abs=1e-3)
+
+    def test_clamps_at_zero_rather_than_going_negative(self) -> None:
+        # A negative budget would read as a queue depth of zero being sufficient,
+        # when in fact the SLO is already missed before queueing.
+        assert w_max_for_slo(0.1, s_p95_s=4.0) == 0.0
+
+    @pytest.mark.parametrize(("slo", "s_p95"), [(0.0, 0.16), (-1.0, 0.16), (3.0, 0.0), (3.0, -1.0)])
+    def test_rejects_nonsense_inputs(self, slo: float, s_p95: float) -> None:
+        with pytest.raises(ValueError):
+            w_max_for_slo(slo, s_p95)
+
+
+class TestSloIsFeasible:
+    def test_a_fast_model_under_a_generous_slo(self) -> None:
+        assert slo_is_feasible(3.0, KOKORO_S_P95_S)
+
+    def test_a_model_slower_than_its_own_slo_is_infeasible(self) -> None:
+        # No queue depth, instance count, or policy rescues this: the unqueued
+        # tail already misses.
+        assert not slo_is_feasible(3.0, s_p95_s=3.5)
+
+    def test_service_time_exactly_at_the_slo_is_infeasible(self) -> None:
+        # Boundary: spending the entire promise on service leaves nothing, and a
+        # queue of depth zero still has the request waiting to be scheduled.
+        assert not slo_is_feasible(3.0, s_p95_s=3.0)
+
+
+class TestFitsSlo:
+    def test_a_derived_w_max_exactly_fits_by_construction(self) -> None:
+        # w_max_for_slo is the inverse, so round-tripping must land on the SLO
+        # rather than a hair over it.
+        w = w_max_for_slo(3.0, KOKORO_S_P95_S)
+        fits, deadline = fits_slo(w, KOKORO_S_P95_S, slo_s=3.0)
+        assert fits
+        assert deadline == pytest.approx(3.0)
+
+    def test_the_deployed_kokoro_config_misses_the_three_second_slo(self) -> None:
+        # The regression this function exists for. max_added_wait_s=20.0 shipped
+        # beside ttfab_budget_ms=300 and nothing related them, so a request using
+        # its full queue allowance took ~20.2s to first byte.
+        fits, deadline = fits_slo(20.0, KOKORO_S_P95_S, slo_s=3.0)
+        assert not fits
+        assert deadline == pytest.approx(20.165, abs=1e-3)
+
+    def test_fitting_the_60s_ceiling_does_not_imply_fitting_the_slo(self) -> None:
+        # Both bounds apply and neither implies the other. This is the case that
+        # passed every check the code had before: legal on the platform, and
+        # silently 6.7x over the promise.
+        ceiling_ok, _ = fits_invocation_ceiling(20.0, KOKORO_S_P95_S)
+        slo_ok, _ = fits_slo(20.0, KOKORO_S_P95_S, slo_s=3.0)
+        assert ceiling_ok
+        assert not slo_ok
+
+    def test_the_slo_can_also_be_looser_than_the_ceiling(self) -> None:
+        # Nothing stops a stated SLO exceeding 60s; the platform still hangs up,
+        # so the ceiling has to keep binding independently.
+        slo_ok, _ = fits_slo(70.0, KOKORO_S_P95_S, slo_s=120.0)
+        ceiling_ok, _ = fits_invocation_ceiling(70.0, KOKORO_S_P95_S)
+        assert slo_ok
+        assert not ceiling_ok
+
+    def test_agrees_with_request_deadline_s(self) -> None:
+        # One definition of "what a queued request occupies", not two.
+        _, deadline = fits_slo(2.0, KOKORO_S_P95_S, slo_s=3.0)
+        assert deadline == request_deadline_s(2.0, KOKORO_S_P95_S)
+
+    def test_rejects_a_nonpositive_slo(self) -> None:
+        with pytest.raises(ValueError):
+            fits_slo(2.0, KOKORO_S_P95_S, slo_s=0.0)
+
+
+class TestSloAndQueueDepthTogether:
+    """The end-to-end consequence: what the derived budget does to ``Q_max``."""
+
+    def test_the_three_second_slo_shrinks_the_queue_sevenfold(self) -> None:
+        # Deployed queue_max_depth was 296, derived from the wrong W_max. At the
+        # SLO-derived budget the same C_max gives ~30.
+        w = w_max_for_slo(3.0, KOKORO_S_P95_S)
+        derived = q_per_instance(1.153, KOKORO_S_MEAN_S, w)
+        shipped = q_per_instance(1.153, KOKORO_S_MEAN_S, 20.0)
+        assert derived == 30
+        assert shipped == 217
+        assert shipped > derived * 7
+
+    def test_the_wait_budget_does_not_bind_c_target_at_three_seconds(self) -> None:
+        # Worth pinning because it is counterintuitive: loosening the SLO from
+        # 300ms to 3s does not move the tracked target at all. c_slo_cap lands at
+        # ~27.7, far above any measured kokoro knee, so surge headroom still binds
+        # and only the queue depth changes.
+        w = w_max_for_slo(3.0, KOKORO_S_P95_S)
+        assert c_slo_cap(w, KOKORO_S_MEAN_S) == pytest.approx(27.7, abs=0.1)
+        for c_max in (1.153, 1.392, 1.790):
+            _, binding = effective_c_target(
+                c_max, k=2.0, s_mean_s=KOKORO_S_MEAN_S, max_added_wait_s=w
+            )
+            assert binding == "surge_headroom"
 
 
 class TestEffectiveCTarget:
@@ -281,3 +411,79 @@ class TestMinSamplesForK:
 class TestDefaultDerate:
     def test_matches_the_methodology(self) -> None:
         assert DEFAULT_DERATE == 0.875
+
+
+class TestRequestDeadline:
+    def test_is_the_wait_plus_the_service(self) -> None:
+        assert request_deadline_s(20.0, s_p95_s=0.3) == pytest.approx(20.3)
+
+    def test_uses_p95_not_mean(self) -> None:
+        # Asserted as a property rather than assumed from the signature: a deadline
+        # sized on the mean is missed by half the requests that reach it.
+        on_mean = request_deadline_s(20.0, s_p95_s=0.11)
+        on_p95 = request_deadline_s(20.0, s_p95_s=0.55)
+        assert on_p95 > on_mean
+
+    def test_a_zero_wait_is_still_the_service_time(self) -> None:
+        assert request_deadline_s(0.0, s_p95_s=0.55) == pytest.approx(0.55)
+
+    @pytest.mark.parametrize(("wait", "p95"), [(-1.0, 0.3), (20.0, 0.0), (20.0, -0.3)])
+    def test_rejects_impossible_inputs(self, wait: float, p95: float) -> None:
+        with pytest.raises(ValueError):
+            request_deadline_s(wait, s_p95_s=p95)
+
+
+class TestFitsInvocationCeiling:
+    def test_the_deployed_kokoro_budget_fits(self) -> None:
+        # W_max=20s at the measured p95 of ~0.55s: 20.55s against a 60s ceiling.
+        # The number config.py ships, so a regression here means the deployed
+        # endpoint stopped being feasible by this tool's own standard.
+        fits, deadline = fits_invocation_ceiling(20.0, s_p95_s=0.55)
+        assert fits
+        assert deadline == pytest.approx(20.55)
+
+    def test_a_wait_past_the_ceiling_does_not_fit(self) -> None:
+        # The failure this exists to catch: a generous W_max chosen to absorb a long
+        # T_total, which the platform then refuses to honour.
+        fits, deadline = fits_invocation_ceiling(70.0, s_p95_s=0.55)
+        assert not fits
+        assert deadline == pytest.approx(70.55)
+
+    def test_service_time_alone_can_break_it(self) -> None:
+        # No queue at all, and still infeasible: a model slower than the ceiling
+        # cannot be deployed behind a real-time endpoint at any W_max.
+        fits, _ = fits_invocation_ceiling(0.0, s_p95_s=61.0)
+        assert not fits
+
+    def test_sitting_exactly_on_the_ceiling_fits(self) -> None:
+        # Inclusive on purpose: the boundary is a valid plan, and excluding it would
+        # report INFEASIBLE for a design that meets the stated constraint exactly.
+        fits, _ = fits_invocation_ceiling(59.5, s_p95_s=0.5)
+        assert fits
+
+    def test_the_ceiling_is_sixty_seconds(self) -> None:
+        assert SAGEMAKER_INVOCATION_CEILING_S == 60.0
+
+    def test_an_explicit_ceiling_overrides_the_default(self) -> None:
+        # Another platform, or a stricter internal SLO, without a second function.
+        assert fits_invocation_ceiling(20.0, s_p95_s=0.55, ceiling_s=10.0)[0] is False
+
+
+class TestMaxAddedWaitUnderCeiling:
+    def test_is_the_ceiling_less_the_service_time(self) -> None:
+        assert max_added_wait_under_ceiling(0.55) == pytest.approx(59.45)
+
+    def test_round_trips_with_the_feasibility_check(self) -> None:
+        # The property that makes it a usable recommendation: the largest budget it
+        # reports must itself pass. Anything else would advise an infeasible plan.
+        largest = max_added_wait_under_ceiling(0.55)
+        assert fits_invocation_ceiling(largest, s_p95_s=0.55)[0]
+
+    def test_a_model_slower_than_the_ceiling_gets_no_budget(self) -> None:
+        # Clamped rather than negative: a negative budget reads as "shorten the
+        # queue", but no queue length rescues a model this slow.
+        assert max_added_wait_under_ceiling(75.0) == 0.0
+
+    def test_rejects_nonpositive_service_time(self) -> None:
+        with pytest.raises(ValueError):
+            max_added_wait_under_ceiling(0.0)
