@@ -12,9 +12,35 @@ from loguru import logger
 from tts_inference.types import TTSModelName
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from tts_bench.observe import ExpectedScaling
+    from tts_bench.planner import SweepRow
 
 ALL_MODELS = [m.value for m in TTSModelName]
+
+#: Where a measurement lands when ``--output`` is not given. These runs cost 45+ minutes
+#: and an endpoint freeze, so the default is to keep the result.
+ARTIFACT_DIR = Path("artifacts")
+
+
+def _default_artifact_path(kind: str, *parts: str) -> Path:
+    """Name an artifact after the configuration it measured.
+
+    Built at *write* time rather than declared as a click default, because the
+    configuration slug is only known once the run has described the endpoint —
+    which is the whole point of naming files this way. Two configurations produce
+    two filenames, so re-running after a redeploy cannot silently overwrite the
+    curve it should be compared against.
+    """
+    stem = "-".join([kind, *(p for p in parts if p)])
+    return ARTIFACT_DIR / f"{stem}.json"
+
+
+def _save_artifact(path: Path, payload: str) -> None:
+    """Write an artifact, creating ``artifacts/`` if this is the first run in a checkout."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload)
 
 
 @click.group()
@@ -23,10 +49,14 @@ def main() -> None:
 
 
 @main.command()
-@click.option("--models", default="all", help="Comma-separated model names or 'all'")
+@click.option(
+    "--models",
+    default="all",
+    help="Comma-separated model names or 'all'. Plural: this command compares models.",
+)
 @click.option("--runs", default=5, type=int, help="Runs per sample")
 @click.option("--max-samples", default=10, type=int, help="Number of text samples")
-@click.option("--region", default="us-east-1")
+@click.option("--region", default="us-east-1", help="AWS region every client is built in")
 @click.option("--output", default=None, type=click.Path(), help="Output JSON path")
 def latency(models: str, runs: int, max_samples: int, region: str, output: str | None) -> None:
     """Measure latency (TTFAB) for each model."""
@@ -60,11 +90,15 @@ def latency(models: str, runs: int, max_samples: int, region: str, output: str |
 
 
 @main.command()
-@click.option("--models", default="all", help="Comma-separated model names or 'all'")
+@click.option(
+    "--models",
+    default="all",
+    help="Comma-separated model names or 'all'. Plural: this command compares models.",
+)
 @click.option("--concurrency", default="5,10,20", help="Comma-separated concurrency levels")
 @click.option("--window", default=15.0, type=float, help="Seconds per concurrency level")
-@click.option("--region", default="us-east-1")
-@click.option("--output", default=None, type=click.Path())
+@click.option("--region", default="us-east-1", help="AWS region every client is built in")
+@click.option("--output", default=None, type=click.Path(), help="Output JSON path")
 def scalability(
     models: str, concurrency: str, window: float, region: str, output: str | None
 ) -> None:
@@ -95,10 +129,14 @@ def scalability(
 
 
 @main.command()
-@click.option("--models", default="all", help="Comma-separated model names or 'all'")
+@click.option(
+    "--models",
+    default="all",
+    help="Comma-separated model names or 'all'. Plural: this command compares models.",
+)
 @click.option("--max-samples", default=20, type=int, help="Number of text samples for throughput")
-@click.option("--region", default="us-east-1")
-@click.option("--output", default=None, type=click.Path())
+@click.option("--region", default="us-east-1", help="AWS region every client is built in")
+@click.option("--output", default=None, type=click.Path(), help="Output JSON path")
 def cost(models: str, max_samples: int, region: str, output: str | None) -> None:
     """Calculate cost per million characters."""
     from shared.loader import get_data_dir, load_tts_samples
@@ -183,9 +221,16 @@ TTOTAL_TRIGGER_FORCE_DESIRED = "force-desired"
 
 
 @main.command()
-@click.option("--model", required=True, help="Model name, e.g. kokoro-82m")
-@click.option("--region", default="us-east-1")
-@click.option("--variant", default="primary")
+@click.option(
+    "--model",
+    required=True,
+    help=(
+        "Model name, e.g. kokoro-82m. Singular and required: this measures one "
+        "configuration, and it freezes or scales that endpoint to do it."
+    ),
+)
+@click.option("--region", default="us-east-1", help="AWS region every client is built in")
+@click.option("--variant", default="primary", help="Production variant on the endpoint")
 @click.option("--voice", default=None, help="Override the model's default voice")
 @click.option(
     "--target-concurrency",
@@ -221,7 +266,12 @@ TTOTAL_TRIGGER_FORCE_DESIRED = "force-desired"
     type=click.Choice(["response-stream", "bidi"]),
     help="Wire protocol to measure. C_max does not transfer between the two.",
 )
-@click.option("--arrival", default="poisson", type=click.Choice(["poisson", "fixed"]))
+@click.option(
+    "--arrival",
+    default="poisson",
+    type=click.Choice(["poisson", "fixed"]),
+    help="Arrival process. Poisson is the realistic one; fixed isolates the harness.",
+)
 @click.option("--seed", default=1234, type=int, help="Arrival-schedule seed; keeps runs comparable")
 @click.option("--max-samples", default=50, type=int, help="Texts drawn into the pool")
 @click.option("--samples", default=None, type=click.Path(), help="Override the sample JSON path")
@@ -232,12 +282,33 @@ TTOTAL_TRIGGER_FORCE_DESIRED = "force-desired"
 )
 @click.option("--pin-to", default=1, type=int, help="Instances to pin for the run")
 @click.option(
+    "--max-workers",
+    default=None,
+    type=int,
+    help=(
+        "Raise the client thread/connection pool above the derived size. Only raises. "
+        "Needed when a transport holds its lock per session (bidi), where in-flight "
+        "overshoots the target by the server's backlog and the derived pool runs out."
+    ),
+)
+@click.option(
     "--cloudwatch/--no-cloudwatch",
     "cloudwatch_join",
     default=True,
     help="Join server-side metrics after a settle delay (~2 min)",
 )
-@click.option("--output", default=None, type=click.Path(), help="Write the artifact JSON here")
+@click.option(
+    "--output",
+    default=None,
+    type=click.Path(),
+    help="Write the artifact JSON here. Defaults to artifacts/, named for the configuration.",
+)
+@click.option(
+    "--no-save",
+    is_flag=True,
+    default=False,
+    help="Discard the artifact. For a smoke test you do not intend to keep.",
+)
 @click.option("--events", default=None, type=click.Path(), help="Write per-request JSONL here")
 @click.option(
     "--dry-run",
@@ -269,8 +340,10 @@ def cmax(
     samples: str | None,
     require_frozen: bool,
     pin_to: int,
+    max_workers: int | None,
     cloudwatch_join: bool,
     output: str | None,
+    no_save: bool,
     events: str | None,
     dry_run: bool,
     dry_run_s: float,
@@ -382,6 +455,7 @@ def cmax(
                 transport=transport,
                 require_frozen=require_frozen,
                 pin_to=pin_to,
+                max_workers=max_workers,
                 cloudwatch_join=cloudwatch_join,
                 event_sink=writer,
             )
@@ -396,17 +470,83 @@ def cmax(
     click.echo(
         f"\nC_max curve for {report.model_name} on {report.instance_type} via {report.transport}:"
     )
-    click.echo(f"{'budget_ms':>10} {'C_max':>8} {'rps':>8} {'p95_ttfab':>10} {'spread':>8}")
+    click.echo(
+        f"{'budget_ms':>10} {'C_max':>8} {'rps':>8} {'p95_ttfab':>10} {'spread':>8} {'runs':>6}"
+    )
     knees = {k.ttfab_budget_ms: k for k in report.knees}
     for budget in sorted(report.c_max_curve):
         knee = knees.get(budget)
         spread = report.curve_spread.get(budget)
+        contributing = report.runs_contributing.get(budget)
+        # A missing knee prints as "n/a", never as 0.00. Zeros in a rate and a latency
+        # column read as a measurement that came back empty, when what happened is that
+        # the detail for this budget is absent while the concurrency beside it is real.
         click.echo(
             f"{budget:>10} {report.c_max_curve[budget]:>8.2f} "
-            f"{knee.offered_rps if knee else 0:>8.2f} "
-            f"{knee.p95_ttfab_ms if knee else 0:>10.0f} "
-            f"{f'{spread:.0%}' if spread is not None else 'n/a':>8}"
+            f"{f'{knee.offered_rps:.2f}' if knee else 'n/a':>8} "
+            f"{f'{knee.p95_ttfab_ms:.0f}' if knee else 'n/a':>10} "
+            f"{f'{spread:.0%}' if spread is not None else 'n/a':>8} "
+            f"{f'{contributing}/{report.runs}' if contributing is not None else 'n/a':>6}"
         )
+
+    # A curve built from one pass of a --runs 3 ladder is a single sample. Saying so
+    # here matters because `spread` is 0% in exactly that case, which otherwise reads
+    # as three runs agreeing.
+    thin = sorted(b for b, n in report.runs_contributing.items() if n < report.runs)
+    if thin and report.runs > 1:
+        click.echo(
+            f"NOTE: budgets {thin} had fewer than {report.runs} runs find a knee, so their "
+            "spread is not a run-to-run agreement. The other runs' steps were unusable or "
+            "unsettled at that budget — check the ladder above."
+        )
+
+    # The second C_max, printed as its own block rather than a row in the curve: it has no
+    # budget to key it by, and the whole point is that it is not a latency measurement.
+    ceiling = report.throughput_ceiling
+    if ceiling is None:
+        click.echo(
+            "\nThroughput ceiling: not measured — no step sustained its offered rate. "
+            "Every rate on this ladder was already past capacity, so C_max is below the "
+            "lowest step; re-run with a lower --target-concurrency."
+        )
+    else:
+        click.echo(
+            f"\nThroughput ceiling: {ceiling.max_sustained_rps:.2f} rps sustained "
+            f"-> C_max {ceiling.concurrency:.2f} "
+            f"(useful concurrency; p95 TTFAB {ceiling.p95_ttfab_ms:.0f}ms at step "
+            f"{ceiling.step_index}, {ceiling.runs_contributing}/{report.runs} runs, "
+            f"spread {ceiling.spread:.0%})"
+        )
+        if ceiling.observed_concurrency is not None:
+            multiple = ceiling.queueing_multiple
+            click.echo(
+                f"  observed in-flight there was {ceiling.observed_concurrency:.2f}"
+                + (
+                    f" — {multiple:.1f}x the useful figure, i.e. that much of each "
+                    "request's residence is queueing. ConcurrentRequestsPerModel (what "
+                    "the scaling policy tracks) reports the observed number, so the two "
+                    "are not interchangeable."
+                    if multiple is not None and multiple > 1.5
+                    else f" ({multiple:.1f}x useful)"
+                    if multiple is not None
+                    else ""
+                )
+            )
+        if report.throughput_bound_budgets:
+            click.echo(
+                f"  WARNING: budgets {report.throughput_bound_budgets} report a knee ABOVE this "
+                "ceiling. Nothing failed at those steps — latency stayed inside budget — but "
+                "the server had stopped keeping up, so their concurrency is backlog, not "
+                "capacity. Plan on the ceiling."
+            )
+        if ceiling.is_lower_bound:
+            reason = (
+                f"{ceiling.dispatch_skipped} dispatch(es) were skipped at that step, so the "
+                "server never saw the full offered rate — raise --max-workers"
+                if ceiling.dispatch_skipped
+                else "no saturated step was observed above it — extend --target-concurrency"
+            )
+            click.echo(f"  NOTE: this is a LOWER bound ({reason}).")
 
     click.echo(
         f"\nS (uncontended): mean {report.s_mean_s * 1000:.0f}ms p95 {report.s_p95_s * 1000:.0f}ms"
@@ -433,16 +573,40 @@ def cmax(
             f"instance counts seen {list(report.instance_counts_observed)}"
         )
 
-    if output:
-        Path(output).write_text(report.model_dump_json(indent=2))
-        click.echo(f"\nArtifact: {output}")
-    click.echo("Next: tts-bench ttotal, then tts-bench plan --measured <artifact>")
+    if no_save:
+        click.echo(f"\n--no-save: nothing written. Configuration measured: {report.config_slug}")
+        click.echo(f"\nNext: tts-bench ttotal --model {model} --measured <cmax artifact>")
+    else:
+        # Defaulted rather than optional: this run costs 45+ minutes and an endpoint
+        # freeze, and printing a suggested filename after the fact does not bring the
+        # measurement back. The slug in the name is what keeps two configurations'
+        # curves apart -- they are two different measurements, not two attempts at one.
+        destination = (
+            Path(output)
+            if output
+            else _default_artifact_path("cmax", model, transport, report.config_slug)
+        )
+        _warn_if_replacing_another_config(destination, report.config_slug)
+        _save_artifact(destination, report.model_dump_json(indent=2))
+        click.echo(f"\nArtifact: {destination}")
+        click.echo(f"Configuration measured: {report.config_slug}")
+        # Echo the path back rather than "<artifact>": the next command needs this exact
+        # file, and the slug in it is not something to retype from memory.
+        click.echo(f"\nNext: tts-bench ttotal --model {model} --measured {destination}")
+        click.echo(f"Then: tts-bench plan --measured {destination} --ttotal <ttotal artifact>")
 
 
 @main.command()
-@click.option("--model", required=True, help="Model name, e.g. kokoro-82m")
-@click.option("--region", default="us-east-1")
-@click.option("--variant", default="primary")
+@click.option(
+    "--model",
+    required=True,
+    help=(
+        "Model name, e.g. kokoro-82m. Singular and required: this measures one "
+        "configuration, and it freezes or scales that endpoint to do it."
+    ),
+)
+@click.option("--region", default="us-east-1", help="AWS region every client is built in")
+@click.option("--variant", default="primary", help="Production variant on the endpoint")
 @click.option("--voice", default=None, help="Override the model's default voice")
 @click.option(
     "--trigger",
@@ -454,7 +618,10 @@ def cmax(
     "--scaling-target",
     default=None,
     type=float,
-    help="C_target to drive past. Defaults to the deployed policy's TargetValue.",
+    help=(
+        "C_target to drive past. Defaults to the deployed policy's TargetValue; with "
+        "--trigger drive-load and no policy deployed, this is an error rather than a guess."
+    ),
 )
 @click.option(
     "--load-multiple",
@@ -481,6 +648,12 @@ def cmax(
     type=float,
     help="Budget the recovery bound is judged against. Defaults from --measured or config.",
 )
+@click.option(
+    "--allow-config-mismatch",
+    is_flag=True,
+    default=False,
+    help="Proceed even if --measured was taken on a different deployed configuration",
+)
 @click.option("--max-wait", "max_wait_s", default=1500.0, type=float, help="Scale-out timeout")
 @click.option(
     "--settle",
@@ -489,12 +662,40 @@ def cmax(
     type=float,
     help="Seconds of load held past the event, so recovery can be bounded",
 )
-@click.option("--poll-interval", "poll_interval_s", default=10.0, type=float)
-@click.option("--transport", type=click.Choice(["response-stream", "bidi"]), default="bidi")
-@click.option("--arrival-seed", "seed", default=1234, type=int)
+@click.option(
+    "--poll-interval",
+    "poll_interval_s",
+    default=10.0,
+    type=float,
+    help="Seconds between endpoint polls; bounds how precisely a stage boundary is placed",
+)
+@click.option(
+    "--transport",
+    type=click.Choice(["response-stream", "bidi"]),
+    default="bidi",
+    help="Wire protocol for the offered load. Match the --measured curve.",
+)
+@click.option(
+    "--arrival-seed",
+    "seed",
+    default=1234,
+    type=int,
+    help="Arrival-schedule seed; keeps runs comparable",
+)
 @click.option("--max-samples", default=50, type=int, help="Texts drawn into the pool")
 @click.option("--samples", default=None, type=click.Path(), help="Override the sample JSON path")
-@click.option("--output", default=None, type=click.Path(), help="Write the report JSON here")
+@click.option(
+    "--output",
+    default=None,
+    type=click.Path(),
+    help="Write the artifact JSON here. Defaults to artifacts/, named for the configuration.",
+)
+@click.option(
+    "--no-save",
+    is_flag=True,
+    default=False,
+    help="Discard the artifact. For a smoke test you do not intend to keep.",
+)
 @click.option("--events", default=None, type=click.Path(), help="Write per-request JSONL here")
 def ttotal(
     model: str,
@@ -507,6 +708,7 @@ def ttotal(
     s_mean_s: float | None,
     measured: str | None,
     ttfab_budget_ms: float | None,
+    allow_config_mismatch: bool,
     max_wait_s: float,
     settle_s: float,
     poll_interval_s: float,
@@ -515,6 +717,7 @@ def ttotal(
     max_samples: int,
     samples: str | None,
     output: str | None,
+    no_save: bool,
     events: str | None,
 ) -> None:
     """Measure T_total: the lag from load arriving to new capacity serving it.
@@ -565,6 +768,18 @@ def ttotal(
                 f"this run uses {transport!r}. S differs per transport, so the offered rate "
                 "may not reach C_target."
             )
+        # A transport mismatch only mis-sizes the offered rate, so it warns. A
+        # configuration mismatch means S itself was measured on other hardware or other
+        # serving code, which makes the whole plan describe a fleet that does not exist —
+        # so it stops the run.
+        _require_matching_config(
+            artifact,
+            endpoint=endpoint,
+            region=region,
+            variant=variant,
+            artifact_path=measured,
+            allow_mismatch=allow_config_mismatch,
+        )
 
     if s_mean_s is None:
         if trigger == TTOTAL_TRIGGER_DRIVE_LOAD:
@@ -600,6 +815,13 @@ def ttotal(
         # force-desired never reads the metric, so any value is inert here.
         scaling_target = 0.0
 
+    # Deliberately the measured budget and not the end-to-end SLO, which is the one place
+    # in this package where those two come apart. Recovery is "p95 came back", and it is
+    # judged by *discrimination*: the threshold has to sit between the overloaded p95 and
+    # the recovered one. Kokoro overloaded at 3x C_target reaches a p95 TTFAB of 818ms,
+    # which is already inside a 3000ms SLO -- threshold it there and the run reports
+    # recovery at the instant the instance came into service, having measured nothing. The
+    # SLO is what the *plan* promises; this is what the *measurement* can resolve.
     if ttfab_budget_ms is None:
         ttfab_budget_ms = _config_ttfab_budget_ms(endpoint)
     if ttfab_budget_ms is None:
@@ -661,13 +883,436 @@ def ttotal(
 
     if events:
         click.echo(f"\nEvents: {events}")
-    if output:
-        Path(output).write_text(json.dumps(report.to_dict(), indent=2))
-        click.echo(f"Report: {output}")
-    click.echo(
-        f"\nNext: tts-bench plan --model {model} --t-total {report.t_total_s or 0:.0f} "
-        "--measured <cmax artifact>"
+
+    if no_save:
+        click.echo(f"\n--no-save: nothing written. Configuration measured: {report.config_slug}")
+        click.echo(
+            "\nNext: tts-bench plan --measured <cmax artifact> --ttotal <ttotal artifact> "
+            "--peak-rps <N>"
+        )
+    else:
+        # Defaulted for the same reason as cmax: this run costs a real scale-out and, on a
+        # timeout, most of max_wait_s of offered load. The trigger is in the name because
+        # force-desired measures only the container half -- the two are different
+        # measurements of the same configuration, not two attempts at one.
+        destination = (
+            Path(output)
+            if output
+            else _default_artifact_path("ttotal", model, trigger, report.config_slug)
+        )
+        _warn_if_replacing_another_config(destination, report.config_slug)
+        _save_artifact(destination, json.dumps(report.to_dict(), indent=2))
+        click.echo(f"\nArtifact: {destination}")
+        click.echo(f"Configuration measured: {report.config_slug}")
+        click.echo(
+            f"\nNext: tts-bench plan --measured <cmax artifact> --ttotal {destination} "
+            "--peak-rps <N>"
+        )
+
+
+@main.command()
+@click.option(
+    "--measured",
+    required=True,
+    type=click.Path(exists=True),
+    help="A cmax artifact: the C_max curve and S this plan is built on",
+)
+@click.option(
+    "--ttotal",
+    "ttotal_path",
+    default=None,
+    type=click.Path(exists=True),
+    help=(
+        "A ttotal artifact: the scaling lag, by stage. Omit only with --assume-t-total, "
+        "since a plan with no lag has nothing to size headroom against."
+    ),
+)
+@click.option(
+    "--peak-rps",
+    default=None,
+    type=float,
+    help="Expected peak arrival rate. Give this or --peak-streams.",
+)
+@click.option(
+    "--trough-rps",
+    default=None,
+    type=float,
+    help="Expected quiet-hours rate; sets min_instances, which reserved capacity pays for",
+)
+@click.option(
+    "--peak-streams",
+    default=None,
+    type=float,
+    help=(
+        "Expected peak concurrent sessions. The honest input for bidi traffic, where "
+        "one session is not one request; bypasses the lambda x S conversion."
+    ),
+)
+@click.option("--trough-streams", default=None, type=float, help="Expected quiet-hours sessions")
+@click.option(
+    "--growth-factor-k",
+    default=2.0,
+    type=float,
+    help="Traffic growth within one T_total. Not measurable without production traffic.",
+)
+@click.option(
+    "--sweep-k",
+    default=None,
+    help=(
+        "Comma-separated growth factors to plan for, e.g. 1,2,3,5. Overrides "
+        "--growth-factor-k; the config's sensitivity to k is the point."
+    ),
+)
+@click.option(
+    "--ttfab-slo-ms",
+    default=3000,
+    type=int,
+    help=(
+        "End-to-end first-byte SLO: queue wait plus service. W_max = SLO - p95 service "
+        "is derived from it, so this is the one field that sets the queueing budget."
+    ),
+)
+@click.option(
+    "--ttfab-budget-ms",
+    default=None,
+    type=int,
+    help=(
+        "Which measured budget to read the knee at — a column selector, not the SLO. "
+        "Defaults to the tightest budget in the curve."
+    ),
+)
+@click.option(
+    "--derate",
+    default=0.875,
+    type=float,
+    help="Fraction of the measured knee to target, for jitter margin",
+)
+@click.option(
+    "--min-floor",
+    "min_instances_floor",
+    default=1,
+    type=int,
+    help="Never plan below this, whatever the trough says",
+)
+@click.option(
+    "--provision-s",
+    default=None,
+    help=(
+        "Comma-separated EC2 provision times to assume, e.g. 60,120,300,600. One plan "
+        "per value, holding the measured container stages fixed — this is the stage a "
+        "reserved-capacity account changes, so it is swept rather than trusted."
+    ),
+)
+@click.option(
+    "--assume-t-total",
+    "assume_t_total_s",
+    default=None,
+    type=float,
+    help=(
+        "Plan against a stated T_total when the ttotal run never spanned one. "
+        "Labelled an assumption in the output, because it is one."
+    ),
+)
+@click.option(
+    "--allow-config-mismatch",
+    is_flag=True,
+    default=False,
+    help="Pair a C_max curve and a T_total lag measured on different configurations",
+)
+@click.option(
+    "--ceiling-s",
+    default=None,
+    type=float,
+    help="Invocation ceiling to judge W_max against. Defaults to SageMaker's 60s.",
+)
+@click.option(
+    "--output",
+    default=None,
+    type=click.Path(),
+    help=(
+        "Write the sweep as JSON here. Nothing is written unless asked — unlike a "
+        "measurement, this run is cheap to repeat."
+    ),
+)
+def plan(
+    measured: str,
+    ttotal_path: str | None,
+    peak_rps: float | None,
+    trough_rps: float | None,
+    peak_streams: float | None,
+    trough_streams: float | None,
+    growth_factor_k: float,
+    sweep_k: str | None,
+    ttfab_slo_ms: int,
+    ttfab_budget_ms: int | None,
+    derate: float,
+    min_instances_floor: int,
+    provision_s: str | None,
+    assume_t_total_s: float | None,
+    allow_config_mismatch: bool,
+    ceiling_s: float | None,
+    output: str | None,
+) -> None:
+    """Turn measurements into a scaling configuration. Reads artifacts, touches no AWS.
+
+    Composes the measured C_max curve, S, and T_total with a stated load into the four
+    numbers ModelEndpointConfig needs — scaling_target_value, queue_max_depth,
+    min_instances, max_instances — and prints them as a paste-ready block. That closes
+    the loop the tool chain exists for: before this, the path from a measurement to a
+    deployed policy ran through hand-arithmetic in a comment.
+
+    Two inputs cannot be measured for the account being configured, so both are swept
+    rather than assumed. --provision-s replaces the EC2 provision stage, which is a
+    property of a capacity contract rather than of the image. --sweep-k varies the
+    growth factor, which needs production traffic to observe.
+
+    The SLO is end-to-end: --ttfab-slo-ms is the whole promise, queue included, and
+    W_max and queue_max_depth are derived from it rather than set beside it. Two
+    independent fields could disagree with the promise; one derived field cannot.
+
+    Refuses two things outright: pairing artifacts whose configuration fingerprints
+    differ, and an SLO that does not fit inside SageMaker's 60s invocation ceiling.
+    """
+    from shared.capacity import SAGEMAKER_INVOCATION_CEILING_S
+    from tts_bench import scale_report
+    from tts_bench.planner import (
+        PlannerError,
+        TTotalStages,
+        measured_from_artifacts,
+        plan_sweep,
     )
+    from tts_bench.types import CMaxReport, Scenario
+
+    if peak_rps is None and peak_streams is None:
+        raise click.UsageError(
+            "one of --peak-rps or --peak-streams is required. The fleet size is what a "
+            "plan is for, and there is nothing to size it from without a stated peak."
+        )
+
+    try:
+        cmax_report = CMaxReport.model_validate_json(Path(measured).read_text())
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(
+            f"could not read {measured} as a cmax artifact: {exc}. It must be the JSON "
+            "written by `tts-bench cmax`."
+        ) from exc
+
+    # A ttotal artifact is the normal path; --assume-t-total covers the case the plan
+    # anticipates, where the second instance would not place in this account at all.
+    if ttotal_path:
+        try:
+            stages = TTotalStages.from_artifact(json.loads(Path(ttotal_path).read_text()))
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(
+                f"could not read {ttotal_path} as a ttotal artifact: {exc}"
+            ) from exc
+    elif assume_t_total_s is None:
+        raise click.UsageError(
+            "--ttotal is required, or --assume-t-total to plan against a stated lag. "
+            "T_total sets how much standing headroom a surge needs and how much of one "
+            "the queue can absorb, so there is no plan without it."
+        )
+    else:
+        # No artifact means no fingerprint to check and no stages to substitute into, so
+        # the assumed total is used whole. from_artifact({}) is the honest shape for
+        # that: every stage missing, nothing measured.
+        stages = TTotalStages.from_artifact({})
+
+    try:
+        planner_input = measured_from_artifacts(
+            cmax_report,
+            stages,
+            allow_config_mismatch=allow_config_mismatch,
+            assume_t_total_s=assume_t_total_s,
+            require_pairing=bool(ttotal_path),
+        )
+    except PlannerError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if ttfab_budget_ms is None:
+        # The tightest measured budget, not the loosest: the knee at a tight SLO is the
+        # smaller number, so defaulting this way sizes the fleet conservatively. `ttotal`
+        # defaults the other way for a different reason -- recovery has to be judged
+        # against a bound the model can actually meet.
+        ttfab_budget_ms = min(planner_input.c_max_curve)
+
+    try:
+        scenario = Scenario(
+            peak_rps=peak_rps,
+            trough_rps=trough_rps,
+            peak_streams=peak_streams,
+            trough_streams=trough_streams,
+            growth_factor_k=growth_factor_k,
+            ttfab_budget_ms=ttfab_budget_ms,
+            ttfab_slo_ms=ttfab_slo_ms,
+            derate=derate,
+            min_instances_floor=min_instances_floor,
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
+    provisions = _parse_floats(provision_s, flag="--provision-s") if provision_s else None
+    ks = _parse_floats(sweep_k, flag="--sweep-k") if sweep_k else None
+
+    try:
+        rows = plan_sweep(
+            planner_input,
+            scenario,
+            stages,
+            provision_sweep_s=provisions,
+            k_sweep=ks,
+            ceiling_s=ceiling_s if ceiling_s is not None else SAGEMAKER_INVOCATION_CEILING_S,
+        )
+    except PlannerError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(scale_report.render_plan(rows, stages))
+    _warn_if_config_queue_disagrees(rows)
+
+    if output:
+        _save_artifact(
+            Path(output),
+            json.dumps([scale_report.plan_to_dict(row) for row in rows], indent=2),
+        )
+        click.echo(f"Plan: {output}")
+
+    # Exit non-zero on an infeasible row so this can gate a deploy. Any row, not all:
+    # a sweep where one assumed provision time breaks the SLO is a plan that depends on
+    # an assumption nobody has verified, which is exactly what should stop a pipeline.
+    if any(row.plan.infeasible for row in rows):
+        raise SystemExit(1)
+
+
+def _warn_if_config_queue_disagrees(rows: Sequence[SweepRow]) -> None:
+    """Say so when the deployed ``queue_max_depth`` is not what this SLO implies.
+
+    ``queue_max_depth`` is the one derived number ``config.py`` stores rather than
+    computes, because it needs ``Lambda_cap`` and that is a measurement. So it can go
+    stale silently, and it did: 296 was carried from a 20s W_max no SLO justified, and
+    nothing compared it to anything until this check existed.
+
+    A warning rather than a refusal, and printed after the plan. The plan *is* the
+    answer, and the whole point of running it is to find out that the deployed value is
+    wrong; exiting non-zero here would fail the command that just told you what to fix.
+    The paste-ready config block above already carries the right number.
+
+    Reads whichever row's ``k`` matches the deployed target most closely — Q_max does
+    not vary with ``k`` or provision time at all (it is ``Lambda_cap x W_max``), so any
+    row's value is the same and the first is enough.
+    """
+    if not rows:
+        return
+    plan = rows[0].plan
+    try:
+        from speech_infra.config import TTS_MODEL_CONFIGS
+    except ImportError:  # pragma: no cover - depends on install layout
+        return
+
+    for config in TTS_MODEL_CONFIGS.values():
+        if config.endpoint_name != plan.endpoint:
+            continue
+        if config.queue_max_depth == plan.queue_max_depth:
+            return
+        if config.queue_max_depth == 0:
+            click.echo(
+                f"\nNOTE: {config.model_name} has queue_max_depth=0 (unbounded) deployed; "
+                f"this SLO implies {plan.queue_max_depth}. Paste the block above into "
+                "config.py to bound it."
+            )
+            return
+        click.echo(
+            f"\nWARNING: {config.model_name} has queue_max_depth="
+            f"{config.queue_max_depth} deployed, but a {plan.scenario.ttfab_slo_ms}ms "
+            f"end-to-end SLO implies {plan.queue_max_depth} "
+            f"(Lambda_cap {plan.c_max / plan.measured.s_mean_s:.2f} rps x W_max "
+            f"{plan.w_max_s:.2f}s). The deployed value admits requests it can only serve "
+            "late. Paste the block above into config.py."
+        )
+        return
+
+
+def _warn_if_replacing_another_config(destination: Path, slug: str) -> None:
+    """Say so when an artifact from a *different* configuration is about to be replaced.
+
+    The realistic mistake in a per-configuration workflow: re-run after a redeploy,
+    reuse the previous ``--output``, and the old hardware's curve is gone. Cheap to
+    warn, and the previous configuration is worth naming because it is usually the
+    comparison the operator wanted.
+
+    Takes the slug rather than a report so ``cmax`` and ``ttotal`` share one guard —
+    both write per-configuration artifacts and both can clobber the previous one.
+    """
+    if not destination.exists():
+        return
+    try:
+        previous = json.loads(destination.read_text()).get("deployed_config")
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(previous, dict) or not previous:
+        return
+
+    from tts_bench.fixture import DeployedConfig
+
+    old = DeployedConfig.from_dict(previous)
+    if old.slug == slug:
+        return
+    click.echo(
+        f"WARNING: {destination} holds a measurement of a different configuration "
+        f"({old.slug}, {old.instance_type}) and is being overwritten with "
+        f"{slug}. Keep the old one under its own name if you want to "
+        "compare the two."
+    )
+
+
+def _require_matching_config(
+    artifact: dict[str, object],
+    *,
+    endpoint: str,
+    region: str,
+    variant: str,
+    artifact_path: str | None,
+    allow_mismatch: bool,
+) -> None:
+    """Refuse to reuse a measurement taken against a different configuration.
+
+    ``C_max``, ``S`` and ``T_total`` are properties of a configuration — the GPU, the
+    serving code, the container knobs — not of a model. Replaying an artifact from one
+    configuration onto another produces a plan for a fleet that does not exist, and
+    nothing about the output would look wrong.
+
+    An artifact with no fingerprint predates this check and is treated as a mismatch:
+    accepting it silently is the hole this closes.
+    """
+    from tts_bench.fixture import DeployedConfig, FixtureError, describe_deployed_config
+
+    label = f"--measured {artifact_path}" if artifact_path else "the measured artifact"
+    raw = artifact.get("deployed_config")
+    recorded = DeployedConfig.from_dict(raw if isinstance(raw, dict) else {})
+
+    try:
+        live = describe_deployed_config(endpoint, region=region, variant=variant)
+    except FixtureError as exc:
+        # Not fatal: the run itself may still be viable, and refusing it because one
+        # extra describe call failed would be its own kind of wrong.
+        click.echo(f"WARNING: could not verify the deployed configuration of {endpoint}: {exc}")
+        return
+
+    if not raw:
+        message = (
+            f"{label} records no deployed configuration, so there is no way to tell "
+            f"whether it describes the {live.instance_type} endpoint deployed now. It "
+            "predates configuration fingerprinting — re-measure it, or pass "
+            "--allow-config-mismatch to proceed anyway."
+        )
+        if not allow_mismatch:
+            raise click.ClickException(message)
+        click.echo(f"WARNING: {message}")
+        return
+
+    try:
+        recorded.assert_matches(live, allow_mismatch=allow_mismatch, artifact_label=label)
+    except FixtureError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _config_ttfab_budget_ms(endpoint: str) -> float | None:
@@ -727,7 +1372,7 @@ def _expected_scaling() -> dict[str, ExpectedScaling]:
 
 
 @main.command()
-@click.option("--region", default="us-east-1")
+@click.option("--region", default="us-east-1", help="AWS region every client is built in")
 @click.option("--output", default=None, type=click.Path(), help="Write findings as JSON")
 @click.option(
     "--fail-on-error/--no-fail-on-error",
@@ -756,6 +1401,10 @@ def drift(region: str, output: str | None, fail_on_error: bool) -> None:
 
     if not findings:
         click.echo("No drift: deployed autoscaling matches config.")
+        # Where drift sits in the sequence: it is the preflight for a measurement, because
+        # an orphaned policy moving capacity mid-run is what makes a C_max curve read as a
+        # fleet. Clean means the freeze in `cmax --require-frozen` has nothing to fight.
+        click.echo("\nNext: tts-bench cmax --model <model> --require-frozen")
     else:
         order = {Severity.ERROR: 0, Severity.WARN: 1, Severity.INFO: 2}
         for finding in sorted(findings, key=lambda f: (order[f.severity], f.resource_id)):
@@ -794,8 +1443,8 @@ def drift(region: str, output: str | None, fail_on_error: bool) -> None:
 
 @main.command()
 @click.option("--endpoint", required=True, help="Endpoint name, e.g. speech-kokoro-82m")
-@click.option("--variant", default="primary")
-@click.option("--region", default="us-east-1")
+@click.option("--variant", default="primary", help="Production variant on the endpoint")
+@click.option("--region", default="us-east-1", help="AWS region every client is built in")
 @click.option(
     "--restore-capacity/--no-restore-capacity",
     default=False,

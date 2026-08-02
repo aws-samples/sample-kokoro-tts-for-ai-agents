@@ -12,10 +12,20 @@ from loguru import logger
 from tts_eval.synthesize import SynthesisClient
 from tts_inference.types import TTSModelName
 
+#: SageMaker real-time inference, us-east-1, on-demand. The g5 and g6 rows were read
+#: from the Pricing API (``USE1-Host`` usagetype) on 2026-07-30; the rest predate that.
+#:
+#: Note the per-GPU arithmetic, because it is the whole question behind a multi-GPU
+#: container: ``ml.g6.12xlarge`` has four L4s at $1.438/GPU-hr against $1.1267 for one
+#: on an ``ml.g6.xlarge`` — 5.1x the price of a single-GPU box. So a container driving
+#: four GPUs has to beat ``4 x C_max`` just to break even on unit cost. What it buys
+#: instead is one ``T_total`` per four GPUs of capacity rather than four.
 INSTANCE_COST_PER_HOUR: dict[str, float] = {
     "ml.g5.xlarge": 1.408,
     "ml.g5.2xlarge": 2.816,
     "ml.g5.4xlarge": 5.632,
+    "ml.g6.xlarge": 1.1267,
+    "ml.g6.12xlarge": 5.752,
     "ml.g4dn.xlarge": 0.736,
     "ml.g4dn.2xlarge": 1.120,
     "ml.p3.2xlarge": 4.284,
@@ -23,6 +33,10 @@ INSTANCE_COST_PER_HOUR: dict[str, float] = {
     "ml.c5.2xlarge": 0.476,
 }
 
+#: Fallback only. `cmax` reads the type off the endpoint and warns when it disagrees with
+#: this dict, because a registry states what *should* be deployed and a measurement has to
+#: record what *is*. Keep it in step with `speech_infra.config` all the same: `cost_per_m_chars`
+#: has no endpoint to ask, so a stale row here silently misprices.
 MODEL_INSTANCE_TYPES: dict[str, str] = {
     TTSModelName.ORPHEUS_3B: "ml.g5.xlarge",
     TTSModelName.KOKORO_82M: "ml.g5.xlarge",
@@ -39,6 +53,29 @@ POLLY_COST_PER_M_CHARS: dict[str, float] = {
 SATURATION_LEVELS = [2, 4, 8, 16, 32]
 
 DEFAULT_INSTANCE_TYPE = "ml.g5.xlarge"
+
+
+def hourly_rate(instance_type: str) -> float:
+    """The hourly rate for an instance type, warning loudly when it is a guess.
+
+    Falls back to ``DEFAULT_INSTANCE_TYPE`` rather than raising, because a missing
+    price should not lose a completed measurement — but it warns, because sweeping
+    instance types is now a normal activity and the error is unbounded in the wrong
+    direction. Pricing an ``ml.g6.12xlarge`` fleet at ``ml.g5.xlarge`` rates
+    understates cost by 4x, and nothing about the resulting figure looks wrong.
+    """
+    hourly = INSTANCE_COST_PER_HOUR.get(instance_type)
+    if hourly is None:
+        fallback = INSTANCE_COST_PER_HOUR[DEFAULT_INSTANCE_TYPE]
+        logger.warning(
+            "No price for {}; costing it at {} rates (${:.4f}/hr). This figure is not "
+            "trustworthy — add the type to INSTANCE_COST_PER_HOUR from the Pricing API.",
+            instance_type,
+            DEFAULT_INSTANCE_TYPE,
+            fallback,
+        )
+        return fallback
+    return hourly
 
 
 def cost_per_m_chars(
@@ -72,10 +109,7 @@ def cost_per_m_chars(
         raise ValueError(f"instance_count must be >= 1, got {instance_count}")
     if chars_per_hr <= 0:
         return float("inf")
-    hourly = INSTANCE_COST_PER_HOUR.get(
-        instance_type, INSTANCE_COST_PER_HOUR[DEFAULT_INSTANCE_TYPE]
-    )
-    return (hourly * instance_count / chars_per_hr) * 1_000_000
+    return (hourly_rate(instance_type) * instance_count / chars_per_hr) * 1_000_000
 
 
 def find_saturation_concurrency(
@@ -245,9 +279,7 @@ def calculate_cost(
         }
 
     instance_type = MODEL_INSTANCE_TYPES.get(model, DEFAULT_INSTANCE_TYPE)
-    instance_cost = INSTANCE_COST_PER_HOUR.get(
-        instance_type, INSTANCE_COST_PER_HOUR[DEFAULT_INSTANCE_TYPE]
-    )
+    instance_cost = hourly_rate(instance_type)
 
     probe_text = texts[0] if texts else "The birch canoe slid on the smooth planks."
     saturation = find_saturation_concurrency(

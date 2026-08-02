@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from loguru import logger
 
 from speech_infra.config import TTS_MODEL_CONFIGS
 from tts_bench.cost import (
@@ -16,10 +17,26 @@ from tts_bench.cost import (
     calculate_cost,
     cost_per_m_chars,
     find_saturation_concurrency,
+    hourly_rate,
     measure_sustained_throughput,
 )
 from tts_eval.synthesize import ENDPOINT_MAP
 from tts_inference.types import TTSModelName
+
+
+@pytest.fixture
+def logged():
+    """Captured loguru warnings.
+
+    ``caplog`` does not see these — loguru does not propagate to the stdlib logging
+    tree — so an assertion against it would pass whether or not anything was emitted.
+    """
+    records: list[str] = []
+    sink_id = logger.add(lambda message: records.append(message.record["message"]), level="WARNING")
+    try:
+        yield records
+    finally:
+        logger.remove(sink_id)
 
 
 class TestCostConfig:
@@ -39,6 +56,25 @@ class TestCostConfig:
     def test_instance_costs_are_positive(self) -> None:
         for instance_type, cost in INSTANCE_COST_PER_HOUR.items():
             assert cost > 0, f"{instance_type} has non-positive cost: {cost}"
+
+    def test_the_candidate_types_for_a_configuration_sweep_are_priced(self) -> None:
+        # Not in MODEL_INSTANCE_TYPES yet, so the guard above does not cover them, but
+        # they are the two the harness is about to be re-run against. An unpriced
+        # candidate makes the cost column of a g5-vs-g6 comparison meaningless.
+        assert INSTANCE_COST_PER_HOUR["ml.g6.xlarge"] == pytest.approx(1.1267)
+        assert INSTANCE_COST_PER_HOUR["ml.g6.12xlarge"] == pytest.approx(5.752)
+
+    def test_g6_is_cheaper_than_g5_at_equal_gpu_count(self) -> None:
+        # The reason kokoro moves: same one GPU, 20% less per hour.
+        assert INSTANCE_COST_PER_HOUR["ml.g6.xlarge"] < INSTANCE_COST_PER_HOUR["ml.g5.xlarge"]
+
+    def test_four_gpus_on_one_box_cost_more_than_four_boxes_worth_of_one(self) -> None:
+        # The multi-GPU tradeoff, as a number rather than an argument: 5.1x the price of
+        # a single-GPU instance, so a container driving four GPUs has to beat 4 x C_max
+        # to break even on unit cost. What it buys instead is one T_total per four GPUs.
+        ratio = INSTANCE_COST_PER_HOUR["ml.g6.12xlarge"] / INSTANCE_COST_PER_HOUR["ml.g6.xlarge"]
+        assert ratio > 4.0
+        assert ratio == pytest.approx(5.1, abs=0.05)
 
     def test_legacy_saturation_ladder_is_geometric(self) -> None:
         # Correct about the old code, and the reason it is legacy: a doubling
@@ -82,6 +118,26 @@ class TestRegistryConsistency:
         assert unpriced == {"maya-veena"}
 
 
+class TestHourlyRate:
+    """The one place an instance type becomes a price, so the one place to warn."""
+
+    def test_returns_the_listed_rate(self) -> None:
+        assert hourly_rate("ml.g6.xlarge") == pytest.approx(1.1267)
+
+    def test_an_unpriced_type_warns_and_names_the_substitute(self, logged: list[str]) -> None:
+        assert hourly_rate("ml.p9.enormous") == pytest.approx(
+            INSTANCE_COST_PER_HOUR[DEFAULT_INSTANCE_TYPE]
+        )
+        assert any(DEFAULT_INSTANCE_TYPE in message for message in logged)
+
+    def test_it_warns_once_per_lookup_not_once_per_process(self, logged: list[str]) -> None:
+        # No memoisation: `calculate_cost` reports a rate and separately divides by one,
+        # so suppressing the repeat would leave whichever call ran second silent.
+        hourly_rate("ml.p9.enormous")
+        hourly_rate("ml.p9.enormous")
+        assert len([m for m in logged if "ml.p9.enormous" in m]) == 2
+
+
 class TestCostPerMChars:
     def test_known_instance_type(self) -> None:
         # 1.408 $/hr over 1M chars/hr is 1.408 $/M chars.
@@ -95,9 +151,19 @@ class TestCostPerMChars:
         two = cost_per_m_chars(1_000_000, "ml.g5.xlarge", instance_count=2)
         assert two == pytest.approx(one * 2)
 
-    def test_unknown_instance_type_falls_back_to_default(self) -> None:
+    def test_unknown_instance_type_falls_back_to_default(self, logged: list[str]) -> None:
+        # The fallback stays -- a missing price should not lose a completed measurement
+        # -- but it must announce itself. Sweeping instance types is now routine and the
+        # error is unbounded in the wrong direction: an ml.g6.12xlarge fleet priced at
+        # ml.g5.xlarge rates understates cost 4x, and the figure looks entirely normal.
         fallback = cost_per_m_chars(1_000_000, "ml.does.not.exist")
         assert fallback == pytest.approx(INSTANCE_COST_PER_HOUR[DEFAULT_INSTANCE_TYPE])
+        assert any("No price for ml.does.not.exist" in message for message in logged)
+        assert any("not trustworthy" in message for message in logged)
+
+    def test_a_priced_instance_type_is_not_warned_about(self, logged: list[str]) -> None:
+        cost_per_m_chars(1_000_000, "ml.g6.xlarge")
+        assert logged == []
 
     def test_zero_throughput_is_infinite_not_free(self) -> None:
         # 0.0 would sort a dead endpoint to the top of a cheapest-first table.
