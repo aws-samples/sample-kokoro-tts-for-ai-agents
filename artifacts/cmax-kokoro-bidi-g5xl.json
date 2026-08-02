@@ -1,4 +1,11 @@
 {
+  "_measured_on": {
+    "instance_type": "ml.g5.xlarge",
+    "gpu": "NVIDIA A10G",
+    "transport": "bidi",
+    "status": "current -- this is the hardware kokoro-82m is deployed on. A g6 move was attempted 2026-07-30 and rolled back: SageMaker refuses an instance-type change while an Application Auto Scaling scalable target is registered on the variant.",
+    "note": "written before configuration fingerprinting, so it carries no deployed_config and tts-bench refuses to replay it without --allow-config-mismatch. That refusal is intended; re-run cmax for an artifact that carries its own fingerprint."
+  },
   "model_name": "kokoro-82m",
   "endpoint": "speech-kokoro-82m",
   "instance_type": "ml.g5.xlarge",
