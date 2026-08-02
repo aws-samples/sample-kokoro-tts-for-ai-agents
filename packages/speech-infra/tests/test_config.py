@@ -93,6 +93,44 @@ class TestModelEndpointConfig:
             cfg.model_name = "changed"
 
 
+class TestInstanceTypeValidation:
+    """The `ml.` prefix, checked at config-load time.
+
+    `instance_type` is changed routinely now — the benchmark harness re-measures per
+    configuration and a candidate type arrives via `app.py`'s context override — and a
+    typo is expensive to diagnose: CloudFormation accepts it and the endpoint then sits
+    in `Updating` with no `FailureReason`.
+    """
+
+    @pytest.mark.parametrize("bad", ["g6.xlarge", "ML.g6.xlarge", "ml-g6.xlarge", ""])
+    def test_a_type_without_the_prefix_is_rejected(self, bad: str) -> None:
+        with pytest.raises(ValidationError, match="must start with 'ml.'"):
+            ModelEndpointConfig(
+                model_name="test",
+                hf_model_id="org/test",
+                instance_type=bad,
+                container_type=ContainerType.VLLM,
+            )
+
+    @pytest.mark.parametrize(
+        "good", ["ml.g5.xlarge", "ml.g6.xlarge", "ml.g6.12xlarge", "ml.c5.2xlarge"]
+    )
+    def test_prefixed_types_are_accepted(self, good: str) -> None:
+        # Not checked against a list: AWS adds instance types faster than this file
+        # changes, and rejecting an unknown-but-real type would block the next sweep.
+        cfg = ModelEndpointConfig(
+            model_name="test",
+            hf_model_id="org/test",
+            instance_type=good,
+            container_type=ContainerType.VLLM,
+        )
+        assert cfg.instance_type == good
+
+    def test_every_configured_model_passes_it(self) -> None:
+        for name, cfg in {**STT_MODEL_CONFIGS, **TTS_MODEL_CONFIGS}.items():
+            assert cfg.instance_type.startswith("ml."), name
+
+
 class TestConfigRegistry:
     def test_orpheus_config_exists(self) -> None:
         cfg = TTS_MODEL_CONFIGS["orpheus-3b"]

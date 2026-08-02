@@ -34,6 +34,29 @@ def _get_container_dir(config: ModelEndpointConfig) -> str:
     return str(CONTAINERS_ROOT / config.model_name)
 
 
+def _apply_instance_type_override(app: cdk.App, config: ModelEndpointConfig) -> ModelEndpointConfig:
+    """Re-type one model's endpoint from CDK context, for a measurement run.
+
+    ``-c kokoro-82m:instance_type=ml.g6.12xlarge`` — scoped per model rather than
+    global, so trying a candidate type cannot silently re-type every stack in the app
+    at once. ``config.py`` remains the source of truth for what is deployed long-term;
+    this exists so evaluating a type is a flag rather than an edit-commit-deploy cycle.
+
+    What keeps the resulting measurements honest is the configuration fingerprint
+    ``tts-bench`` reads back off the endpoint: an artifact records the type it was
+    actually measured against, not the one this file declares.
+    """
+    override = app.node.try_get_context(f"{config.model_name}:instance_type")
+    if not override:
+        return config
+    # Revalidated rather than `model_copy(update=...)`, which skips validators in
+    # Pydantic v2 — the `ml.` prefix check is the whole reason a typo fails at synth
+    # instead of sitting in an Updating endpoint with no FailureReason.
+    return ModelEndpointConfig.model_validate(
+        {**config.model_dump(), "instance_type": str(override)}
+    )
+
+
 def create_app() -> cdk.App:
     """Create the CDK app with all stacks."""
     app = cdk.App()
@@ -62,7 +85,8 @@ def create_app() -> cdk.App:
     )
     model_cache.add_dependency(foundation)
 
-    for _model_name, model_config in TTS_MODEL_CONFIGS.items():
+    for _model_name, declared_config in TTS_MODEL_CONFIGS.items():
+        model_config = _apply_instance_type_override(app, declared_config)
         container_dir = _get_container_dir(model_config)
         model_bucket_name = (
             foundation.model_bucket.bucket_name if model_config.cache_model_weights else None

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ContainerType(StrEnum):
@@ -23,6 +23,9 @@ class ModelEndpointConfig(BaseModel):
 
     model_name: str
     hf_model_id: str
+
+    #: SageMaker instance type, e.g. ``ml.g6.xlarge``. Validated for the ``ml.`` prefix
+    #: rather than against a list, since AWS adds types faster than this file changes.
     instance_type: str
     container_type: ContainerType
     streaming_mode: StreamingMode = StreamingMode.BIDIRECTIONAL
@@ -55,17 +58,31 @@ class ModelEndpointConfig(BaseModel):
     #: converge one step at a time. Off until a measurement justifies it.
     emergency_step_enabled: bool = False
 
-    #: The p95 TTFAB budget ``scaling_target_value`` was derived against. Recorded
-    #: beside the target because a target without its budget is unfalsifiable —
-    #: you cannot tell later which SLO it was meant to hold.
+    #: End-to-end p95 first-byte SLO, milliseconds: queue wait *plus* service, the
+    #: whole promise to the client. Everything about queueing follows from it —
+    #: ``W_max = SLO - S_p95`` and ``queue_max_depth = Lambda_cap x W_max`` — so it is
+    #: the only queueing number stated here. It replaced a hand-set ``max_added_wait_s``
+    #: that sat beside ``ttfab_budget_ms`` with no relation between them, which is how
+    #: this model came to declare a 20s queue allowance under a 300ms budget: a request
+    #: spending its allowance took 20.2s to first byte while the config claimed 0.3s.
+    #: Two independent fields can disagree with the promise; one derived pair cannot.
+    ttfab_slo_ms: int = 3000
+
+    #: The p95 TTFAB budget ``scaling_target_value`` was derived against — the *measured*
+    #: budget the C_max ladder read its knee at, not the promise. Recorded beside the
+    #: target because a target without its budget is unfalsifiable: you cannot tell later
+    #: which knee it was sized from. Deliberately tighter than ``ttfab_slo_ms``, and the
+    #: reason the ``FirstChunkLatencyP95`` alarm reads this rather than the SLO: that
+    #: alarm watches *service* time on an instance already serving, where an in-flight
+    #: request has spent none of the queue allowance, so an SLO-sized threshold would
+    #: only fire once the endpoint was already 10x past where it stops keeping up.
     ttfab_budget_ms: int = 300
 
-    #: W_max: added queueing wait a request may absorb. Hard-capped well under
-    #: SageMaker's 60s invocation ceiling.
-    max_added_wait_s: float = 2.0
-
-    #: Q_max per instance = Lambda_cap x W_max. Consumed by the container
-    #: admission queue; 0 means unbounded, i.e. not yet planned for this model.
+    #: Q_max per instance = Lambda_cap x W_max, where W_max derives from
+    #: ``ttfab_slo_ms``. Consumed by the container admission queue; 0 means unbounded,
+    #: i.e. not yet planned for this model. Stored rather than derived here because it
+    #: needs ``Lambda_cap``, which is a measurement — ``tts-bench plan`` computes it and
+    #: refuses when a stored value disagrees with what the SLO implies.
     queue_max_depth: int = 0
 
     container_startup_health_check_timeout_s: int = 600
@@ -74,6 +91,23 @@ class ModelEndpointConfig(BaseModel):
 
     container_env: dict[str, str] = Field(default_factory=dict)
     codec_model_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("instance_type")
+    @classmethod
+    def _instance_type_looks_like_sagemaker(cls, value: str) -> str:
+        """Reject anything without the ``ml.`` prefix SageMaker requires.
+
+        Worth the check because ``instance_type`` is now changed routinely — the
+        harness re-measures per configuration, and a candidate type arrives by flag
+        (see ``app.py``'s ``instance_type`` context override). A typo like
+        ``g6.xlarge`` is accepted by CloudFormation and then sits in ``Updating``
+        with no ``FailureReason``, which costs far more to diagnose than to prevent.
+        """
+        if not value.startswith("ml."):
+            raise ValueError(
+                f"instance_type must start with 'ml.' (SageMaker's prefix), got {value!r}"
+            )
+        return value
 
     @property
     def endpoint_name(self) -> str:
@@ -129,9 +163,30 @@ STT_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
 
 TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
     # The one model with a measured C_max, so the one model configured to scale.
-    # From artifacts/cmax-kokoro-bidi.json (bidi transport, frozen, 1 instance):
-    # C_max 1.63 concurrent at p95 TTFAB 276ms, S mean 110ms, so Lambda_cap 14.82 rps.
-    # At the chosen k=2: C_target = 0.875 x 1.63 / 2 = 0.713, or 44% utilization.
+    #
+    # Every scaling number below derives from artifacts/cmax-kokoro-bidi-g5xl.json,
+    # measured on this same ml.g5.xlarge (A10G): C_max 1.63 concurrent at p95 TTFAB
+    # 276ms, S mean 110ms and p95 174ms, so Lambda_cap 14.84 rps. At the chosen k=2:
+    # C_target = 0.875 x 1.63 / 2 = 0.713, or 44% utilization.
+    #
+    # queue_max_depth follows from the SLO and nothing else:
+    #   W_max = 3.0s SLO - 0.174s p95 service = 2.826s
+    #   Q_max = 14.84 rps x 2.826s = 41 per instance
+    # It was 296, from a hand-set 20s W_max that no SLO justified -- a request spending
+    # that allowance reached first byte at 20.2s. Recompute all four via
+    # shared/capacity.py -- ideally `tts-bench plan` -- if any input changes.
+    #
+    # A move to ml.g6.xlarge was attempted 2026-07-30 and rolled back. SageMaker refuses
+    # an instance-type change while an Application Auto Scaling scalable target is
+    # registered on the variant, which needs three deploys (deregister, retype,
+    # re-register) and a window with no autoscaling. Any future type change on a model
+    # with scaling_enabled hits the same rule.
+    #
+    # Separately, us-east-1 could not place a second ml.g5.xlarge for this account --
+    # three attempts, the decisive one with quota free (4, one in use), no load, and one
+    # instance requested, still Updating at 22 min with no FailureReason. That is EC2
+    # capacity for the type, not an account limit. It bounds what T_total we can measure
+    # here, which is why the plan sweeps the provision stage rather than assuming ours.
     #
     # C_target below 1 is not a mistake. Kokoro holds its inference lock for a whole
     # bidi session, so an instance serves about one stream and one sustained request
@@ -151,9 +206,9 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         max_instances=4,
         scaling_target_value=0.713,
         scale_in_threshold=0.2,
+        ttfab_slo_ms=3000,
         ttfab_budget_ms=300,
-        max_added_wait_s=20.0,
-        queue_max_depth=296,
+        queue_max_depth=41,
     ),
     "kokoro-82m-cpu": ModelEndpointConfig(
         model_name="kokoro-82m-cpu",

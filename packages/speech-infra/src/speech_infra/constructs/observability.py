@@ -74,6 +74,15 @@ class EndpointObservability(Construct):
         # The SLO alarm. FirstChunkLatency is SageMaker's name for what the
         # benchmark calls TTFAB, so this is the one alarm that watches the quantity
         # C_max was measured against. Reported in microseconds by CloudWatch.
+        #
+        # ttfab_budget_ms, deliberately, and not ttfab_slo_ms. The two differ by an
+        # order of magnitude (300ms against 3000ms) and this metric is the tighter
+        # one's: it is measured on an instance already serving, so an in-flight request
+        # has spent none of its queue allowance here. Threshold it at the end-to-end SLO
+        # and the alarm only fires once service time alone is 10x past where the model
+        # stops keeping up -- by which point the queue has been missing the promise for
+        # a long time. The SLO is held by sizing the fleet and bounding the queue; this
+        # alarm is how we notice the instance itself degrading.
         self.ttfab_alarm = cloudwatch.Alarm(
             self,
             "FirstChunkLatencyP95",
