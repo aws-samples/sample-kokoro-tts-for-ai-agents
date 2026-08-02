@@ -6,8 +6,11 @@ Provides:
 - WS /invocations-bidirectional-stream: streaming TTS over WebSocket
 
 Uses the PyTorch `kokoro` package with KPipeline for native CUDA
-inference on A10G GPU. Single model instance with asyncio.Lock
-serialization — the model is fast enough (0.12s/inference) that
+inference. Runs on A10G (ml.g5, sm_86) and L4 (ml.g6, sm_89) off the same
+pinned cu124 wheel — its newest 8.x cubin is sm_86, which is forward
+compatible within the major arch — so this logs the GPU it actually found
+rather than assuming one. Single model instance with asyncio.Lock
+serialization; the model is fast enough (0.12s/inference on A10G) that
 multi-session adds negligible benefit.
 """
 
