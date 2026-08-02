@@ -35,7 +35,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from loguru import logger
 
-from tts_bench import cmax
+from shared.capacity import lambda_cap_per_instance
+from tts_bench import cmax, fixture
 from tts_bench.bidi import Transport, invoke_bidi
 from tts_bench.cmax import (
     SPREAD_WARN_THRESHOLD,
@@ -45,8 +46,10 @@ from tts_bench.cmax import (
     build_report,
     dry_run_plan,
     find_knee,
+    find_throughput_ceiling,
     join_cloudwatch,
     measure,
+    median_ceiling,
     median_curve,
     probe_service_time,
     rps_for_concurrency,
@@ -242,6 +245,7 @@ def _summary(
     step_index: int = 0,
     target_concurrency: float = 1.0,
     offered_rps: float = 5.0,
+    achieved_rps: float | None = None,
     ttfab_p95_ms: float | None = 100.0,
     concurrency_mean: float | None = None,
     s_mean_s: float | None = 0.2,
@@ -249,17 +253,27 @@ def _summary(
     saturated: bool = False,
     settled: bool = True,
     usable: bool = True,
+    skipped: int = 0,
+    capacity_changed: bool = False,
+    completed: int | None = None,
     run_index: int = 0,
 ) -> StepSummary:
-    """A ``StepSummary`` built directly, for the pure knee/curve functions."""
+    """A ``StepSummary`` built directly, for the pure knee/curve functions.
+
+    ``achieved_rps`` defaults to ``offered_rps`` — the server kept up. The throughput
+    ceiling reads it directly, so a test about the ceiling has to set it rather than rely
+    on ``saturated``: the two are independent fields here even though the real
+    ``WindowStats.saturated`` derives one from the other.
+    """
+    achieved = offered_rps if achieved_rps is None else achieved_rps
     return StepSummary(
         run_index=run_index,
         step_index=step_index,
         target_concurrency=target_concurrency,
         offered_rps=offered_rps,
-        achieved_rps=offered_rps,
-        completed=int(offered_rps * WINDOW_S),
-        ok=int(offered_rps * WINDOW_S),
+        achieved_rps=achieved,
+        completed=int(achieved * WINDOW_S) if completed is None else completed,
+        ok=int(achieved * WINDOW_S) if completed is None else completed,
         ttfab_p95_ms=ttfab_p95_ms,
         s_mean_s=s_mean_s,
         s_p95_s=s_p95_s,
@@ -267,6 +281,8 @@ def _summary(
         saturated=saturated,
         settled=settled,
         usable=usable,
+        dispatch_skipped=skipped,
+        capacity_changed=capacity_changed,
     )
 
 
@@ -385,23 +401,54 @@ class FakeAppScaling:
 
 
 class FakeSageMaker:
-    """Minimal ``sagemaker`` double: already at one instance, so no pin is needed."""
+    """Minimal ``sagemaker`` double: already at one instance, so no pin is needed.
 
-    def __init__(self, *, desired: int = 1, current: int = 1) -> None:
+    Also answers the three calls behind the configuration fingerprint. ``instance_type``
+    defaults to the registry's value for kokoro so the common case is a *match*, which
+    keeps the disagreement warning out of tests that are not about it.
+    """
+
+    def __init__(
+        self,
+        *,
+        desired: int = 1,
+        current: int = 1,
+        instance_type: str = "ml.g5.xlarge",
+        image: str | None = "repo/asset:abc123def456",
+        env: dict[str, str] | None = None,
+    ) -> None:
         self.desired = desired
         self.current = current
+        self.instance_type = instance_type
+        self.image = image
+        self.env = {"MAX_REQUEST_AGE_S": "56"} if env is None else env
         self.updates: list[dict] = []
 
     def describe_endpoint(self, EndpointName: str) -> dict:  # noqa: N803 - boto3 API
         return {
+            "EndpointConfigName": f"{EndpointName}-config",
             "ProductionVariants": [
                 {
                     "VariantName": "primary",
                     "DesiredInstanceCount": self.desired,
                     "CurrentInstanceCount": self.current,
                 }
+            ],
+        }
+
+    def describe_endpoint_config(self, EndpointConfigName: str) -> dict:  # noqa: N803 - boto3 API
+        return {
+            "ProductionVariants": [
+                {
+                    "VariantName": "primary",
+                    "InstanceType": self.instance_type,
+                    "ModelName": "fake-model",
+                }
             ]
         }
+
+    def describe_model(self, ModelName: str) -> dict:  # noqa: N803 - boto3 API
+        return {"PrimaryContainer": {"Image": self.image, "Environment": dict(self.env)}}
 
     def update_endpoint_weights_and_capacities(self, **kwargs) -> dict:
         self.updates.append(kwargs)
@@ -475,6 +522,22 @@ class TestWorkerCount:
 
     def test_grows_with_the_ladder(self) -> None:
         assert worker_count(4.0) < worker_count(16.0)
+
+    def test_an_override_raises_the_pool(self) -> None:
+        # The whole reason the flag exists: bidi's in-flight overshoots the target by the
+        # server's backlog, so no derived multiple of the target covers it, and a ceiling
+        # measured against an exhausted pool is the benchmark's rather than the server's.
+        assert worker_count(3.0) == 14
+        assert worker_count(3.0, 64) == 64
+
+    def test_an_override_cannot_shrink_the_pool(self, logged: list[str]) -> None:
+        # Lowering it would recreate the one failure worker_count exists to prevent — a
+        # *passing* step that was silently client-limited. Refused and said out loud.
+        assert worker_count(3.0, 4) == 14
+        assert any("below the 14 workers" in m for m in logged)
+
+    def test_no_override_is_the_derived_size(self) -> None:
+        assert worker_count(3.0, None) == worker_count(3.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -774,6 +837,349 @@ class TestFindKnee:
         assert find_knee(steps, 300).concurrency == pytest.approx(4.0)
 
 
+class TestFindThroughputCeiling:
+    def test_takes_the_highest_sustained_rate(self) -> None:
+        steps = [
+            _summary(step_index=0, target_concurrency=1.0, offered_rps=5.0),
+            _summary(step_index=1, target_concurrency=2.0, offered_rps=10.0),
+        ]
+        ceiling = find_throughput_ceiling(steps, 0.2)
+        assert ceiling is not None
+        assert ceiling.max_sustained_rps == pytest.approx(10.0)
+        assert ceiling.step_index == 1
+
+    def test_converts_to_concurrency_through_littles_law(self) -> None:
+        # C = lambda x S, so 10 rps at 200ms is 2.0 of *useful* concurrency. This is the
+        # unit the planner compares against a knee, so getting the conversion wrong would
+        # misprice every fleet built on the ceiling.
+        ceiling = find_throughput_ceiling([_summary(offered_rps=10.0)], 0.2)
+        assert ceiling is not None
+        assert ceiling.concurrency == pytest.approx(2.0)
+
+    def test_the_concurrency_round_trips_back_to_the_measured_rate(self) -> None:
+        # The invariant that makes this number safe to plan on: feeding it to
+        # lambda_cap_per_instance must return the rate we actually observed, not one
+        # inferred from it. If these ever diverge the plan permits a rate nothing measured.
+        ceiling = find_throughput_ceiling([_summary(offered_rps=13.03)], 0.10602401316328536)
+        assert ceiling is not None
+        assert lambda_cap_per_instance(ceiling.concurrency, 0.10602401316328536) == pytest.approx(
+            ceiling.max_sustained_rps
+        )
+
+    def test_uses_the_uncontended_s_not_the_steps_own(self) -> None:
+        # At the ceiling the step's own s_mean_s already contains queueing. Using it would
+        # inflate the concurrency by exactly the wait this bound exists to exclude — here
+        # 4x, since the contended figure is 4x the uncontended one.
+        step = _summary(offered_rps=10.0, s_mean_s=0.8, s_p95_s=1.2)
+        ceiling = find_throughput_ceiling([step], 0.2)
+        assert ceiling is not None
+        assert ceiling.concurrency == pytest.approx(2.0)
+
+    def test_records_observed_concurrency_beside_the_useful_figure(self) -> None:
+        # Not the same unit, and the gap is the point: ConcurrentRequestsPerModel — what
+        # the deployed scaling policy tracks — reports the observed number.
+        ceiling = find_throughput_ceiling(
+            [_summary(offered_rps=10.0, concurrency_mean=4.2)],
+            0.2,
+        )
+        assert ceiling is not None
+        assert ceiling.concurrency == pytest.approx(2.0)
+        assert ceiling.observed_concurrency == pytest.approx(4.2)
+        assert ceiling.queueing_multiple == pytest.approx(2.1)
+
+    def test_a_saturated_step_cannot_be_the_ceiling(self) -> None:
+        # The retraction this function exists for. A saturated step's *measured*
+        # concurrency is accumulated backlog, and reading it as capacity is how a ladder
+        # that peaked at 13 rps came to look like it held 11 concurrent requests.
+        steps = [
+            _summary(step_index=0, target_concurrency=2.0, offered_rps=12.89, achieved_rps=13.03),
+            _summary(
+                step_index=1,
+                target_concurrency=3.0,
+                offered_rps=19.33,
+                achieved_rps=16.88,
+                saturated=True,
+                concurrency_mean=11.15,
+            ),
+        ]
+        ceiling = find_throughput_ceiling(steps, 0.10602401316328536)
+        assert ceiling is not None
+        assert ceiling.step_index == 0
+        assert ceiling.max_sustained_rps == pytest.approx(13.03)
+        # Would have been ~1.79 read off the saturated step's rate, and 11.15 read off its
+        # concurrency. Both overstate an instance that tops out near 1.38.
+        assert ceiling.concurrency == pytest.approx(1.3813, abs=1e-3)
+
+    def test_an_unsettled_step_cannot_be_the_ceiling(self) -> None:
+        # Achieved can match offered while the queue is still filling; the window just
+        # ended before the backlog surfaced. Same reasoning as the knee's version.
+        steps = [
+            _summary(step_index=0, target_concurrency=1.0, offered_rps=5.0),
+            _summary(step_index=1, target_concurrency=2.0, offered_rps=10.0, settled=False),
+        ]
+        ceiling = find_throughput_ceiling(steps, 0.2)
+        assert ceiling is not None
+        assert ceiling.step_index == 0
+
+    def test_a_client_limited_step_can_still_be_the_ceiling(self) -> None:
+        # Where this deliberately parts company with find_knee. `usable=False` means the
+        # step cannot host a *latency* knee, but the rate it delivered is a rate the server
+        # delivered, and discarding it is what hid kokoro's real limit.
+        steps = [
+            _summary(step_index=0, target_concurrency=1.0, offered_rps=5.0),
+            _summary(step_index=1, target_concurrency=2.0, offered_rps=10.0, usable=False),
+        ]
+        ceiling = find_throughput_ceiling(steps, 0.2)
+        assert ceiling is not None
+        assert ceiling.step_index == 1
+
+    def test_a_capacity_change_disqualifies_a_step(self) -> None:
+        # Throughput that rose because a second instance appeared is not a per-instance
+        # ceiling — the same reason it cannot host a knee.
+        steps = [
+            _summary(step_index=0, target_concurrency=1.0, offered_rps=5.0),
+            _summary(step_index=1, target_concurrency=2.0, offered_rps=10.0, capacity_changed=True),
+        ]
+        ceiling = find_throughput_ceiling(steps, 0.2)
+        assert ceiling is not None
+        assert ceiling.step_index == 0
+
+    def test_a_step_with_no_completions_is_not_a_ceiling(self) -> None:
+        assert find_throughput_ceiling([_summary(offered_rps=5.0, completed=0)], 0.2) is None
+
+    def test_returns_none_when_every_step_saturated(self) -> None:
+        # The honest answer for a ladder whose lowest rate is already past capacity: no
+        # ceiling was found, rather than a fabricated one from the least-bad step.
+        steps = [
+            _summary(step_index=0, saturated=True),
+            _summary(step_index=1, target_concurrency=2.0, saturated=True),
+        ]
+        assert find_throughput_ceiling(steps, 0.2) is None
+
+    def test_a_saturated_step_above_brackets_the_ceiling(self) -> None:
+        steps = [
+            _summary(step_index=0, target_concurrency=1.0, offered_rps=10.0),
+            _summary(step_index=1, target_concurrency=2.0, offered_rps=20.0, saturated=True),
+        ]
+        ceiling = find_throughput_ceiling(steps, 0.2)
+        assert ceiling is not None
+        assert ceiling.bracketed
+
+    def test_running_out_of_ladder_makes_it_a_lower_bound(self) -> None:
+        ceiling = find_throughput_ceiling([_summary(target_concurrency=8.0, offered_rps=40.0)], 0.2)
+        assert ceiling is not None
+        assert not ceiling.bracketed
+        assert ceiling.is_lower_bound
+
+    def test_skipped_dispatches_make_it_a_lower_bound_too(self) -> None:
+        # A second, independent reason to distrust the number, and it wants the opposite
+        # fix: --max-workers, not a longer ladder. Bracketed and still a lower bound.
+        steps = [
+            _summary(step_index=0, target_concurrency=1.0, offered_rps=10.0, skipped=29),
+            _summary(step_index=1, target_concurrency=2.0, offered_rps=20.0, saturated=True),
+        ]
+        ceiling = find_throughput_ceiling(steps, 0.2)
+        assert ceiling is not None
+        assert ceiling.bracketed
+        assert ceiling.dispatch_skipped == 29
+        assert ceiling.is_lower_bound
+
+    def test_a_tie_on_rate_prefers_the_lower_target(self) -> None:
+        # The same rate reached from a lower target is the less contended measurement of
+        # it, so its latency and observed concurrency are the ones worth recording.
+        steps = [
+            _summary(step_index=0, target_concurrency=1.0, offered_rps=10.0, ttfab_p95_ms=150.0),
+            _summary(step_index=1, target_concurrency=4.0, offered_rps=10.0, ttfab_p95_ms=900.0),
+        ]
+        ceiling = find_throughput_ceiling(steps, 0.2)
+        assert ceiling is not None
+        assert ceiling.step_index == 0
+        assert ceiling.p95_ttfab_ms == pytest.approx(150.0)
+
+    def test_records_the_latency_at_the_ceiling(self) -> None:
+        # A ceiling reached with latency well inside budget is the finding: it proves the
+        # limit was throughput and not the SLO.
+        ceiling = find_throughput_ceiling([_summary(offered_rps=10.0, ttfab_p95_ms=551.0)], 0.2)
+        assert ceiling is not None
+        assert ceiling.p95_ttfab_ms == pytest.approx(551.0)
+
+    def test_rejects_a_non_positive_service_time(self) -> None:
+        with pytest.raises(ValueError, match="s_mean_s must be positive"):
+            find_throughput_ceiling([_summary()], 0.0)
+
+    def test_no_steps_at_all(self) -> None:
+        assert find_throughput_ceiling([], 0.2) is None
+
+
+class TestMedianCeiling:
+    def _ceiling(self, rps: float, **kwargs):
+        return find_throughput_ceiling([_summary(offered_rps=rps, **kwargs)], 0.2)
+
+    def test_takes_the_median_rate_across_runs(self) -> None:
+        merged = median_ceiling([self._ceiling(r) for r in (10.0, 11.0, 40.0)])
+        assert merged is not None
+        assert merged.max_sustained_rps == pytest.approx(11.0)
+
+    def test_returns_a_run_that_really_happened(self) -> None:
+        # Not a synthetic average: step_index, p95 and dispatch_skipped have to describe
+        # one real step, or the artifact reports a step nobody ran.
+        merged = median_ceiling(
+            [
+                self._ceiling(10.0, ttfab_p95_ms=100.0, skipped=1),
+                self._ceiling(11.0, ttfab_p95_ms=200.0, skipped=2),
+                self._ceiling(40.0, ttfab_p95_ms=900.0, skipped=3),
+            ]
+        )
+        assert merged is not None
+        assert (merged.p95_ttfab_ms, merged.dispatch_skipped) == (200.0, 2)
+
+    def test_an_even_count_prefers_the_lower_middle(self) -> None:
+        # The conservative choice for a capacity number: understating the fleet's per-
+        # instance ceiling oversizes the fleet, which is the safe direction to be wrong.
+        merged = median_ceiling([self._ceiling(r) for r in (10.0, 20.0)])
+        assert merged is not None
+        assert merged.max_sustained_rps == pytest.approx(10.0)
+
+    def test_one_bracketing_run_is_enough(self) -> None:
+        # A ceiling is a lower bound unless *some* run bracketed it. Requiring every run
+        # to have done so would throw away evidence we paid 45 minutes for.
+        bracketed = find_throughput_ceiling(
+            [
+                _summary(step_index=0, target_concurrency=1.0, offered_rps=10.0),
+                _summary(step_index=1, target_concurrency=2.0, offered_rps=20.0, saturated=True),
+            ],
+            0.2,
+        )
+        merged = median_ceiling([self._ceiling(10.0), bracketed, self._ceiling(10.0)])
+        assert merged is not None
+        assert merged.bracketed
+
+    def test_reports_how_many_runs_contributed(self) -> None:
+        # The denominator that keeps a 0% spread from reading as agreement.
+        merged = median_ceiling([self._ceiling(10.0), None, None])
+        assert merged is not None
+        assert merged.runs_contributing == 1
+        assert merged.spread == pytest.approx(0.0)
+
+    def test_reports_relative_spread(self) -> None:
+        merged = median_ceiling([self._ceiling(r) for r in (9.0, 10.0, 11.0)])
+        assert merged is not None
+        assert merged.spread == pytest.approx(0.2)
+
+    def test_no_run_found_a_ceiling(self) -> None:
+        assert median_ceiling([None, None]) is None
+        assert median_ceiling([]) is None
+
+
+class TestTheCeilingAgainstTheRealLadder:
+    """The committed kokoro artifact, checked offline.
+
+    The whole reason this measurement exists: reading the ladder through the latency lens
+    alone reported a knee, and reading its *rate* columns showed the server had already
+    stopped keeping up. These pin what the real data says so a future change to either
+    function has to confront it.
+    """
+
+    def _report(self):
+        import json
+        from pathlib import Path
+
+        path = (
+            Path(__file__).resolve().parents[3]
+            / "artifacts"
+            / "cmax-kokoro-82m-bidi-g5xlarge-139b9068.json"
+        )
+        if not path.exists():
+            pytest.skip(f"{path.name} not present")
+        return CMaxReport.model_validate(json.loads(path.read_text()))
+
+    def test_every_run_agrees_the_ceiling_is_about_thirteen_rps(self) -> None:
+        report = self._report()
+        rates = [
+            c.max_sustained_rps
+            for i in range(report.runs)
+            if (
+                c := find_throughput_ceiling(
+                    [s for s in report.steps if s.run_index == i], report.s_mean_s
+                )
+            )
+            is not None
+        ]
+        assert len(rates) == 3
+        assert all(12.5 < r < 13.5 for r in rates), rates
+
+    def test_the_ceiling_lands_near_one_point_four_not_eleven(self) -> None:
+        # 11.15 was the measured concurrency at target 3.0 — a saturated step, so that
+        # figure is backlog. 1.79 would be its rate read as capacity. Both are wrong.
+        report = self._report()
+        merged = median_ceiling(
+            [
+                find_throughput_ceiling(
+                    [s for s in report.steps if s.run_index == i], report.s_mean_s
+                )
+                for i in range(report.runs)
+            ]
+        )
+        assert merged is not None
+        assert merged.concurrency == pytest.approx(1.38, abs=0.02)
+        assert merged.spread < 0.05
+
+    def test_the_ceiling_sits_above_this_ladders_latency_knees(self) -> None:
+        # Kokoro is throughput-bound in general, but *this* ladder never resolved it: its
+        # top two steps were unusable, so no knee was ever reported above 1.26. The
+        # planner therefore still picks the latency knee here, and it takes the denser
+        # re-run to show the ceiling binding. Pinning the honest outcome rather than the
+        # predicted one.
+        report = self._report()
+        merged = median_ceiling(
+            [
+                find_throughput_ceiling(
+                    [s for s in report.steps if s.run_index == i], report.s_mean_s
+                )
+                for i in range(report.runs)
+            ]
+        )
+        assert merged is not None
+        assert max(report.c_max_curve.values()) < merged.concurrency
+        assert (
+            report.model_copy(update={"throughput_ceiling": merged}).throughput_bound_budgets == []
+        )
+
+    def test_most_of_the_residence_at_the_ceiling_is_already_queueing(self) -> None:
+        # 2.1x. The instance is not idle at its throughput limit — it is backed up, which
+        # is why the deployed scaling_target_value (which tracks the observed figure) and
+        # this C_max are not the same number.
+        report = self._report()
+        merged = median_ceiling(
+            [
+                find_throughput_ceiling(
+                    [s for s in report.steps if s.run_index == i], report.s_mean_s
+                )
+                for i in range(report.runs)
+            ]
+        )
+        assert merged is not None
+        assert merged.queueing_multiple == pytest.approx(2.1, abs=0.1)
+
+    def test_the_ceiling_is_a_lower_bound_because_the_client_throttled(self) -> None:
+        # Bracketed — target 3.0 did saturate — yet still a lower bound, because the pool
+        # skipped dispatches at the ceiling step. This is the case --max-workers exists
+        # for, and the reason the re-run raises it to 64.
+        report = self._report()
+        merged = median_ceiling(
+            [
+                find_throughput_ceiling(
+                    [s for s in report.steps if s.run_index == i], report.s_mean_s
+                )
+                for i in range(report.runs)
+            ]
+        )
+        assert merged is not None
+        assert merged.bracketed
+        assert merged.dispatch_skipped > 0
+        assert merged.is_lower_bound
+
+
 class TestMedianCurve:
     def test_takes_the_median_across_runs(self) -> None:
         # Median, not mean: with runs=3 one bad run must not move the answer, and
@@ -941,6 +1347,13 @@ class TestRunLadder:
         runner = _RecordingRunner()
         _run_ladder(runner, target_concurrencies=(1.0, 16.0))
         assert {c["max_workers"] for c in runner.calls} == {worker_count(16.0)}
+
+    def test_the_override_reaches_every_step(self) -> None:
+        # A raised pool that only reached some steps would leave the others client-limited
+        # while the artifact recorded one --max-workers, which is worse than not raising it.
+        runner = _RecordingRunner()
+        _run_ladder(runner, target_concurrencies=(1.0, 3.0), max_workers=64)
+        assert {c["max_workers"] for c in runner.calls} == {64}
 
     def test_varies_the_seed_per_step_and_per_run(self) -> None:
         # Each step stays individually reproducible without every step drawing
@@ -1424,6 +1837,250 @@ class TestBuildReport:
             _build(model="not-a-model")
 
 
+def _rising_ladder(**kwargs) -> LadderRun:
+    """A ladder whose offered rate rises with the target, as a real one does.
+
+    ``_build``'s default holds ``offered_rps`` flat at 5.0 across three targets, which is
+    fine for the knee (it reads concurrency) and meaningless for the ceiling (it reads
+    rate). Rate and target move together here: 0.2s service time, so target C is 5C rps.
+    """
+    return _ladder(
+        [
+            _summary(step_index=0, target_concurrency=1.0, offered_rps=5.0, ttfab_p95_ms=80.0),
+            _summary(step_index=1, target_concurrency=2.0, offered_rps=10.0, ttfab_p95_ms=280.0),
+            _summary(step_index=2, target_concurrency=4.0, offered_rps=20.0, ttfab_p95_ms=900.0),
+        ],
+        **kwargs,
+    )
+
+
+class TestBuildReportCarriesTheCeiling:
+    def test_the_report_carries_a_throughput_ceiling(self) -> None:
+        report = _build(ladders=[_rising_ladder()])
+        assert report.throughput_ceiling is not None
+        # Highest sustained step is target 4.0 at 20 rps; S from the lowest step is 0.2s.
+        assert report.throughput_ceiling.max_sustained_rps == pytest.approx(20.0)
+        assert report.throughput_ceiling.concurrency == pytest.approx(4.0)
+
+    def test_a_curve_always_comes_with_a_ceiling(self) -> None:
+        # Structural, not incidental: hosting a latency knee requires `usable` (completed,
+        # no capacity change) plus not-saturated and settled, which is strictly stronger
+        # than _sustained. So build_report cannot emit a curve with no ceiling beside it,
+        # and a None ceiling on a report that has a curve means the artifact predates the
+        # field rather than that the measurement failed.
+        report = _build(ladders=[_rising_ladder()])
+        assert report.c_max_curve
+        assert report.throughput_ceiling is not None
+
+    def test_the_ceiling_uses_the_reports_uncontended_s(self) -> None:
+        # Not the probe's, and not the ceiling step's own. Whatever
+        # uncontended_service_time settled on is what the conversion has to use, or the
+        # artifact's S and its ceiling describe different service times.
+        report = _build(
+            ladders=[
+                _ladder(
+                    [
+                        _summary(
+                            step_index=0, target_concurrency=1.0, offered_rps=2.0, s_mean_s=0.5
+                        ),
+                        _summary(
+                            step_index=1, target_concurrency=2.0, offered_rps=4.0, s_mean_s=1.9
+                        ),
+                    ]
+                )
+            ],
+            probe=_probe(s_mean_s=0.05),
+            budgets=(300,),
+        )
+        assert report.s_mean_s == pytest.approx(0.5)
+        assert report.throughput_ceiling is not None
+        assert report.throughput_ceiling.concurrency == pytest.approx(2.0)
+
+    def test_the_ceiling_is_the_median_across_runs(self) -> None:
+        ladders = [
+            _ladder(
+                [_summary(target_concurrency=1.0, offered_rps=r, ttfab_p95_ms=280.0)], run_index=i
+            )
+            for i, r in enumerate((10.0, 11.0, 40.0))
+        ]
+        report = _build(ladders=ladders, budgets=(300,))
+        assert report.throughput_ceiling is not None
+        assert report.throughput_ceiling.max_sustained_rps == pytest.approx(11.0)
+        assert report.throughput_ceiling.runs_contributing == 3
+
+    def test_the_ceiling_is_per_ladder_not_pooled(self) -> None:
+        # Pooling the steps first would let the luckiest run stand in for the median:
+        # three runs peaking at 10, 11 and 40 rps must report 11, not 40.
+        ladders = [
+            _ladder(
+                [
+                    _summary(step_index=0, target_concurrency=1.0, offered_rps=5.0, run_index=i),
+                    _summary(
+                        step_index=1,
+                        target_concurrency=2.0,
+                        offered_rps=r,
+                        ttfab_p95_ms=280.0,
+                        run_index=i,
+                    ),
+                ],
+                run_index=i,
+            )
+            for i, r in enumerate((10.0, 11.0, 40.0))
+        ]
+        report = _build(ladders=ladders, budgets=(300,))
+        assert report.throughput_ceiling is not None
+        assert report.throughput_ceiling.max_sustained_rps == pytest.approx(11.0)
+
+    def test_no_sustained_step_means_no_ceiling_not_a_fabricated_one(self) -> None:
+        report = _build(
+            ladders=[
+                _ladder(
+                    [
+                        _summary(step_index=0, target_concurrency=1.0, ttfab_p95_ms=80.0),
+                        _summary(
+                            step_index=1,
+                            target_concurrency=2.0,
+                            ttfab_p95_ms=280.0,
+                            saturated=True,
+                        ),
+                    ]
+                )
+            ],
+            budgets=(150,),
+        )
+        # Step 0 sustained, so there *is* a ceiling here; the saturated step is excluded.
+        assert report.throughput_ceiling is not None
+        assert report.throughput_ceiling.step_index == 0
+
+    def test_every_step_saturated_fails_before_a_ceiling_is_reported(self) -> None:
+        # The other side of the invariant above: with nothing sustained there is also no
+        # curve, so build_report raises rather than returning a report whose ceiling is
+        # None. A caller never sees the two disagree.
+        with pytest.raises(CMaxError, match="no ladder step met any TTFAB budget"):
+            _build(
+                ladders=[
+                    _ladder([_summary(target_concurrency=1.0, ttfab_p95_ms=80.0, saturated=True)])
+                ],
+                budgets=(150,),
+            )
+
+    def test_warns_when_a_knee_sits_above_the_ceiling(self, logged: list[str]) -> None:
+        # The finding a latency-only reading cannot state. The 900ms step sustained its
+        # rate and hosts the 1000ms knee at concurrency 4.0; the ceiling is 2.0 because
+        # the faster step saturated. Nothing failed, and the knee is still wrong.
+        report = _build(
+            ladders=[
+                _ladder(
+                    [
+                        _summary(
+                            step_index=0,
+                            target_concurrency=4.0,
+                            offered_rps=10.0,
+                            ttfab_p95_ms=900.0,
+                            concurrency_mean=4.0,
+                        ),
+                        _summary(
+                            step_index=1,
+                            target_concurrency=8.0,
+                            offered_rps=20.0,
+                            achieved_rps=12.0,
+                            ttfab_p95_ms=950.0,
+                            saturated=True,
+                        ),
+                    ]
+                )
+            ],
+            budgets=(1000,),
+        )
+        assert report.c_max_curve[1000] == pytest.approx(4.0)
+        assert report.throughput_ceiling is not None
+        assert report.throughput_ceiling.concurrency == pytest.approx(2.0)
+        assert report.throughput_bound_budgets == [1000]
+        assert any("backlog rather than capacity" in m for m in logged)
+
+    def test_stays_quiet_when_the_knee_is_inside_the_ceiling(self, logged: list[str]) -> None:
+        # The ordinary case, and the one that makes the warning worth reading. Both knees
+        # (1.0 and 2.0) sit under the 4.0 ceiling.
+        report = _build(ladders=[_rising_ladder()])
+        assert max(report.c_max_curve.values()) < report.throughput_ceiling.concurrency
+        assert report.throughput_bound_budgets == []
+        assert not any("backlog rather than capacity" in m for m in logged)
+
+    def test_warns_when_the_ceiling_is_a_lower_bound(self, logged: list[str]) -> None:
+        _build(ladders=[_rising_ladder()])  # nothing saturated above: unbracketed
+        assert any("LOWER bound" in m for m in logged)
+
+    def test_the_lower_bound_warning_names_the_worker_pool_when_that_is_the_cause(
+        self, logged: list[str]
+    ) -> None:
+        # Two causes, opposite fixes: extend the ladder, or raise --max-workers.
+        _build(
+            ladders=[
+                _ladder(
+                    [
+                        _summary(
+                            step_index=0,
+                            target_concurrency=1.0,
+                            offered_rps=10.0,
+                            ttfab_p95_ms=80.0,
+                            skipped=29,
+                        ),
+                        _summary(
+                            step_index=1,
+                            target_concurrency=2.0,
+                            offered_rps=20.0,
+                            achieved_rps=12.0,
+                            ttfab_p95_ms=280.0,
+                            saturated=True,
+                        ),
+                    ]
+                )
+            ],
+            budgets=(150,),
+        )
+        assert any("--max-workers" in m for m in logged)
+
+    def test_warns_when_the_instance_is_mostly_queueing_at_the_ceiling(
+        self, logged: list[str]
+    ) -> None:
+        _build(
+            ladders=[
+                _ladder(
+                    [
+                        _summary(
+                            step_index=0,
+                            target_concurrency=1.0,
+                            offered_rps=10.0,
+                            ttfab_p95_ms=80.0,
+                            concurrency_mean=4.5,
+                        )
+                    ]
+                )
+            ],
+            budgets=(150,),
+        )
+        # 10 rps x 0.2s = 2.0 useful against 4.5 observed: 2.25x.
+        assert any("residence is queueing" in m for m in logged)
+
+    def test_the_no_curve_error_distinguishes_a_latency_limit_from_a_capacity_one(self) -> None:
+        # "Lower --target-concurrency" is wrong advice for an endpoint that sustained every
+        # rate it was offered and merely did so slowly. That one wants a looser budget.
+        with pytest.raises(CMaxError, match="The limit here is latency, not throughput"):
+            _build(
+                ladders=[_ladder([_summary(offered_rps=10.0, ttfab_p95_ms=5000.0)])],
+                budgets=(150,),
+            )
+
+    def test_the_no_curve_error_keeps_the_old_advice_when_nothing_sustained(self) -> None:
+        with pytest.raises(CMaxError, match="--target-concurrency"):
+            _build(
+                ladders=[
+                    _ladder([_summary(offered_rps=10.0, ttfab_p95_ms=5000.0, saturated=True)])
+                ],
+                budgets=(150,),
+            )
+
+
 class TestDryRunPlan:
     def test_one_row_per_step_per_run(self) -> None:
         plan = dry_run_plan(s_mean_s=0.25, target_concurrencies=(1.0, 2.0), runs=3)
@@ -1650,6 +2307,101 @@ class TestMeasureOrchestration:
             _measure(model="polly-neural")
 
 
+class TestMeasureRecordsTheConfiguration:
+    """What the artifact says it was measured against, and where that comes from.
+
+    The endpoint, not ``cost.MODEL_INSTANCE_TYPES``. A registry states what *should* be
+    deployed; a benchmark has to record what *is*. Getting this backwards is silent in
+    exactly the workflow the harness exists for — redeploy on new hardware, re-measure,
+    and the static dict stamps the fresh curve with the old type.
+    """
+
+    def test_the_fingerprint_comes_off_the_endpoint(self, monkeypatch) -> None:
+        _patch_load(monkeypatch)
+        sm = FakeSageMaker(image="repo/asset:deadbeefcafe", env={"MAX_REQUEST_AGE_S": "56"})
+
+        report = _measure(appscaling=FakeAppScaling(), sagemaker=sm)
+
+        assert report.deployed_config["instance_type"] == "ml.g5.xlarge"
+        assert report.deployed_config["image_digest"] == "deadbeefcafe"
+        assert report.deployed_config["container_env"] == {"MAX_REQUEST_AGE_S": "56"}
+
+    def test_the_live_type_wins_over_the_registry(self, monkeypatch, logged: list[str]) -> None:
+        # The stale-registry bug, made loud. ERROR rather than WARNING because the same
+        # divergence also makes `drift` and the cost model wrong, not just this artifact.
+        # A retype that landed on the endpoint but not in the registry is the realistic
+        # shape of this: the measurement has to follow the hardware, not the dict.
+        _patch_load(monkeypatch)
+        sm = FakeSageMaker(instance_type="ml.g6.xlarge")
+
+        report = _measure(appscaling=FakeAppScaling(), sagemaker=sm)
+
+        assert report.instance_type == "ml.g6.xlarge"
+        assert report.deployed_config["instance_type"] == "ml.g6.xlarge"
+        assert any("MODEL_INSTANCE_TYPES says ml.g5.xlarge" in m for m in logged)
+
+    def test_an_agreeing_registry_is_not_complained_about(
+        self, monkeypatch, logged: list[str]
+    ) -> None:
+        _patch_load(monkeypatch)
+        _measure(appscaling=FakeAppScaling(), sagemaker=FakeSageMaker())
+        assert not any("MODEL_INSTANCE_TYPES" in m for m in logged)
+
+    def test_an_unreadable_endpoint_falls_back_to_the_registry(
+        self, monkeypatch, logged: list[str]
+    ) -> None:
+        # A failed describe must not cost a whole ladder run. The fallback is still
+        # honest: no image digest, so it can never compare equal to a real fingerprint.
+        _patch_load(monkeypatch)
+
+        def boom(*_args, **_kwargs):
+            raise FixtureError("endpoint is gone")
+
+        monkeypatch.setattr(fixture, "describe_deployed_config", boom)
+
+        report = _measure(appscaling=FakeAppScaling(), sagemaker=FakeSageMaker())
+
+        assert report.instance_type == "ml.g5.xlarge"
+        assert report.deployed_config["image_digest"] is None
+        assert any("Falling back to the registry type" in m for m in logged)
+
+    def test_the_slug_names_the_configuration(self, monkeypatch) -> None:
+        # What defaults one artifact filename per configuration, so two of them cannot
+        # overwrite each other by forgetting --output.
+        _patch_load(monkeypatch)
+        sm = FakeSageMaker(instance_type="ml.g6.12xlarge", image="repo/asset:139b9068c5eb1f03")
+
+        report = _measure(appscaling=FakeAppScaling(), sagemaker=sm)
+
+        assert report.config_slug == "g612xlarge-139b9068"
+
+    def test_the_fingerprint_survives_the_join_into_measured(self, monkeypatch) -> None:
+        # `plan` reads a Measured, so losing it here would leave the read-side check
+        # with nothing to compare.
+        _patch_load(monkeypatch)
+        report = _measure(appscaling=FakeAppScaling(), sagemaker=FakeSageMaker())
+
+        joined = report.to_measured(t_total_s=180.0)
+
+        assert joined.deployed_config == report.deployed_config
+
+    def test_the_fingerprint_round_trips_through_json(self, monkeypatch) -> None:
+        _patch_load(monkeypatch)
+        report = _measure(appscaling=FakeAppScaling(), sagemaker=FakeSageMaker())
+
+        restored = CMaxReport.model_validate_json(report.model_dump_json())
+
+        assert restored.deployed_config == report.deployed_config
+        assert restored.config_slug == report.config_slug
+
+    def test_an_artifact_without_one_still_has_a_slug(self) -> None:
+        # Every committed artifact predates fingerprinting. `config_slug` is used to name
+        # files, so it must not raise on them -- the read-side check is what refuses them.
+        report = _build()
+        assert report.deployed_config == {}
+        assert report.config_slug == "g5xlarge-nodigest"
+
+
 class TestJoinWithTTotal:
     """``CMaxReport.to_measured`` is the single place Phase 2 meets Phase 3."""
 
@@ -1676,6 +2428,104 @@ class TestJoinWithTTotal:
         assert restored.c_max_curve == report.c_max_curve
         assert all(isinstance(k, int) for k in restored.c_max_curve)
         assert restored.model_name is TTSModelName.KOKORO_82M
+
+    def test_carries_the_throughput_ceiling_into_the_planner_input(self) -> None:
+        report = _build(ladders=[_rising_ladder()])
+        joined = report.to_measured(t_total_s=180.0)
+        assert joined.c_max_throughput == pytest.approx(4.0)
+
+    def test_an_unbracketed_ceiling_arrives_flagged(self) -> None:
+        # The planner takes the *minimum* of the two C_max kinds, so a lower-bound minimum
+        # understates the fleet and the report has to say so rather than print a bare
+        # number. `is_lower_bound`, not `bracketed`: a client-throttled ceiling is just as
+        # untrustworthy as an unbracketed one.
+        joined = _build(ladders=[_rising_ladder()]).to_measured(t_total_s=180.0)
+        assert not joined.c_max_throughput_bracketed
+
+    def test_a_bracketed_ceiling_arrives_trusted(self) -> None:
+        report = _build(
+            ladders=[
+                _ladder(
+                    [
+                        _summary(
+                            step_index=0,
+                            target_concurrency=1.0,
+                            offered_rps=10.0,
+                            ttfab_p95_ms=80.0,
+                        ),
+                        _summary(
+                            step_index=1,
+                            target_concurrency=2.0,
+                            offered_rps=20.0,
+                            achieved_rps=12.0,
+                            ttfab_p95_ms=280.0,
+                            saturated=True,
+                        ),
+                    ]
+                )
+            ],
+            budgets=(150,),
+        )
+        joined = report.to_measured(t_total_s=180.0)
+        assert joined.c_max_throughput_bracketed
+
+    def test_the_binding_c_max_takes_the_lower_of_the_two(self) -> None:
+        # Both are real per-instance limits and an instance is bound by whichever it
+        # reaches first, so planning on the higher one sizes a fleet for capacity that does
+        # not exist. Here the knee at the 900ms budget (4.0) is above the 2.0 ceiling.
+        report = _build(
+            ladders=[
+                _ladder(
+                    [
+                        _summary(
+                            step_index=0,
+                            target_concurrency=4.0,
+                            offered_rps=10.0,
+                            ttfab_p95_ms=900.0,
+                            concurrency_mean=4.0,
+                        ),
+                        _summary(
+                            step_index=1,
+                            target_concurrency=8.0,
+                            offered_rps=20.0,
+                            achieved_rps=12.0,
+                            ttfab_p95_ms=950.0,
+                            saturated=True,
+                        ),
+                    ]
+                )
+            ],
+            budgets=(1000,),
+        )
+        joined = report.to_measured(t_total_s=180.0)
+        assert joined.binding_c_max(1000) == (pytest.approx(2.0), "throughput_ceiling")
+
+    def test_the_binding_c_max_keeps_the_knee_when_it_is_lower(self) -> None:
+        joined = _build(ladders=[_rising_ladder()]).to_measured(t_total_s=180.0)
+        c_max, source = joined.binding_c_max(300)
+        assert (c_max, source) == (pytest.approx(2.0), "latency_knee")
+
+    def test_an_artifact_with_no_ceiling_says_the_comparison_never_happened(self) -> None:
+        # Pre-existing artifacts have no ceiling to report, and "not measured" is a
+        # different claim from "no ceiling found" — for a throughput-bound model that is
+        # the difference between a checked answer and an unchecked one.
+        joined = _build(ladders=[_rising_ladder()]).to_measured(t_total_s=180.0)
+        stripped = joined.model_copy(update={"c_max_throughput": None})
+        assert stripped.binding_c_max(300) == (pytest.approx(2.0), "latency_knee_only")
+
+    def test_the_ceiling_round_trips_through_json(self) -> None:
+        report = _build(ladders=[_rising_ladder()])
+        restored = CMaxReport.model_validate_json(report.model_dump_json())
+        assert restored.throughput_ceiling == report.throughput_ceiling
+
+    def test_an_artifact_written_before_the_field_existed_still_loads(self) -> None:
+        # The pre-fingerprint precedent: absent must read as "not measured" rather than
+        # fail the load, or every artifact on disk becomes unreadable.
+        payload = _build(ladders=[_rising_ladder()]).model_dump(mode="json")
+        del payload["throughput_ceiling"]
+        restored = CMaxReport.model_validate(payload)
+        assert restored.throughput_ceiling is None
+        assert restored.throughput_bound_budgets == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1792,3 +2642,44 @@ class TestMeasureUsesOneTransport:
             sagemaker=FakeSageMaker(),
         )
         assert built[0][0] is Transport.BIDI
+
+    def test_the_connection_pool_matches_the_worker_pool(self, monkeypatch) -> None:
+        # Two pools bound the same client, and the smaller one wins. Raising only the
+        # threads would move the bottleneck from the executor to the HTTP pool and the
+        # artifact would still record a client-limited ceiling under --max-workers 64.
+        built: list[dict] = []
+        monkeypatch.setattr(
+            cmax,
+            "make_client_for",
+            lambda transport, region, **kw: built.append(kw) or object(),
+        )
+        recorded = _patch_load(monkeypatch)
+
+        _measure(
+            runtime_client=None,
+            max_workers=64,
+            appscaling=FakeAppScaling(),
+            sagemaker=FakeSageMaker(),
+        )
+        assert built[0]["max_pool"] == 64
+        assert {k["max_workers"] for k in recorded} == {64}
+
+    def test_without_an_override_the_pools_are_the_derived_size(self, monkeypatch) -> None:
+        built: list[dict] = []
+        monkeypatch.setattr(
+            cmax,
+            "make_client_for",
+            lambda transport, region, **kw: built.append(kw) or object(),
+        )
+        recorded = _patch_load(monkeypatch)
+
+        _measure(
+            runtime_client=None,
+            target_concurrencies=(1.0, 2.0),
+            appscaling=FakeAppScaling(),
+            sagemaker=FakeSageMaker(),
+        )
+        assert built[0]["max_pool"] == worker_count(2.0)
+        # run_ladder derives its own from the same targets, so it takes the override
+        # itself rather than the resolved number.
+        assert {k["max_workers"] for k in recorded} == {None}

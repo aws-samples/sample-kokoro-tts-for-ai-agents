@@ -249,9 +249,21 @@ class TestScenario:
         with pytest.raises(ValidationError):
             Scenario(peak_rps=10.0, derate=1.5)
 
-    def test_zero_added_wait_is_allowed(self) -> None:
-        # A no-queue configuration is a legitimate scenario to price.
-        assert Scenario(peak_rps=10.0, max_added_wait_s=0.0).max_added_wait_s == 0.0
+    def test_the_slo_is_the_only_queueing_input(self) -> None:
+        # W_max used to sit here as an independent field beside ttfab_budget_ms, and the
+        # two could disagree without anything noticing -- which is how kokoro shipped a
+        # 20s queue allowance under a 300ms budget. It is derived at plan time now, so
+        # the scenario must not accept one.
+        assert not hasattr(Scenario(peak_rps=10.0), "max_added_wait_s")
+        with pytest.raises(ValidationError):
+            Scenario(peak_rps=10.0, ttfab_slo_ms=0)
+
+    def test_the_slo_and_the_measurement_budget_are_separate(self) -> None:
+        # The SLO is the promise; ttfab_budget_ms picks which measured column to read
+        # the knee at, and is deliberately the tighter of the two.
+        scenario = Scenario(peak_rps=10.0)
+        assert scenario.ttfab_slo_ms == 3000
+        assert scenario.ttfab_budget_ms == 300
 
     def test_defaults_are_tagged_as_assumptions(self) -> None:
         scenario = _scenario()

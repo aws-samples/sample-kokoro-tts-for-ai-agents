@@ -58,7 +58,14 @@ from tts_bench.loadgen import (
     run_step,
     summarize_window,
 )
-from tts_bench.types import CMaxReport, KneePoint, Origin, Provenance, StepSummary
+from tts_bench.types import (
+    CMaxReport,
+    KneePoint,
+    Origin,
+    Provenance,
+    StepSummary,
+    ThroughputCeiling,
+)
 from tts_inference.types import TTSModelName
 
 #: Ladder in *expected* concurrency (``lambda x S``) rather than in raw rate: a
@@ -129,7 +136,7 @@ def rps_for_concurrency(target_concurrency: float, s_mean_s: float) -> float:
     return target_concurrency / s_mean_s
 
 
-def worker_count(max_target_concurrency: float) -> int:
+def worker_count(max_target_concurrency: float, override: int | None = None) -> int:
     """Thread-pool and connection-pool size for the ladder's highest step.
 
     Sized above the *target* in-flight count, which is only the same as the peak
@@ -146,8 +153,35 @@ def worker_count(max_target_concurrency: float) -> int:
     marked unusable (:func:`_unusable_reason`) and still brackets the knee from
     above (:func:`_brackets_from_above`). What must never happen is a *passing*
     step that was silently client-limited, and that is what the headroom buys.
+
+    That reasoning holds for the latency knee and fails for the throughput ceiling. A
+    client-limited step still cannot be a knee, but the rate it *delivered* is real, so
+    :func:`find_throughput_ceiling` reads it — and then the pool becomes a confound: a
+    ceiling measured with dispatches skipped may be the pool's limit rather than the
+    server's. Hence the override, which is the only way a re-run can tell the two apart.
+
+    Args:
+        override: Raise the pool to at least this many workers. Ignored when it is
+            *below* the derived size — a caller cannot shrink the pool into the region
+            where a passing step would be silently client-limited, which is the one
+            failure this function exists to prevent. Asking for less is a mistake worth
+            logging rather than honouring.
     """
-    return max(2, int((max_target_concurrency + WORKER_HEADROOM) * 2))
+    derived = max(2, int((max_target_concurrency + WORKER_HEADROOM) * 2))
+    if override is None:
+        return derived
+    if override < derived:
+        logger.warning(
+            "--max-workers {} is below the {} workers this ladder needs for a target of "
+            "{:.2f}; using {}. A smaller pool would make the client the limit and the knee "
+            "would describe the benchmark.",
+            override,
+            derived,
+            max_target_concurrency,
+            derived,
+        )
+        return derived
+    return override
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +388,123 @@ def find_knee(steps: Sequence[StepSummary], ttfab_budget_ms: int) -> KneePoint |
     )
 
 
+def _sustained(step: StepSummary) -> bool:
+    """Whether the server kept up with the offered rate at this step.
+
+    Deliberately weaker than :func:`_meets_budget` and than ``step.usable``. Neither the
+    latency budget nor ``dispatch_skipped`` appears: a throughput ceiling is not a
+    statement about latency, and a client-limited step still *delivered* the rate it
+    delivered, which is a fact about the server. ``settled`` is required because a
+    still-growing in-flight count means the queue is filling — the rate looks sustained
+    only because the window ended before the backlog surfaced.
+
+    ``capacity_changed`` disqualifies for the reason it disqualifies a knee: throughput
+    that rose because a second instance appeared is not a per-instance ceiling.
+    """
+    return (
+        step.completed > 0
+        and not step.capacity_changed
+        and not step.saturated
+        and step.settled
+        and step.achieved_rps > 0
+    )
+
+
+def find_throughput_ceiling(
+    steps: Sequence[StepSummary],
+    s_mean_s: float,
+) -> ThroughputCeiling | None:
+    """Highest rate the server sustained, as a second, independent ``C_max``.
+
+    ``find_knee`` asks where latency degrades; this asks where the server stops keeping
+    up. For a model that holds its inference lock across a whole session — kokoro on bidi —
+    the second binds far below the first, and a ladder read only through the latency lens
+    reports a knee that is nowhere near the instance's limit.
+
+    The ceiling is the highest ``achieved_rps`` over sustained steps (:func:`_sustained`),
+    converted to concurrency via the *uncontended* ``S``. Uncontended on purpose: at the
+    ceiling the measured ``S`` already contains queueing, so using it would inflate the
+    concurrency by exactly the wait this bound exists to keep out. See
+    :class:`~tts_bench.types.ThroughputCeiling` — the result is *useful* concurrency and is
+    not the same unit as a knee's observed in-flight count.
+
+    ``bracketed`` asks whether any step above the ceiling actually saturated. Unlike the
+    knee's version this needs no unusable-step special case: saturation is read off
+    achieved-vs-offered on every step regardless of whether it could be a knee.
+
+    Args:
+        s_mean_s: Uncontended service time, from :func:`uncontended_service_time` or the
+            probe. Not read off the ceiling step.
+
+    Returns:
+        The ceiling, or ``None`` when no step sustained its offered rate — which for a
+        ladder whose lowest step already saturates is the honest answer, not a failure.
+
+    Raises:
+        ValueError: If ``s_mean_s`` is not positive. A ceiling converted through a
+            non-positive service time would be meaningless rather than merely wrong.
+    """
+    if s_mean_s <= 0:
+        raise ValueError(f"s_mean_s must be positive, got {s_mean_s}")
+
+    sustained = [s for s in steps if _sustained(s)]
+    if not sustained:
+        return None
+
+    # Highest achieved rate, tie-broken by the lower target: the same rate reached from a
+    # lower target is the less contended measurement of it.
+    best = max(sustained, key=lambda s: (s.achieved_rps, -s.target_concurrency))
+    saturated_above = any(
+        s.target_concurrency > best.target_concurrency and s.saturated for s in steps
+    )
+
+    observed = best.concurrency_mean if (best.concurrency_mean or 0) > 0 else None
+    return ThroughputCeiling(
+        max_sustained_rps=best.achieved_rps,
+        concurrency=best.achieved_rps * s_mean_s,
+        observed_concurrency=observed,
+        offered_rps=best.offered_rps,
+        p95_ttfab_ms=best.ttfab_p95_ms or 0.0,
+        step_index=best.step_index,
+        bracketed=saturated_above,
+        dispatch_skipped=best.dispatch_skipped,
+    )
+
+
+def median_ceiling(
+    per_run: Sequence[ThroughputCeiling | None],
+) -> ThroughputCeiling | None:
+    """Cross-run ceiling: the median rate, carried on the run that achieved it.
+
+    Median for the reason :func:`median_curve` gives — with ``runs=3`` one bad run should
+    not move the answer. Returns the *representative run's* object rather than a synthetic
+    average, so ``step_index``, ``p95_ttfab_ms`` and ``dispatch_skipped`` still describe a
+    step that really ran. With an even count the lower of the two middles wins, which is
+    the conservative choice for a capacity number.
+
+    ``bracketed`` is **not** taken from that run alone: a ceiling is a lower bound unless
+    *some* run bracketed it, and requiring every run to have done so would discard
+    evidence. ``dispatch_skipped`` stays per-run, because it describes that step's client
+    behaviour and averaging it would describe no step at all.
+    """
+    found = [c for c in per_run if c is not None]
+    if not found:
+        return None
+
+    ordered = sorted(found, key=lambda c: c.max_sustained_rps)
+    representative = ordered[(len(ordered) - 1) // 2]
+    rates = [c.max_sustained_rps for c in ordered]
+    median = statistics.median(rates)
+    spread = ((max(rates) - min(rates)) / median) if median > 0 else 0.0
+    return representative.model_copy(
+        update={
+            "bracketed": any(c.bracketed for c in found),
+            "runs_contributing": len(found),
+            "spread": spread,
+        }
+    )
+
+
 def median_curve(
     per_run_knees: Sequence[Sequence[KneePoint]],
     budgets: Sequence[int],
@@ -384,6 +535,47 @@ def median_curve(
         curve[budget] = median
         spread[budget] = ((max(values) - min(values)) / median) if median > 0 else 0.0
     return curve, spread
+
+
+def _representative_knees(
+    per_run_knees: Sequence[Sequence[KneePoint]],
+) -> list[KneePoint]:
+    """Knee detail to publish, one per budget, preferring a run that found one.
+
+    Was "the last run's knees", which silently published *nothing* whenever the
+    final ladder pass found no knee — even though earlier passes did and the curve
+    is built from them. The report then carried a ``c_max_curve`` with no supporting
+    detail, and the CLI rendered the missing knee as ``rps 0.00, p95 0``: a measured
+    concurrency sitting beside two zeros that look like a failed measurement.
+
+    Walks runs newest-first and takes the first knee found for each budget, so the
+    most recent evidence still wins where it exists. This is display detail for one
+    representative step; the curve itself is the median across all runs
+    (:func:`median_curve`) and is not affected by which run is picked here.
+    """
+    chosen: dict[int, KneePoint] = {}
+    for knees in reversed(list(per_run_knees)):
+        for knee in knees:
+            chosen.setdefault(knee.ttfab_budget_ms, knee)
+    return [chosen[budget] for budget in sorted(chosen)]
+
+
+def _runs_contributing(
+    per_run_knees: Sequence[Sequence[KneePoint]],
+    budgets: Sequence[int],
+) -> dict[int, int]:
+    """How many runs found a knee at each budget.
+
+    The denominator ``curve_spread`` is missing. A spread of 0% reads as three runs
+    agreeing perfectly, when it can equally mean one run contributed and there was
+    nothing to disagree with — the difference between a repeatable number and a
+    single sample, which is precisely what ``--runs 3`` was meant to establish.
+    """
+    return {
+        budget: sum(1 for knees in per_run_knees if any(k.ttfab_budget_ms == budget for k in knees))
+        for budget in budgets
+        if any(any(k.ttfab_budget_ms == budget for k in knees) for knees in per_run_knees)
+    }
 
 
 def uncontended_service_time(
@@ -454,6 +646,7 @@ def run_ladder(
     arrival: ArrivalProcess | str = ArrivalProcess.POISSON,
     seed: int | None = None,
     saturated_steps_to_stop: int = DEFAULT_SATURATED_STEPS_TO_STOP,
+    max_workers: int | None = None,
     instance_count_fetch: Callable[[], int] | None = None,
     event_sink: Callable[[LoadEvent], None] | None = None,
     clock: Clock = SYSTEM_CLOCK,
@@ -472,6 +665,8 @@ def run_ladder(
             target into an arrival rate.
         measure_window_s: Trailing part of each step that is measured. The rest
             is warm-up and is discarded.
+        max_workers: Raise the thread and connection pool above the derived
+            :func:`worker_count`. Only raises; see that function for why.
         step_runner: Injected for tests; defaults to :func:`loadgen.run_step`.
         invoke: Transport for each request. Must be the same one the probe used,
             or ``S`` and the ladder describe different wire protocols and every
@@ -489,7 +684,7 @@ def run_ladder(
     run_id = run_id or uuid.uuid4().hex[:12]
     ladder = LadderRun(run_index=run_index)
     ordered_targets = sorted(target_concurrencies)
-    workers = worker_count(max(ordered_targets))
+    workers = worker_count(max(ordered_targets), max_workers)
     consecutive_saturated = 0
 
     for step_index, target in enumerate(ordered_targets):
@@ -689,6 +884,7 @@ def build_report(
     transport: Transport | str = Transport.RESPONSE_STREAM,
     joined_steps: Sequence[StepSummary] | None = None,
     measured_at: str | None = None,
+    deployed_config: dict[str, Any] | None = None,
 ) -> CMaxReport:
     """Assemble the artifact from one or more ladder runs.
 
@@ -708,18 +904,34 @@ def build_report(
     ]
     curve, spread = median_curve(per_run_knees, budgets)
 
-    if not curve:
-        raise CMaxError(
-            "no ladder step met any TTFAB budget without saturating. Either the endpoint is "
-            "unhealthy, or the lowest ladder rate is already past its capacity — re-run with "
-            "a lower --target-concurrency, or raise --ttfab-budgets if the SLO allows it."
-        )
-
     if joined_steps is not None:
         all_steps = list(joined_steps)
     else:
         all_steps = [step for ladder in ladders for step in ladder.steps]
     s_mean, s_p95 = uncontended_service_time(all_steps, probe)
+
+    # Per ladder, not over `all_steps`: a ceiling is the highest rate *one* pass sustained,
+    # and pooling the runs first would let the luckiest run stand in for the median.
+    ceiling = median_ceiling([find_throughput_ceiling(ladder.steps, s_mean) for ladder in ladders])
+
+    if not curve:
+        # The ceiling changes the diagnosis, so it changes the message. "The lowest rate is
+        # already past capacity" is wrong when the server sustained every rate offered and
+        # merely did so slowly; that endpoint wants a looser budget, not a shorter ladder.
+        if ceiling is not None:
+            raise CMaxError(
+                f"no ladder step met any TTFAB budget, but the endpoint sustained "
+                f"{ceiling.max_sustained_rps:.2f} rps (p95 TTFAB "
+                f"{ceiling.p95_ttfab_ms:.0f}ms) without saturating. The limit here is "
+                f"latency, not throughput: raise --ttfab-budgets above "
+                f"{ceiling.p95_ttfab_ms:.0f}ms if the SLO allows it, and only lower "
+                "--target-concurrency if it does not."
+            )
+        raise CMaxError(
+            "no ladder step met any TTFAB budget without saturating. Either the endpoint is "
+            "unhealthy, or the lowest ladder rate is already past its capacity — re-run with "
+            "a lower --target-concurrency, or raise --ttfab-budgets if the SLO allows it."
+        )
 
     observed: list[int] = []
     for ladder in ladders:
@@ -736,10 +948,13 @@ def build_report(
         model_name=TTSModelName(model),
         endpoint=endpoint,
         instance_type=instance_type,
+        deployed_config=dict(deployed_config) if deployed_config else {},
         run_id=run_id,
         c_max_curve=curve,
-        knees=list(per_run_knees[-1]) if per_run_knees else [],
+        knees=_representative_knees(per_run_knees),
+        throughput_ceiling=ceiling,
         curve_spread=spread,
+        runs_contributing=_runs_contributing(per_run_knees, budgets),
         s_mean_s=s_mean,
         s_p95_s=s_p95,
         derate=derate,
@@ -791,6 +1006,60 @@ def build_report(
             "the knee",
             report.inconclusive_budgets,
         )
+    if ceiling is not None:
+        logger.info(
+            "Throughput ceiling: {:.2f} rps sustained -> C_max {:.3f} (useful concurrency), "
+            "observed in-flight {}, p95 TTFAB {:.0f}ms at step {}",
+            ceiling.max_sustained_rps,
+            ceiling.concurrency,
+            f"{ceiling.observed_concurrency:.2f}" if ceiling.observed_concurrency else "n/a",
+            ceiling.p95_ttfab_ms,
+            ceiling.step_index,
+        )
+        # The finding the latency-only view cannot state. Budgets whose knee sits above the
+        # ceiling are not describing this instance's capacity: the server had already
+        # stopped keeping up before latency ever crossed them.
+        overstated = sorted(b for b, value in curve.items() if value > ceiling.concurrency)
+        if overstated:
+            logger.warning(
+                "Budgets {} report a knee above the {:.3f} throughput ceiling. Latency was "
+                "still inside those budgets, so nothing failed — but the server was not "
+                "keeping up, and their concurrency is backlog rather than capacity. Plan on "
+                "the ceiling.",
+                overstated,
+                ceiling.concurrency,
+            )
+        if ceiling.is_lower_bound:
+            logger.warning(
+                "The throughput ceiling is a LOWER bound: bracketed={} (no saturated step "
+                "above it){}. Planning on it understates capacity.",
+                ceiling.bracketed,
+                (
+                    f", and {ceiling.dispatch_skipped} dispatch(es) were skipped at that step, "
+                    "so the server never saw the full offered rate — raise --max-workers"
+                    if ceiling.dispatch_skipped
+                    else ""
+                ),
+            )
+        if ceiling.runs_contributing < len(ladders):
+            logger.warning(
+                "Only {}/{} run(s) produced a throughput ceiling, so its {:.0%} spread is not "
+                "a repeatability claim",
+                ceiling.runs_contributing,
+                len(ladders),
+                ceiling.spread,
+            )
+        multiple = ceiling.queueing_multiple
+        if multiple is not None and multiple > 1.5:
+            logger.warning(
+                "At the ceiling, observed in-flight ({:.2f}) is {:.1f}x the useful "
+                "concurrency ({:.3f}): most of each request's residence is queueing, not "
+                "work. A scaling_target_value policy tracks the observed figure, so the two "
+                "numbers are not interchangeable.",
+                ceiling.observed_concurrency,
+                multiple,
+                ceiling.concurrency,
+            )
     if not report.trustworthy:
         logger.error(
             "This curve is NOT safe to read as per-instance: frozen={}, instance counts {}",
@@ -863,6 +1132,7 @@ def measure(
     require_frozen: bool = True,
     pin_to: int = 1,
     cloudwatch_join: bool = True,
+    max_workers: int | None = None,
     transport: Transport | str = Transport.RESPONSE_STREAM,
     event_sink: Callable[[LoadEvent], None] | None = None,
     # See probe_service_time: bidi's client is not a BaseClient. Callers passing
@@ -888,6 +1158,11 @@ def measure(
             possibly fleet-wide.
         cloudwatch_join: Join server-side metrics after the ladder. Costs a
             settle wait (~2 min) and buys the client/server cross-check.
+        max_workers: Raise the client's thread and connection pool above the derived
+            :func:`worker_count`. Needed to tell a throughput ceiling that is the
+            server's from one that is the benchmark's: kokoro's bidi transport holds
+            the inference lock per session, so in-flight overshoots the target by the
+            server's backlog and the derived pool runs out. Only raises the pool.
         transport: Wire protocol to measure on. Recorded on the report, because
             the containers hold their inference lock differently per transport
             (``bidi.py`` module docstring) and a ``C_max`` from one does not
@@ -902,14 +1177,19 @@ def measure(
     model = TTSModelName(model)
     endpoint = resolve_endpoint(model)
     voice = resolve_voice(model, voice)
-    instance_type = _instance_type_for(model)
+    deployed = fixture.fingerprint_or_registry(
+        model.value, endpoint=endpoint, region=region, variant=variant, sagemaker=sagemaker
+    )
+    instance_type = deployed.instance_type or fixture.registry_instance_type(model.value)
     pool = build_text_pool(texts, seed=seed)
     run_id = uuid.uuid4().hex[:12]
     transport = Transport(transport)
 
-    client = runtime_client or make_client_for(
-        transport, region, max_pool=worker_count(max(target_concurrencies))
-    )
+    # Same figure the ladder will use for its thread pool. A connection pool smaller than
+    # the worker pool would make the client the limit through the other door, and the
+    # override exists precisely to stop the client being the limit at all.
+    workers = worker_count(max(target_concurrencies), max_workers)
+    client = runtime_client or make_client_for(transport, region, max_pool=workers)
     # One transport for the probe and every ladder step. S is what converts each
     # concurrency target into a rate, so probing on one protocol and laddering on
     # another would misprice every step on the ladder.
@@ -951,6 +1231,7 @@ def measure(
                 run_id=f"{run_id}-r{run_index}",
                 arrival=arrival,
                 seed=seed,
+                max_workers=max_workers,
                 instance_count_fetch=fetch,
                 event_sink=event_sink,
                 clock=clock,
@@ -1016,6 +1297,7 @@ def measure(
         transport=transport,
         joined_steps=all_steps,
         measured_at=datetime.now(UTC).isoformat(),
+        deployed_config=deployed.to_dict(),
     )
 
 
@@ -1040,22 +1322,3 @@ def _cloudwatch_client(cloudwatch: BaseClient | None, *, region: str) -> BaseCli
     import boto3
 
     return boto3.client("cloudwatch", region_name=region)
-
-
-def _instance_type_for(model: TTSModelName) -> str:
-    """Instance type from the benchmark registry, not from ``speech_infra``.
-
-    ``cost.MODEL_INSTANCE_TYPES`` is kept in step with ``TTS_MODEL_CONFIGS`` by a
-    consistency test, so this avoids pulling ``aws-cdk-lib`` in for one lookup.
-    """
-    from tts_bench.cost import DEFAULT_INSTANCE_TYPE, MODEL_INSTANCE_TYPES
-
-    instance_type = MODEL_INSTANCE_TYPES.get(model.value)
-    if instance_type is None:
-        logger.warning(
-            "{} is not in MODEL_INSTANCE_TYPES; costing against {}",
-            model.value,
-            DEFAULT_INSTANCE_TYPE,
-        )
-        return DEFAULT_INSTANCE_TYPE
-    return instance_type
