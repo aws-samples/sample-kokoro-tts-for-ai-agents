@@ -1,44 +1,60 @@
-"""Open-loop load generator: arrival rate is set by us, never by the server.
+"""Closed-loop load generator: concurrency is set by us, and held exactly.
 
-This is the technical core of the capacity work, and the one place where the
-existing benchmark is not merely incomplete but wrong. ``measure_scalability``
-(``scalability.py:68``) runs N threads that each send the next request only
-after the previous one returns, so offered load is ``N / mean_latency`` — when
-the server slows down, the client sends *slower*. That is coordinated omission:
-the queueing delay that a real user would experience never gets generated, so
-the knee cannot be found. On Kokoro it produces a concrete wrong answer
-(throughput pins at ~8.3 req/s for every level, the plateau break trips, and it
-reports a concurrency of 4 for a model whose capacity is 1).
+``N`` workers each issue their next request only when their previous one completes,
+so outstanding requests — queued **plus** executing — stay pinned at ``N``. That is
+the user's own definition of the quantity being measured: "at 5 there should always
+be Q (queue) + E (executing) = 5".
 
-Here the schedule is computed up front from ``t0`` and followed regardless of
-what the server does:
+**This is deliberately the design the module was originally written to avoid, and the
+reason is that the question changed.** The previous version drove an open-loop Poisson
+arrival schedule and argued, correctly, that response-gated dispatch is *coordinated
+omission*: when the server slows down the client sends slower, so the queueing delay a
+real user would feel never gets generated. That argument is about measuring **throughput
+at a given offered rate**, where the arrival rate is the independent variable and
+concurrency is the outcome. It does not apply when the roles are reversed.
 
-* **Absolute timestamps**, not accumulated sleeps, so a slow step cannot make
-  later arrivals drift late.
-* **Poisson inter-arrivals by default.** Fixed-interval arrival is the best case
-  and understates queueing; real traffic clumps.
-* **The dispatcher never blocks.** With no worker free it records
-  ``dispatch_skipped`` and moves on. Blocking there would be the same
-  self-throttling in a new place, and a skipped dispatch is a statement about
-  the *client*, so it must be visible rather than silently absorbed.
-* **A 1 Hz monitor** samples in-flight count and instance count. A fleet that
-  grows mid-step invalidates a per-instance measurement, so the change is
-  recorded on the step rather than averaged into it.
+``Q_max`` is defined as a concurrency: the largest number of simultaneously outstanding
+requests that still meets the SLO. Concurrency is therefore the independent variable, and
+closed-loop sets it *directly and exactly*. Open-loop can only reach a concurrency by
+choosing a rate and hoping — via ``lambda = C / S``, a conversion that needs a service
+time we are also trying to measure, and which every units defect found on this endpoint
+came through. Set ``N`` and count, and those defects stop existing rather than get fixed.
 
-Every scheduled arrival produces exactly one :class:`LoadEvent`, so a step's
-totals always reconcile: ``len(events) == len(schedule)``.
+Coordinated omission has not been reintroduced, because nothing here is being read as a
+rate promise: a step reports the latency *at* ``N`` outstanding, and ``achieved_rps`` is
+an observed consequence of that latency, never a target that the server failed to meet.
+
+What the design does cost, and how each cost is recovered:
+
+* **In-flight count can no longer detect a growing queue** — it is pinned at ``N`` by
+  construction, so a slope on it would always read zero. The signal moves to *latency*:
+  :attr:`WindowStats.settled` fits TTFAB against time and reports whether the step had
+  reached steady state. A check that silently always passes is worse than no check.
+* **There is no ``dispatch_skipped``** to reveal a client-side bottleneck. The
+  replacement is stronger: mean in-flight *should* equal ``N``, so any shortfall is
+  client turnaround, measured directly by :attr:`WindowStats.concurrency_shortfall`.
+* **Saturation is no longer a rate comparison.** A closed-loop driver cannot outrun the
+  server, so "achieved below offered" has no meaning here. What still means saturation is
+  the server *refusing* work, so :attr:`WindowStats.saturated` reads rejection outcomes.
+
+A **1 Hz monitor** samples in-flight and instance count. A fleet that grows mid-step
+invalidates a per-instance measurement, so the change is recorded on the step rather
+than averaged into it.
+
+Every dispatched request produces exactly one :class:`LoadEvent`, including one whose
+transport raised — a worker that died silently would drop concurrency below ``N`` and
+quietly invalidate the only thing this driver guarantees.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -60,31 +76,45 @@ DEFAULT_INSTANCE_COUNT_TTL_S = 10.0
 #: Client-side deadline per request, at SageMaker's hard invocation ceiling.
 DEFAULT_REQUEST_DEADLINE_S = 60.0
 
-#: Achieved/offered below this means the server is not keeping up. Not 1.0:
-#: a step always ends with requests still in flight, so a small shortfall is
-#: an artifact of the window, not of saturation.
-SATURATION_RATIO = 0.95
+#: Outcomes where the server refused the work rather than performed it. These are
+#: the closed-loop saturation signal: a driver that cannot outrun the server can
+#: still be told by the server to go away.
+REJECTION_OUTCOMES = frozenset(
+    {
+        InvokeOutcome.SATURATED_503.value,
+        InvokeOutcome.STALE_408.value,
+        InvokeOutcome.THROTTLED_429.value,
+    }
+)
 
+#: Fraction of completions that must be rejections before a window reads as
+#: saturated. Not zero: a single 429 in a ten-minute step is SageMaker's own
+#: throttling and should not discard the step. Not high either — a ``Q_max``
+#: ladder is supposed to run against an *unbounded* queue, so sustained
+#: rejections mean the run's preconditions were violated and the latency
+#: percentiles describe something other than what was intended.
+REJECTION_RATIO = 0.01
 
-class ArrivalProcess(StrEnum):
-    """How inter-arrival times are drawn."""
+#: Largest fitted TTFAB drift across a window, as a fraction of that window's p95,
+#: that still counts as steady state. 25% is loose enough to tolerate percentile
+#: noise on a short hold and tight enough that a queue genuinely still filling —
+#: which on a serial server grows latency without bound — fails it.
+LATENCY_DRIFT_RATIO = 0.25
 
-    POISSON = "poisson"
-    """Exponential gaps. The default: matches independent arrivals and, unlike
-    fixed spacing, produces the bursts that actually build a queue."""
-
-    FIXED = "fixed"
-    """Uniform spacing. Useful for a reproducible floor, but it flatters the
-    server — never use it alone to justify a capacity number."""
+#: How far mean in-flight may fall below ``N`` before the *client* is the limit.
+#: Each worker spends a little time between completing one request and dispatching
+#: the next, so the shortfall is never exactly zero; at 5% of ``N`` it is the
+#: closed-loop replacement for ``dispatch_skipped``.
+CONCURRENCY_SHORTFALL_RATIO = 0.05
 
 
 @dataclass(frozen=True, slots=True)
 class Clock:
     """Injectable time source.
 
-    Exists so the schedule-adherence tests can run without real waiting. The
-    load generator reads *both* a monotonic clock (for scheduling, immune to NTP
-    steps) and wall time (for event timestamps that correlate with CloudWatch).
+    Exists so the driver's tests can run without real waiting. The load generator
+    reads *both* a monotonic clock (for the step deadline, immune to NTP steps) and
+    wall time (for event timestamps that correlate with CloudWatch).
     """
 
     monotonic: Callable[[], float]
@@ -95,58 +125,9 @@ class Clock:
 SYSTEM_CLOCK = Clock(monotonic=time.monotonic, sleep=time.sleep, time=time.time)
 
 
-def arrival_offsets(
-    rate_rps: float,
-    duration_s: float,
-    *,
-    process: ArrivalProcess | str = ArrivalProcess.POISSON,
-    seed: int | None = None,
-) -> list[float]:
-    """Arrival times as offsets from ``t0``, in seconds, ascending.
-
-    Args:
-        rate_rps: Target arrival rate. The schedule's *mean* rate for Poisson.
-        duration_s: Schedule length. Arrivals at or beyond this are dropped.
-        process: :class:`ArrivalProcess` member.
-        seed: RNG seed. Supply one — an unseeded Poisson schedule makes two runs
-            of the same step incomparable.
-
-    Returns:
-        Offsets in ``[0, duration_s)``. Empty when ``rate_rps`` is 0.
-
-    Raises:
-        ValueError: If ``rate_rps`` or ``duration_s`` is negative.
-    """
-    if rate_rps < 0:
-        raise ValueError(f"rate_rps must be non-negative, got {rate_rps}")
-    if duration_s < 0:
-        raise ValueError(f"duration_s must be non-negative, got {duration_s}")
-    if rate_rps == 0 or duration_s == 0:
-        return []
-
-    process = ArrivalProcess(process)
-    if process is ArrivalProcess.FIXED:
-        gap = 1.0 / rate_rps
-        count = int(duration_s / gap)
-        return [i * gap for i in range(count)]
-
-    rng = np.random.default_rng(seed)
-    offsets: list[float] = []
-    t = 0.0
-    # Draw in blocks: one exponential per call would dominate the loop at high
-    # rates, and the schedule is built before any load is applied.
-    block = max(16, int(rate_rps * duration_s * 1.2))
-    while True:
-        for gap in rng.exponential(1.0 / rate_rps, size=block):
-            t += float(gap)
-            if t >= duration_s:
-                return offsets
-            offsets.append(t)
-
-
 @dataclass(frozen=True, slots=True)
 class LoadEvent:
-    """One scheduled arrival, whatever became of it.
+    """One dispatched request, whatever became of it.
 
     Serialized as one JSONL line. Written as events complete rather than at the
     end of the step, so a run killed mid-flight keeps everything it measured.
@@ -155,14 +136,19 @@ class LoadEvent:
     run_id: str
     step_index: int
     seq: int
-    offered_rps: float
+    worker_index: int
+    """Which worker issued it. A worker holds exactly one outstanding request at a
+    time, so two events sharing a ``worker_index`` can never overlap — that is what
+    makes ``Q + E = N`` true by construction rather than by sampling, and it is
+    checkable after the fact from the artifact alone."""
+    concurrency: int
+    """The step's ``N``. Held exactly, unlike the open-loop ``offered_rps`` it
+    replaced, which was a request the server could decline."""
     model: str
     endpoint: str
-    scheduled_ts: float
     dispatch_ts: float | None
     first_byte_ts: float | None
     end_ts: float | None
-    dispatch_delay_ms: float | None
     ttfab_ms: float | None
     latency_ms: float | None
     outcome: str
@@ -190,8 +176,8 @@ class ConcurrencySample:
     """One monitor tick.
 
     ``in_flight`` is measured client-side. It is cross-checked against AWS's
-    ``ConcurrentRequestsPerModel`` afterwards: if ours is lower, the client is
-    the bottleneck and the step says nothing about the server.
+    ``ConcurrentRequestsPerModel`` afterwards: the two are the same quantity in
+    different units, and the deployed threshold is compared against AWS's version.
     """
 
     ts: float
@@ -201,22 +187,19 @@ class ConcurrencySample:
 
 @dataclass(slots=True)
 class StepResult:
-    """Everything one constant-rate step produced.
+    """Everything one constant-concurrency step produced.
 
-    Deliberately raw. Windowing and knee-fitting are the caller's job
-    (``cmax.py``), because the warm-up to discard depends on the model.
+    Deliberately raw. Windowing and ladder-fitting are the caller's job
+    (``qmax.py``), because the warm-up to discard depends on the model.
     """
 
     run_id: str
     step_index: int
-    offered_rps: float
+    concurrency: int
     model: str
     endpoint: str
-    arrival_process: str
-    seed: int | None
     started_ts: float
     ended_ts: float
-    scheduled_count: int
     events: list[LoadEvent] = field(default_factory=list)
     samples: list[ConcurrencySample] = field(default_factory=list)
 
@@ -233,26 +216,47 @@ class StepResult:
     def capacity_changed(self) -> bool:
         """True if the fleet resized mid-step.
 
-        When true the step must be excluded from knee-fitting: achieved
-        throughput rose for a reason unrelated to the latency knee, so any
-        ``C_max`` derived from it is really ``N x C_max``.
+        When true the step must be excluded from the ladder: ``N`` outstanding
+        requests spread over two instances is a different measurement from ``N`` on
+        one, so the latency it reports belongs to no single per-instance ``Q_max``.
         """
         return len(self.instance_counts) > 1
 
     @property
-    def dispatch_skipped(self) -> int:
-        return sum(1 for e in self.events if e.outcome == InvokeOutcome.DISPATCH_SKIPPED.value)
+    def worker_overlaps(self) -> int:
+        """Events where one worker's request overlapped its own next one.
+
+        Must be zero. A non-zero count means a worker dispatched before its previous
+        request completed, so outstanding requests exceeded ``N`` and the step's
+        concurrency is not the number it claims. Cheap to check and it falsifies the
+        driver's one structural guarantee, so it is checked rather than assumed.
+        """
+        overlaps = 0
+        by_worker: dict[int, list[LoadEvent]] = {}
+        for event in self.events:
+            by_worker.setdefault(event.worker_index, []).append(event)
+        for events in by_worker.values():
+            timed = sorted(
+                (e for e in events if e.dispatch_ts is not None and e.end_ts is not None),
+                key=lambda e: e.dispatch_ts or 0.0,
+            )
+            for earlier, later in zip(timed, timed[1:], strict=False):
+                if (later.dispatch_ts or 0.0) < (earlier.end_ts or 0.0):
+                    overlaps += 1
+        return overlaps
 
 
 @dataclass(frozen=True, slots=True)
 class WindowStats:
     """Aggregates over one time window of a step.
 
-    ``achieved_rps`` counts *completions* in the window, so it is directly
-    comparable with ``offered_rps``; that comparison is the saturation test.
+    ``achieved_rps`` counts completions in the window. Unlike the open-loop version
+    it is an *output*, not something to compare against a target: at fixed ``N`` it
+    is ``N / latency``, so it is how throughput is derived from the ladder rather
+    than how saturation is detected.
     """
 
-    offered_rps: float
+    concurrency: int
     achieved_rps: float
     window_start_ts: float
     window_end_ts: float
@@ -269,34 +273,67 @@ class WindowStats:
     s_p95_s: float | None
     rtf_mean: float | None
     concurrency_mean: float | None
-    concurrency_p95: float | None
-    concurrency_slope_per_s: float | None
-    chars_per_hour: float
+    concurrency_peak: int | None
+    ttfab_drift_ms: float | None
+    """Fitted change in TTFAB across the whole window, milliseconds. Positive means
+    latency was still climbing when the window ended."""
     capacity_changed: bool
     instance_counts: tuple[int, ...]
 
     @property
+    def rejected(self) -> int:
+        """Completions where the server refused the work."""
+        return sum(self.outcome_counts.get(name, 0) for name in REJECTION_OUTCOMES)
+
+    @property
     def saturated(self) -> bool:
-        """Server could not keep up with the offered rate."""
-        if self.offered_rps <= 0:
+        """Server refused a meaningful share of the offered work.
+
+        The closed-loop meaning of saturation. A rate comparison cannot serve here —
+        the driver never offers more than the server accepts — so the signal is the
+        server's own rejections. Reading ``outcome_counts`` also closes a real hole
+        in the open-loop version, where a 1ms 503 counted as a completion and so
+        *raised* achieved throughput: a fully-rejecting endpoint looked healthy.
+        """
+        if self.completed <= 0:
             return False
-        return self.achieved_rps < SATURATION_RATIO * self.offered_rps
+        return self.rejected / self.completed > REJECTION_RATIO
+
+    @property
+    def concurrency_shortfall(self) -> float | None:
+        """How far mean in-flight fell below ``N``, as a fraction of ``N``.
+
+        Zero would mean the client turned a completed request into its next dispatch
+        instantly. Small values are ordinary overhead; a large one means the client
+        was the bottleneck and the step measured our own latency, not the server's.
+        """
+        if self.concurrency_mean is None or self.concurrency <= 0:
+            return None
+        return max(0.0, (self.concurrency - self.concurrency_mean) / self.concurrency)
+
+    @property
+    def client_bound(self) -> bool:
+        """Whether the client, not the server, limited this step."""
+        shortfall = self.concurrency_shortfall
+        return shortfall is not None and shortfall > CONCURRENCY_SHORTFALL_RATIO
 
     @property
     def settled(self) -> bool:
-        """In-flight count is not trending upward.
+        """Whether latency had stopped climbing by the end of the window.
 
-        An unsettled step *is* the measurement — a queue still growing at the
-        end of the window means this rate is already past capacity, whatever the
-        latency percentiles happen to read.
+        The closed-loop replacement for an in-flight trend, which is pinned at ``N``
+        here and would always read as settled. An unsettled step *is* a
+        measurement — on a serial server a queue that is still filling grows latency
+        without bound, so whatever p95 the window reports is a snapshot of a moving
+        number rather than the SLO verdict at this concurrency.
         """
-        if self.concurrency_slope_per_s is None:
+        if self.ttfab_drift_ms is None or self.ttfab_p95_ms is None or self.ttfab_p95_ms <= 0:
             return True
-        return self.concurrency_slope_per_s <= 0.05
+        return self.ttfab_drift_ms <= LATENCY_DRIFT_RATIO * self.ttfab_p95_ms
 
     @property
-    def usable_for_knee(self) -> bool:
-        """Whether this window may inform a per-instance ``C_max``."""
+    def usable_for_ladder(self) -> bool:
+        """Whether this window may inform a per-instance ``Q_max``."""
         return not self.capacity_changed and self.completed > 0
 
 
@@ -315,9 +352,9 @@ def summarize_window(
     """Aggregate the part of a step that falls inside a window.
 
     Requests are attributed by ``end_ts`` (completion), which is what makes
-    ``achieved_rps`` a throughput. ``dispatch_skipped`` events have no
-    completion time and are counted by ``scheduled_ts`` instead, so they are
-    never silently dropped from the outcome table.
+    ``achieved_rps`` a throughput. An event with no completion time — a transport
+    that raised outright — is placed by its dispatch instead, so it is never
+    silently dropped from the outcome table.
 
     Raises:
         ValueError: If the window is empty or inverted.
@@ -331,8 +368,8 @@ def summarize_window(
 
     for event in result.events:
         if event.end_ts is None:
-            # Never sent: place it by when it should have arrived.
-            if start_ts <= event.scheduled_ts < end_ts:
+            placed_at = event.dispatch_ts
+            if placed_at is not None and start_ts <= placed_at < end_ts:
                 outcome_counts[event.outcome] = outcome_counts.get(event.outcome, 0) + 1
             continue
         if start_ts <= event.end_ts < end_ts:
@@ -347,18 +384,25 @@ def summarize_window(
     latencies = [e.latency_ms for e in oks if e.latency_ms is not None]
     rtfs = [e.rtf for e in oks if e.rtf is not None]
     latency_p95 = _percentile(latencies, 95)
+    ttfab_p95 = _percentile(ttfabs, 95)
+
+    # TTFAB against completion time, fitted in ms per second and reported as the
+    # drift across the whole window: a slope is hard to judge without knowing the
+    # window length, while "latency rose 900ms over this window" is not.
+    drift: float | None = None
+    timed = [(e.end_ts, e.ttfab_ms) for e in oks if e.end_ts is not None and e.ttfab_ms is not None]
+    if len(timed) >= 3:
+        xs = np.array([t - start_ts for t, _ in timed], dtype=float)
+        ys = np.array([v for _, v in timed], dtype=float)
+        if float(xs.max() - xs.min()) > 0:
+            slope = float(np.polyfit(xs, ys, 1)[0])
+            drift = slope * duration
 
     in_window = [s for s in result.samples if start_ts <= s.ts < end_ts]
     in_flight = [float(s.in_flight) for s in in_window]
-    slope: float | None = None
-    if len(in_window) >= 3:
-        # Least-squares trend in requests per second. Positive means the queue
-        # is still growing at the end of the window.
-        ts = np.array([s.ts - start_ts for s in in_window], dtype=float)
-        slope = float(np.polyfit(ts, np.array(in_flight, dtype=float), 1)[0])
 
     return WindowStats(
-        offered_rps=result.offered_rps,
+        concurrency=result.concurrency,
         achieved_rps=len(completed) / duration,
         window_start_ts=start_ts,
         window_end_ts=end_ts,
@@ -366,7 +410,7 @@ def summarize_window(
         ok=len(oks),
         outcome_counts=outcome_counts,
         ttfab_p50_ms=_percentile(ttfabs, 50),
-        ttfab_p95_ms=_percentile(ttfabs, 95),
+        ttfab_p95_ms=ttfab_p95,
         ttfab_p99_ms=_percentile(ttfabs, 99),
         latency_p50_ms=_percentile(latencies, 50),
         latency_p95_ms=latency_p95,
@@ -375,9 +419,8 @@ def summarize_window(
         s_p95_s=(latency_p95 / 1000.0) if latency_p95 is not None else None,
         rtf_mean=(sum(rtfs) / len(rtfs)) if rtfs else None,
         concurrency_mean=(sum(in_flight) / len(in_flight)) if in_flight else None,
-        concurrency_p95=_percentile(in_flight, 95),
-        concurrency_slope_per_s=slope,
-        chars_per_hour=sum(e.chars for e in oks) / duration * 3600.0,
+        concurrency_peak=int(max(in_flight)) if in_flight else None,
+        ttfab_drift_ms=drift,
         capacity_changed=result.capacity_changed,
         instance_counts=result.instance_counts,
     )
@@ -416,12 +459,12 @@ class JsonlWriter:
 
 
 class _InFlight:
-    """Request counter, incremented at dispatch and decremented at completion.
+    """Outstanding-request counter, incremented at dispatch and decremented at completion.
 
-    Only the dispatcher increments and only workers decrement, so a value read
-    by the dispatcher can be stale in one direction only — too high, never too
-    low. That makes the ``>= max_workers`` check conservative: it may skip a
-    dispatch that would have fit, but it can never oversubscribe the pool.
+    Reads are only telemetry here — the closed loop bounds concurrency structurally,
+    by giving each worker one request at a time, rather than by consulting a counter.
+    That is why the count can be sampled freely without the sampling affecting what
+    is dispatched.
     """
 
     def __init__(self) -> None:
@@ -505,7 +548,7 @@ def build_text_pool(
 
     Every step then walks the same order from index 0, so two steps of equal
     length synthesize the *same* characters. Without that, a step could show a
-    worse knee merely for having drawn longer texts.
+    worse latency merely for having drawn longer texts.
 
     Raises:
         ValueError: If the pool is empty.
@@ -529,13 +572,10 @@ def run_step(
     endpoint: str,
     voice: str,
     texts: Sequence[str],
-    offered_rps: float,
+    concurrency: int,
     duration_s: float,
-    max_workers: int,
     step_index: int = 0,
     run_id: str | None = None,
-    arrival: ArrivalProcess | str = ArrivalProcess.POISSON,
-    seed: int | None = None,
     request_deadline_s: float = DEFAULT_REQUEST_DEADLINE_S,
     monitor_interval_s: float = DEFAULT_MONITOR_INTERVAL_S,
     instance_count_fetch: Callable[[], int] | None = None,
@@ -545,18 +585,20 @@ def run_step(
     clock: Clock = SYSTEM_CLOCK,
     invoke: Callable[..., InvokeResult] = invoke_stream,
 ) -> StepResult:
-    """Drive one constant-rate step and return everything it produced.
+    """Hold ``concurrency`` requests outstanding for ``duration_s`` and return the result.
 
     Args:
-        max_workers: Concurrency cap. Must exceed the highest in-flight count
-            the step will reach, or the *client* becomes the bottleneck — which
-            shows up as ``dispatch_skipped``, not as saturation.
-        offered_rps: Arrival rate to hold regardless of server behaviour.
-        duration_s: Step length. The caller measures a sub-window of it.
-        request_deadline_s: Client-side per-request deadline, measured from the
-            **scheduled** arrival, not from dispatch: that is what a user
-            experiences, and it means dispatch delay eats into the budget
-            instead of being hidden.
+        concurrency: ``N``. Exactly this many requests are outstanding at any moment,
+            because exactly this many workers exist and each holds one. This is the
+            independent variable of a ``Q_max`` ladder, which is why it is set rather
+            than approached via an arrival rate.
+        duration_s: How long to keep the loop running. A request already in flight
+            when the deadline passes is allowed to finish rather than be truncated,
+            so the wall-clock is slightly longer than this by design — a cut-off
+            latency is a wrong latency, not a shorter step.
+        request_deadline_s: Client-side per-request deadline, from dispatch. In a
+            closed loop dispatch *is* arrival: there is no schedule to be late
+            against, which is one of the things the design removes.
         instance_count_fetch: Optional reader for the mid-run capacity tripwire.
         invoke: The transport. :func:`invoke_stream` or
             :func:`tts_bench.bidi.invoke_bidi` — see
@@ -565,21 +607,22 @@ def run_step(
             type it built.
 
     Returns:
-        A :class:`StepResult` with exactly one event per scheduled arrival.
+        A :class:`StepResult` with exactly one event per dispatched request.
 
     Raises:
-        ValueError: If ``max_workers`` < 1 or ``texts`` is empty.
+        ValueError: If ``concurrency`` < 1, ``duration_s`` < 0, or ``texts`` is empty.
     """
-    if max_workers < 1:
-        raise ValueError(f"max_workers must be >= 1, got {max_workers}")
+    if concurrency < 1:
+        raise ValueError(f"concurrency must be >= 1, got {concurrency}")
+    if duration_s < 0:
+        raise ValueError(f"duration_s must be non-negative, got {duration_s}")
     if not texts:
         raise ValueError("texts must not be empty")
 
     run_id = run_id or uuid.uuid4().hex[:12]
-    offsets = arrival_offsets(offered_rps, duration_s, process=arrival, seed=seed)
-    # The caller's stop_event aborts the run; this step's own event also stops
-    # the monitor at the end of the step. Setting the caller's event here would
-    # abort every *later* step in a ladder as a side effect of finishing this one.
+    # The caller's stop_event aborts the run; this step's own event also stops the
+    # monitor at the end of the step. Setting the caller's event here would abort
+    # every *later* step in a ladder as a side effect of finishing this one.
     abort = stop_event or threading.Event()
     done = threading.Event()
     in_flight = _InFlight()
@@ -591,13 +634,13 @@ def run_step(
     events_lock = threading.Lock()
     samples: list[ConcurrencySample] = []
     samples_lock = threading.Lock()
+    # Global across workers so `seq` orders the step's requests, not one worker's.
+    # itertools.count is atomic under the GIL for a single next() call.
+    sequence = itertools.count()
 
     t0_mono = clock.monotonic()
     t0_wall = clock.time()
-
-    def _wall_for(offset: float) -> float:
-        """Wall-clock timestamp for a monotonic offset, without re-reading time."""
-        return t0_wall + offset
+    deadline_mono = t0_mono + duration_s
 
     def _record(event: LoadEvent) -> None:
         with events_lock:
@@ -610,12 +653,11 @@ def run_step(
 
     def _monitor() -> None:
         # Sampled on its own thread so a slow describe_endpoint delays telemetry
-        # rather than the arrival schedule.
+        # rather than a worker's next dispatch.
         #
-        # Waits on the event in real time rather than through `clock`: sampling
-        # is inherently wall-clock, and waiting on the event also means shutdown
-        # is immediate instead of one interval late. Only the arrival schedule
-        # goes through the injectable clock.
+        # Waits on the event in real time rather than through `clock`: sampling is
+        # inherently wall-clock, and waiting on the event also means shutdown is
+        # immediate instead of one interval late.
         while not (done.is_set() or abort.is_set()):
             with samples_lock:
                 samples.append(
@@ -627,108 +669,108 @@ def run_step(
                 )
             done.wait(monitor_interval_s)
 
-    def _worker(seq: int, text: str, scheduled_wall: float, before: int) -> None:
-        try:
+    def _worker(worker_index: int) -> None:
+        # One request at a time, for the whole step. The serial loop *is* the
+        # concurrency bound: with N workers, outstanding requests cannot exceed N
+        # no matter how the server behaves, so nothing has to be checked or capped.
+        while not abort.is_set() and clock.monotonic() < deadline_mono:
+            seq = next(sequence)
+            text = texts[seq % len(texts)]
+            before = in_flight.acquire()
             dispatch_wall = clock.time()
-            result = invoke(
-                client,
-                endpoint,
-                text,
-                voice,
-                deadline_ts=scheduled_wall + request_deadline_s,
-            )
-            _record(
-                LoadEvent(
-                    run_id=run_id,
-                    step_index=step_index,
-                    seq=seq,
-                    offered_rps=offered_rps,
-                    model=model,
-                    endpoint=endpoint,
-                    scheduled_ts=scheduled_wall,
-                    dispatch_ts=result.dispatch_ts,
-                    first_byte_ts=result.first_byte_ts,
-                    end_ts=result.end_ts,
-                    dispatch_delay_ms=(dispatch_wall - scheduled_wall) * 1000.0,
-                    ttfab_ms=result.ttfab_ms,
-                    latency_ms=result.latency_ms,
-                    outcome=result.outcome.value,
-                    http_status=result.http_status,
-                    error_class=result.error_class,
-                    error_message=result.error_message,
-                    chars=result.chars,
-                    audio_bytes=result.audio_bytes,
-                    audio_duration_s=result.audio_duration_s,
-                    rtf=result.rtf,
-                    in_flight_at_dispatch=before,
-                    instance_count=instance_counts.get(),
+            try:
+                result = invoke(
+                    client,
+                    endpoint,
+                    text,
+                    voice,
+                    deadline_ts=dispatch_wall + request_deadline_s,
                 )
-            )
-        finally:
-            in_flight.release()
+                _record(
+                    LoadEvent(
+                        run_id=run_id,
+                        step_index=step_index,
+                        seq=seq,
+                        worker_index=worker_index,
+                        concurrency=concurrency,
+                        model=model,
+                        endpoint=endpoint,
+                        dispatch_ts=result.dispatch_ts,
+                        first_byte_ts=result.first_byte_ts,
+                        end_ts=result.end_ts,
+                        ttfab_ms=result.ttfab_ms,
+                        latency_ms=result.latency_ms,
+                        outcome=result.outcome.value,
+                        http_status=result.http_status,
+                        error_class=result.error_class,
+                        error_message=result.error_message,
+                        chars=result.chars,
+                        audio_bytes=result.audio_bytes,
+                        audio_duration_s=result.audio_duration_s,
+                        rtf=result.rtf,
+                        in_flight_at_dispatch=before,
+                        instance_count=instance_counts.get(),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - a raising transport must not vanish
+                # The transport classifies its own failures, so reaching here means
+                # something outside that contract broke. Recorded rather than
+                # swallowed: an unrecorded request is one the step held a worker for
+                # and cannot account for, which breaks the reconciliation that makes
+                # `Q + E = N` checkable from the artifact.
+                logger.error("Worker {} seq={} raised: {}", worker_index, seq, exc)
+                _record(
+                    LoadEvent(
+                        run_id=run_id,
+                        step_index=step_index,
+                        seq=seq,
+                        worker_index=worker_index,
+                        concurrency=concurrency,
+                        model=model,
+                        endpoint=endpoint,
+                        dispatch_ts=dispatch_wall,
+                        first_byte_ts=None,
+                        end_ts=clock.time(),
+                        ttfab_ms=None,
+                        latency_ms=None,
+                        outcome=InvokeOutcome.ERROR.value,
+                        http_status=None,
+                        error_class=type(exc).__name__,
+                        error_message=str(exc),
+                        chars=len(text),
+                        audio_bytes=0,
+                        audio_duration_s=0.0,
+                        rtf=None,
+                        in_flight_at_dispatch=before,
+                        instance_count=instance_counts.get(),
+                    )
+                )
+            finally:
+                in_flight.release()
 
     monitor = threading.Thread(target=_monitor, name=f"loadgen-monitor-{step_index}", daemon=True)
     monitor.start()
 
     logger.info(
-        "Step {}: {} arrivals at {:.2f} rps over {:.0f}s ({} arrivals)",
+        "Step {}: holding {} outstanding request(s) for {:.0f}s",
         step_index,
-        len(offsets),
-        offered_rps,
+        concurrency,
         duration_s,
-        arrival,
     )
 
+    # Plain threads rather than a pool: each worker runs one long serial loop, so
+    # there is nothing for a pool's queue to schedule, and `N` threads is exactly
+    # `N` outstanding requests with no bookkeeping in between. All N start together,
+    # which is a burst the caller's warm-up window is there to discard.
+    workers = [
+        threading.Thread(target=_worker, args=(i,), name=f"loadgen-{step_index}-{i}", daemon=True)
+        for i in range(concurrency)
+    ]
     try:
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="loadgen") as pool:
-            for seq, offset in enumerate(offsets):
-                if abort.is_set():
-                    break
-                # Sleep against the absolute target, so a late dispatch does not
-                # push every later arrival later too.
-                remaining = (t0_mono + offset) - clock.monotonic()
-                if remaining > 0:
-                    clock.sleep(remaining)
-
-                scheduled_wall = _wall_for(offset)
-                text = texts[seq % len(texts)]
-
-                if in_flight.value >= max_workers:
-                    # Never block here: waiting for a worker is exactly the
-                    # response-gated dispatch this module exists to avoid.
-                    _record(
-                        LoadEvent(
-                            run_id=run_id,
-                            step_index=step_index,
-                            seq=seq,
-                            offered_rps=offered_rps,
-                            model=model,
-                            endpoint=endpoint,
-                            scheduled_ts=scheduled_wall,
-                            dispatch_ts=None,
-                            first_byte_ts=None,
-                            end_ts=None,
-                            dispatch_delay_ms=None,
-                            ttfab_ms=None,
-                            latency_ms=None,
-                            outcome=InvokeOutcome.DISPATCH_SKIPPED.value,
-                            http_status=None,
-                            error_class=None,
-                            error_message=f"no free worker of {max_workers}",
-                            chars=len(text),
-                            audio_bytes=0,
-                            audio_duration_s=0.0,
-                            rtf=None,
-                            in_flight_at_dispatch=in_flight.value,
-                            instance_count=instance_counts.get(),
-                        )
-                    )
-                    continue
-
-                before = in_flight.acquire()
-                pool.submit(_worker, seq, text, scheduled_wall, before)
-            # Exiting the `with` joins the pool: in-flight requests are allowed
-            # to finish so their latencies are not truncated.
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
     finally:
         done.set()
         monitor.join(timeout=max(monitor_interval_s * 3, 1.0))
@@ -737,31 +779,28 @@ def run_step(
     result = StepResult(
         run_id=run_id,
         step_index=step_index,
-        offered_rps=offered_rps,
+        concurrency=concurrency,
         model=model,
         endpoint=endpoint,
-        arrival_process=str(ArrivalProcess(arrival)),
-        seed=seed,
         started_ts=t0_wall,
         ended_ts=ended_wall,
-        scheduled_count=len(offsets),
         events=sorted(events, key=lambda e: e.seq),
         samples=list(samples),
     )
 
     if result.capacity_changed:
         logger.warning(
-            "Step {}: instance count changed mid-run {} — excluded from knee fitting",
+            "Step {}: instance count changed mid-run {} — excluded from the ladder",
             step_index,
             result.instance_counts,
         )
-    if result.dispatch_skipped:
-        logger.warning(
-            "Step {}: {}/{} dispatches skipped (max_workers={}); the client, not the "
-            "server, was the limit",
+    overlaps = result.worker_overlaps
+    if overlaps:
+        logger.error(
+            "Step {}: {} overlapping request(s) on a single worker; outstanding "
+            "requests exceeded the requested concurrency of {}",
             step_index,
-            result.dispatch_skipped,
-            result.scheduled_count,
-            max_workers,
+            overlaps,
+            concurrency,
         )
     return result

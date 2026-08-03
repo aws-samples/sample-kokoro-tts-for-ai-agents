@@ -345,7 +345,6 @@ class TestOutcomeEnum:
             "server_5xx",
             "model_error",
             "client_timeout",
-            "dispatch_skipped",
             "error",
         }
 

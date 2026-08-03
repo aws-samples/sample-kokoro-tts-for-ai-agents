@@ -6,15 +6,15 @@ both distort measurements:
 1. That client builds boto3 clients with no ``botocore.Config``, so
    ``max_pool_connections`` defaults to 10. Above ten in-flight streams urllib3
    silently queues connections, and the benchmark measures the client's
-   connection pool instead of the server's concurrency ceiling.
-2. boto3 retries by default. Retries fabricate load exactly when the server is
-   saturated, inflating the offered rate and hiding errors behind eventual
-   successes — the two things a saturation measurement most needs to be honest
-   about.
+   connection pool instead of the server's queue.
+2. boto3 retries by default. A retry turns one measured request into several
+   attempts under one latency, and hides the failure behind an eventual success
+   — so a saturating endpoint reports as slow rather than as saturated, which is
+   the distinction the whole measurement rests on.
 
 Nothing here is swallowed: every request resolves to exactly one
 :class:`InvokeOutcome`, so a run's totals always reconcile against the requests
-that were scheduled.
+it dispatched.
 """
 
 from __future__ import annotations
@@ -68,13 +68,6 @@ class InvokeOutcome(StrEnum):
 
     CLIENT_TIMEOUT = "client_timeout"
     """We stopped waiting. Not evidence the server failed."""
-
-    DISPATCH_SKIPPED = "dispatch_skipped"
-    """No worker was free at the scheduled arrival time; never sent.
-
-    Set by the load generator, not here. Its presence means the *client* ran out
-    of capacity, so any saturation conclusion from that step is unsafe.
-    """
 
     ERROR = "error"
     """Unclassified. Investigate rather than aggregate."""
