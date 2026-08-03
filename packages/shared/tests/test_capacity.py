@@ -6,31 +6,20 @@ here means the plan output stopped matching the documented reasoning.
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from shared.capacity import (
-    CLOUDWATCH_HIGH_RES_PERIOD_S,
-    DEFAULT_DERATE,
     SAGEMAKER_INVOCATION_CEILING_S,
-    c_slo_cap,
-    c_target,
-    effective_c_target,
-    effective_headroom_lag_s,
     fits_invocation_ceiling,
     fits_slo,
-    lambda_cap_per_instance,
     max_added_wait_under_ceiling,
-    min_samples_for_k,
     n_instances,
     n_instances_from_streams,
-    q_per_instance,
-    queue_covers_surge,
     request_deadline_s,
+    scale_thresholds,
+    shed_probability,
     slo_is_feasible,
-    utilization_at_k,
-    w_absorbed,
+    utilization_for_occupancy,
     w_max_for_slo,
 )
 
@@ -40,60 +29,16 @@ from shared.capacity import (
 KOKORO_S_MEAN_S = 0.10602401316328536
 KOKORO_S_P95_S = 0.1645768812391907
 
+#: Service time from the latency-vs-queue-position fit on the same artifact:
+#: TTFAB(q) = 33.9ms + (q+1) x 57.5ms, R^2 0.9998 over 32,960 OK events. Distinct
+#: from KOKORO_S_MEAN_S, which conflates 34ms of client RTT with 59ms of service --
+#: the reason the queueing math takes this number and not that one.
+KOKORO_SERVICE_S = 0.0575
 
-class TestCTarget:
-    def test_k_of_one_is_just_the_derate(self) -> None:
-        # Flat traffic needs no surge reserve, only the jitter margin.
-        assert c_target(8.0, k=1.0, derate=1.0) == 8.0
-        assert c_target(8.0, k=1.0) == pytest.approx(7.0)
-
-    @pytest.mark.parametrize(
-        ("k", "expected_fraction"),
-        [(1.0, 1.0), (2.0, 0.5), (3.0, 1 / 3), (4.0, 0.25), (5.0, 0.2)],
-    )
-    def test_reserves_one_over_k(self, k: float, expected_fraction: float) -> None:
-        # The headline result: doubling traffic within one T_total means running
-        # each instance at half its ceiling.
-        assert c_target(100.0, k=k, derate=1.0) == pytest.approx(100.0 * expected_fraction)
-
-    def test_worked_example_from_methodology(self) -> None:
-        # C_max = 8, k_p99 = 2, derate = 0.875 -> C_target = 3.5
-        assert c_target(8.0, k=2.0) == pytest.approx(3.5)
-
-    def test_kokoro_case_c_max_one(self) -> None:
-        # C_max=1 with k=2 yields a fractional target, which is exactly why
-        # ModelEndpointConfig.scaling_target_value must be a float, not an int.
-        assert c_target(1.0, k=2.0) == pytest.approx(0.4375)
-
-    @pytest.mark.parametrize(
-        ("c_max", "k", "derate"),
-        [
-            (0.0, 2.0, 0.875),  # no measured ceiling
-            (-1.0, 2.0, 0.875),
-            (8.0, 0.5, 0.875),  # k<1 would target above the knee
-            (8.0, 2.0, 0.0),  # derate of zero means never send traffic
-            (8.0, 2.0, 1.5),  # derate above 1 targets past the knee
-        ],
-    )
-    def test_rejects_nonsense_inputs(self, c_max: float, k: float, derate: float) -> None:
-        with pytest.raises(ValueError):
-            c_target(c_max, k, derate)
-
-
-class TestCSloCap:
-    def test_wait_budget_of_zero_allows_only_the_running_request(self) -> None:
-        assert c_slo_cap(0.0, s_mean_s=0.5) == pytest.approx(1.0)
-
-    def test_budget_of_four_service_times_allows_five_deep(self) -> None:
-        assert c_slo_cap(2.0, s_mean_s=0.5) == pytest.approx(5.0)
-
-    def test_rejects_nonpositive_service_time(self) -> None:
-        with pytest.raises(ValueError):
-            c_slo_cap(2.0, s_mean_s=0.0)
-
-    def test_rejects_negative_wait_budget(self) -> None:
-        with pytest.raises(ValueError):
-            c_slo_cap(-1.0, s_mean_s=0.5)
+#: Q_max = W_max / service at the 3s SLO, and T_total from the 07-31 activity
+#: history (3m51s). The pair the worked examples below use.
+KOKORO_Q_MAX = 50.0
+KOKORO_T_TOTAL_S = 231.0
 
 
 class TestWMaxForSlo:
@@ -112,8 +57,8 @@ class TestWMaxForSlo:
         assert mean_budget - tail_budget == pytest.approx(KOKORO_S_P95_S - KOKORO_S_MEAN_S)
 
     def test_a_tight_slo_leaves_almost_no_queue(self) -> None:
-        # Why the old 300ms budget was never an end-to-end number: 135ms of slack
-        # is barely one service time, so the queue is not a queue.
+        # Why the deleted 300ms budget was never an end-to-end number: 135ms of
+        # slack is barely one service time, so the queue is not a queue.
         assert w_max_for_slo(0.3, KOKORO_S_P95_S) == pytest.approx(0.135, abs=1e-3)
 
     def test_clamps_at_zero_rather_than_going_negative(self) -> None:
@@ -153,8 +98,8 @@ class TestFitsSlo:
 
     def test_the_deployed_kokoro_config_misses_the_three_second_slo(self) -> None:
         # The regression this function exists for. max_added_wait_s=20.0 shipped
-        # beside ttfab_budget_ms=300 and nothing related them, so a request using
-        # its full queue allowance took ~20.2s to first byte.
+        # beside a 300ms budget and nothing related them, so a request using its
+        # full queue allowance took ~20.2s to first byte.
         fits, deadline = fits_slo(20.0, KOKORO_S_P95_S, slo_s=3.0)
         assert not fits
         assert deadline == pytest.approx(20.165, abs=1e-3)
@@ -186,53 +131,281 @@ class TestFitsSlo:
             fits_slo(2.0, KOKORO_S_P95_S, slo_s=0.0)
 
 
-class TestSloAndQueueDepthTogether:
-    """The end-to-end consequence: what the derived budget does to ``Q_max``."""
+class TestScaleThresholds:
+    """The two derived numbers, from ``Q_max`` and the chosen surge ratio."""
 
-    def test_the_three_second_slo_shrinks_the_queue_sevenfold(self) -> None:
-        # Deployed queue_max_depth was 296, derived from the wrong W_max. At the
-        # SLO-derived budget the same C_max gives ~30.
-        w = w_max_for_slo(3.0, KOKORO_S_P95_S)
-        derived = q_per_instance(1.153, KOKORO_S_MEAN_S, w)
-        shipped = q_per_instance(1.153, KOKORO_S_MEAN_S, 20.0)
-        assert derived == 30
-        assert shipped == 217
-        assert shipped > derived * 7
+    def test_the_worked_example(self) -> None:
+        # The plan's headline: Q_max 50 at a 1.25 surge ratio gives 37.5 and 25.0,
+        # and 2->1 scale-in is unsafe so the smallest safe fleet is 3.
+        out = scale_thresholds(KOKORO_Q_MAX, 1.25)
+        assert out.c_scale_max == pytest.approx(37.5)
+        assert out.c_scale_min == pytest.approx(25.0)
+        assert out.min_safe_instances == 3
 
-    def test_the_wait_budget_does_not_bind_c_target_at_three_seconds(self) -> None:
-        # Worth pinning because it is counterintuitive: loosening the SLO from
-        # 300ms to 3s does not move the tracked target at all. c_slo_cap lands at
-        # ~27.7, far above any measured kokoro knee, so surge headroom still binds
-        # and only the queue depth changes.
-        w = w_max_for_slo(3.0, KOKORO_S_P95_S)
-        assert c_slo_cap(w, KOKORO_S_MEAN_S) == pytest.approx(27.7, abs=0.1)
-        for c_max in (1.153, 1.392, 1.790):
-            _, binding = effective_c_target(
-                c_max, k=2.0, s_mean_s=KOKORO_S_MEAN_S, max_added_wait_s=w
-            )
-            assert binding == "surge_headroom"
+    def test_unpacks_positionally_in_order(self) -> None:
+        # Callers unpack this straight into a deployed policy, so the order is
+        # part of the contract: out, then in, then the fleet floor.
+        c_out, c_in, n = scale_thresholds(KOKORO_Q_MAX, 1.25)
+        assert (c_out, c_in, n) == (37.5, 25.0, 3)
+
+    def test_flat_traffic_needs_no_headroom_at_all(self) -> None:
+        # k=1.0 is "no surge expected": both thresholds sit at Q_max, which is the
+        # degenerate policy of running the queue right up to the SLO line.
+        out = scale_thresholds(KOKORO_Q_MAX, 1.0)
+        assert out.c_scale_max == pytest.approx(KOKORO_Q_MAX)
+        assert out.c_scale_min == pytest.approx(KOKORO_Q_MAX)
+        # Coincident thresholds mean every scale-in immediately re-triggers
+        # scale-out, so there is no safe fleet size to report rather than a
+        # large-but-finite one.
+        assert out.min_safe_instances is None
+
+    def test_scale_out_is_always_above_scale_in(self) -> None:
+        # The property that keeps the policy from fighting itself. Asserted across
+        # the whole legal range because a transposition here deploys as an endpoint
+        # that scales in and out on the same datapoint.
+        for k in (1.0, 1.05, 1.1, 1.25, 1.4, 1.49):
+            out = scale_thresholds(KOKORO_Q_MAX, k)
+            assert out.c_scale_max >= out.c_scale_min
+
+    def test_both_thresholds_stay_inside_q_max(self) -> None:
+        # Neither may exceed the measured SLO limit: a threshold above Q_max is a
+        # policy that only reacts after the promise is already broken.
+        for k in (1.0, 1.25, 1.49):
+            out = scale_thresholds(KOKORO_Q_MAX, k)
+            assert out.c_scale_max <= KOKORO_Q_MAX
+            assert out.c_scale_min <= KOKORO_Q_MAX
+
+    def test_a_bigger_surge_ratio_triggers_earlier(self) -> None:
+        # Monotone in the chosen ratio, in both thresholds. Expecting more surge
+        # can only make the policy more eager, never less.
+        ks = [1.0, 1.1, 1.25, 1.4]
+        outs = [scale_thresholds(KOKORO_Q_MAX, k) for k in ks]
+        assert [o.c_scale_max for o in outs] == sorted((o.c_scale_max for o in outs), reverse=True)
+        assert [o.c_scale_min for o in outs] == sorted((o.c_scale_min for o in outs), reverse=True)
+
+    def test_scales_linearly_with_q_max(self) -> None:
+        # Both are fractions of Q_max and nothing else, so a rerun that doubles
+        # Q_max on a bigger instance doubles both. This is what makes the tooling
+        # a rerun rather than a re-derivation.
+        small = scale_thresholds(25.0, 1.25)
+        large = scale_thresholds(50.0, 1.25)
+        assert large.c_scale_max == pytest.approx(2 * small.c_scale_max)
+        assert large.c_scale_min == pytest.approx(2 * small.c_scale_min)
+        assert large.min_safe_instances == small.min_safe_instances
+
+    def test_min_safe_instances_is_the_fleet_where_scale_in_stops_flapping(self) -> None:
+        # Removing 1 of N multiplies survivors' concurrency by N/(N-1). The
+        # reported N is the smallest where that lands strictly under the scale-out
+        # threshold, and N-1 must genuinely fail -- otherwise the number is just
+        # conservative rather than minimal.
+        out = scale_thresholds(KOKORO_Q_MAX, 1.25)
+        n = out.min_safe_instances
+        assert n is not None
+        assert out.c_scale_min * n / (n - 1) <= out.c_scale_max
+        assert out.c_scale_min * (n - 1) / (n - 2) > out.c_scale_max
+
+    def test_the_two_to_one_case_lands_exactly_on_q_max(self) -> None:
+        # Limit #2 from the plan, pinned numerically: kokoro runs min_instances=1,
+        # so 2->1 is the common case and it breaches the SLO on the way down.
+        out = scale_thresholds(KOKORO_Q_MAX, 1.25)
+        assert out.c_scale_min * 2 / 1 == pytest.approx(KOKORO_Q_MAX)
+
+    def test_the_three_to_two_case_lands_exactly_on_the_scale_out_threshold(self) -> None:
+        # The other half of limit #2: 3->2 does not breach the SLO but re-triggers
+        # scale-out immediately, which is a flap rather than an outage.
+        out = scale_thresholds(KOKORO_Q_MAX, 1.25)
+        assert out.c_scale_min * 3 / 2 == pytest.approx(out.c_scale_max)
+
+    def test_a_gentler_surge_ratio_needs_a_bigger_fleet_to_scale_in_safely(self) -> None:
+        # Counterintuitive and worth pinning: expecting *less* surge makes scale-in
+        # harder, not easier. Safety depends on the ratio between the thresholds,
+        # and a small h puts them nearly on top of each other -- at h=0.05 they are
+        # 47.5 and 45.0, a ratio of 1.056, so N/(N-1) only fits from N=19 up.
+        assert scale_thresholds(KOKORO_Q_MAX, 1.05).min_safe_instances == 19
+        assert scale_thresholds(KOKORO_Q_MAX, 1.25).min_safe_instances == 3
+
+    def test_min_safe_instances_falls_as_the_surge_ratio_grows(self) -> None:
+        # The same fact as monotonicity, so a plan that loosens the ratio to make
+        # scale-in safe is doing something real rather than coincidental.
+        fleets = [
+            scale_thresholds(KOKORO_Q_MAX, k).min_safe_instances for k in (1.05, 1.1, 1.25, 1.4)
+        ]
+        assert fleets == [19, 9, 3, 2]
+
+    def test_a_fleet_exactly_on_the_boundary_counts_as_safe(self) -> None:
+        # N/(N-1) <= r is inclusive, and the exact cases are the ones float error
+        # would silently round the wrong way. At h=0.1 the thresholds are 45 and 40,
+        # so 9 -> 8 lands on 45.0 exactly; reporting 10 here would pad the fleet on
+        # nothing but representation error.
+        out = scale_thresholds(KOKORO_Q_MAX, 1.1)
+        assert out.min_safe_instances == 9
+        assert out.c_scale_min * 9 / 8 == pytest.approx(out.c_scale_max)
+
+    def test_never_claims_a_single_instance_fleet_is_safe(self) -> None:
+        # N=1 has no scale-in to be safe about (min_instances floors at 1 on
+        # SageMaker), and N/(N-1) is undefined there. Floored at 2 so the number
+        # is always a fleet you can actually remove an instance from.
+        for k in (1.0001, 1.01, 1.05, 1.25, 1.49):
+            out = scale_thresholds(KOKORO_Q_MAX, k)
+            assert out.min_safe_instances is None or out.min_safe_instances >= 2
+
+    def test_rejects_a_shrinking_surge(self) -> None:
+        with pytest.raises(ValueError, match=">= 1"):
+            scale_thresholds(KOKORO_Q_MAX, 0.9)
+
+    def test_refuses_a_ratio_that_would_disable_scale_in(self) -> None:
+        # At h=0.5 the scale-in threshold reaches zero and beyond it goes
+        # negative, which deploys as a policy that never scales in -- refused
+        # rather than clamped, since a clamped 0.0 looks like a real threshold.
+        with pytest.raises(ValueError, match="never scales in"):
+            scale_thresholds(KOKORO_Q_MAX, 1.5)
+        with pytest.raises(ValueError, match="never scales in"):
+            scale_thresholds(KOKORO_Q_MAX, 2.0)
+
+    @pytest.mark.parametrize("q_max", [0.0, -1.0])
+    def test_rejects_a_nonpositive_q_max(self, q_max: float) -> None:
+        with pytest.raises(ValueError):
+            scale_thresholds(q_max, 1.25)
 
 
-class TestEffectiveCTarget:
-    def test_surge_headroom_binds_for_a_fast_model(self) -> None:
-        # S=0.12s (Kokoro-ish): the wait budget permits ~17 deep, so the
-        # k-derated knee is the tighter constraint.
-        target, binding = effective_c_target(c_max=8.0, k=2.0, s_mean_s=0.12, max_added_wait_s=2.0)
-        assert binding == "surge_headroom"
-        assert target == pytest.approx(3.5)
+class TestUtilizationForOccupancy:
+    """Occupancy read as load, which is the step that makes ``Q_max`` interpretable."""
 
-    def test_slo_budget_binds_for_a_slow_model(self) -> None:
-        # S=4s: two seconds of added wait cannot cover even one queued request,
-        # so the wait budget binds regardless of how high the knee sits.
-        target, binding = effective_c_target(c_max=16.0, k=2.0, s_mean_s=4.0, max_added_wait_s=2.0)
-        assert binding == "slo_wait_budget"
-        assert target == pytest.approx(1.5)
+    def test_the_textbook_pairs(self) -> None:
+        # rho = L/(1+L): occupancy 1 is half utilized, 4 is 80%, 9 is 90%.
+        assert utilization_for_occupancy(1.0) == pytest.approx(0.5)
+        assert utilization_for_occupancy(4.0) == pytest.approx(0.8)
+        assert utilization_for_occupancy(9.0) == pytest.approx(0.9)
 
-    def test_takes_the_smaller_of_the_two(self) -> None:
-        for s_mean in (0.05, 0.5, 1.0, 4.0, 20.0):
-            target, _ = effective_c_target(c_max=8.0, k=2.0, s_mean_s=s_mean, max_added_wait_s=2.0)
-            assert target <= c_target(8.0, 2.0) + 1e-9
-            assert target <= c_slo_cap(2.0, s_mean) + 1e-9
+    def test_the_derived_scale_out_threshold_is_97_percent_utilized(self) -> None:
+        # Limit #1 from the plan. "Three quarters of Q_max" sounds like three
+        # quarters of the way to trouble; it is 0.974 utilization.
+        c_scale_max = scale_thresholds(KOKORO_Q_MAX, 1.25).c_scale_max
+        assert utilization_for_occupancy(c_scale_max) == pytest.approx(0.974, abs=1e-3)
+
+    def test_eighty_percent_utilization_is_eight_percent_of_q_max(self) -> None:
+        # The same fact from the other direction: rho=0.80 is occupancy 4, i.e.
+        # 8% of a Q_max of 50. Depth is exponentially sensitive to utilization.
+        assert utilization_for_occupancy(4.0) == pytest.approx(0.8)
+        assert 4.0 / KOKORO_Q_MAX == pytest.approx(0.08)
+
+    def test_an_idle_queue_is_unutilized(self) -> None:
+        assert utilization_for_occupancy(0.0) == 0.0
+
+    def test_approaches_but_never_reaches_saturation(self) -> None:
+        # An observed occupancy cannot express rho >= 1: a queue at critical load
+        # has no steady-state mean to have measured in the first place.
+        assert utilization_for_occupancy(1e6) < 1.0
+        assert utilization_for_occupancy(1e6) > 0.999
+
+    def test_rejects_negative_occupancy(self) -> None:
+        with pytest.raises(ValueError):
+            utilization_for_occupancy(-1.0)
+
+
+class TestShedProbability:
+    """P(the queue breaches ``Q_max``) while waiting out one ``T_total``."""
+
+    def test_reproducible_on_a_fixed_seed(self) -> None:
+        # The number goes into a published plan beside the artifact it came from,
+        # so it has to be recomputable from the seed alone.
+        args = (20.0, KOKORO_Q_MAX, 60.0, KOKORO_SERVICE_S)
+        assert shed_probability(*args, seed=7) == shed_probability(*args, seed=7)
+
+    def test_a_different_seed_is_a_different_sample(self) -> None:
+        # Guards against a simulation that silently ignores its randomness and
+        # would report the same figure for every input.
+        args = (20.0, KOKORO_Q_MAX, 60.0, KOKORO_SERVICE_S)
+        samples = {shed_probability(*args, seed=s) for s in range(6)}
+        assert len(samples) > 1
+
+    def test_does_not_disturb_the_global_random_stream(self) -> None:
+        # A private Random instance, so a caller that seeded the module-global
+        # generator gets the same sequence back afterwards -- and, conversely,
+        # cannot change a published number by reseeding.
+        import random
+
+        random.seed(99)
+        expected = [random.random() for _ in range(3)]
+        random.seed(99)
+        shed_probability(20.0, KOKORO_Q_MAX, 60.0, KOKORO_SERVICE_S, seed=1)
+        assert [random.random() for _ in range(3)] == expected
+
+    def test_monotone_in_occupancy(self) -> None:
+        # The load-bearing property: starting closer to Q_max cannot make a breach
+        # less likely. Checked on one seed so the comparison is paired.
+        probs = [
+            shed_probability(occ, KOKORO_Q_MAX, KOKORO_T_TOTAL_S, KOKORO_SERVICE_S, seed=3)
+            for occ in (1.0, 4.0, 10.0, 20.0, 30.0, 37.5)
+        ]
+        assert probs == sorted(probs)
+
+    def test_an_idle_queue_never_sheds(self) -> None:
+        assert shed_probability(0.0, KOKORO_Q_MAX, KOKORO_T_TOTAL_S, KOKORO_SERVICE_S) == 0.0
+
+    def test_starting_at_or_above_q_max_has_already_shed(self) -> None:
+        # No simulation needed, and reported as certainty rather than as a sample
+        # that happened to hit on the first step.
+        assert shed_probability(50.0, KOKORO_Q_MAX, 60.0, KOKORO_SERVICE_S) == 1.0
+        assert shed_probability(80.0, KOKORO_Q_MAX, 60.0, KOKORO_SERVICE_S) == 1.0
+
+    def test_no_time_to_wait_means_nothing_can_go_wrong(self) -> None:
+        # T_total of zero is an instance that arrives instantly; the threshold
+        # question disappears with it.
+        assert shed_probability(37.5, KOKORO_Q_MAX, 0.0, KOKORO_SERVICE_S) == 0.0
+
+    def test_monotone_in_t_total(self) -> None:
+        # A slower scale-out cannot make a breach less likely, which is why
+        # T_total has to be measured rather than assumed.
+        probs = [
+            shed_probability(30.0, KOKORO_Q_MAX, t, KOKORO_SERVICE_S, seed=5)
+            for t in (1.0, 10.0, 60.0, 240.0)
+        ]
+        assert probs == sorted(probs)
+
+    def test_the_derived_threshold_is_a_coin_flip_or_worse(self) -> None:
+        # Limit #1, made falsifiable: scaling out at 0.75 x Q_max and then waiting
+        # a measured 231s breaches the SLO more often than not. This is the number
+        # the surge_survival finding reports.
+        p = shed_probability(37.5, KOKORO_Q_MAX, KOKORO_T_TOTAL_S, KOKORO_SERVICE_S, seed=1234)
+        assert p > 0.5
+
+    def test_a_low_utilization_threshold_survives_the_same_lag(self) -> None:
+        # The contrast that makes the finding actionable rather than fatalistic:
+        # same Q_max, same T_total, trigger at rho=0.80 instead, and the breach
+        # becomes rare. Not zero -- Poisson variance never gives a free pass.
+        p = shed_probability(4.0, KOKORO_Q_MAX, KOKORO_T_TOTAL_S, KOKORO_SERVICE_S, seed=1234)
+        assert p < 0.1
+
+    def test_a_deeper_queue_absorbs_more(self) -> None:
+        # Monotone in Q_max at fixed occupancy: more slots between the trigger and
+        # the SLO line can only help.
+        shallow = shed_probability(10.0, 20.0, 60.0, KOKORO_SERVICE_S, seed=11)
+        deep = shed_probability(10.0, 200.0, 60.0, KOKORO_SERVICE_S, seed=11)
+        assert deep <= shallow
+
+    def test_trials_bound_the_resolution(self) -> None:
+        # A probability is always a multiple of 1/trials, which is the honest
+        # precision of the number and worth pinning so a caller reading four
+        # decimal places knows better.
+        p = shed_probability(20.0, KOKORO_Q_MAX, 60.0, KOKORO_SERVICE_S, seed=2, trials=10)
+        assert p * 10 == pytest.approx(round(p * 10))
+
+    @pytest.mark.parametrize(
+        ("occ", "q_max", "t_total", "service", "trials"),
+        [
+            (-1.0, 50.0, 60.0, 0.0575, 200),  # negative occupancy
+            (20.0, 0.0, 60.0, 0.0575, 200),  # no queue to breach
+            (20.0, 50.0, -1.0, 0.0575, 200),  # negative lag
+            (20.0, 50.0, 60.0, 0.0, 200),  # instantaneous service
+            (20.0, 50.0, 60.0, 0.0575, 0),  # no trials to average
+        ],
+    )
+    def test_rejects_nonsense_inputs(
+        self, occ: float, q_max: float, t_total: float, service: float, trials: int
+    ) -> None:
+        with pytest.raises(ValueError):
+            shed_probability(occ, q_max, t_total, service, trials=trials)
 
 
 class TestNInstances:
@@ -252,9 +425,13 @@ class TestNInstances:
         # an instance is required for no traffic.
         assert n_instances(0.0, s_mean_s=0.12, target_concurrency=3.5) == 0
 
-    def test_kokoro_fractional_target(self) -> None:
-        # C_target=0.4375 with S=0.12s: each instance sustains ~3.6 rps.
-        assert n_instances(30.0, s_mean_s=0.12, target_concurrency=0.4375) == 9
+    def test_divides_by_the_derived_scale_out_threshold(self) -> None:
+        # The target is C_scale_max now, not a C_max derivative: that is the
+        # concurrency the deployed policy actually holds each instance at, so it
+        # is what the fleet size has to be computed against.
+        c_scale_max = scale_thresholds(KOKORO_Q_MAX, 1.25).c_scale_max
+        assert n_instances(450.0, KOKORO_SERVICE_S, c_scale_max) == 1
+        assert n_instances(45000.0, KOKORO_SERVICE_S, c_scale_max) == 69
 
     @pytest.mark.parametrize(
         ("rate", "s_mean", "target"),
@@ -276,141 +453,6 @@ class TestNInstancesFromStreams:
 
     def test_zero_streams_needs_none(self) -> None:
         assert n_instances_from_streams(0.0, target_concurrency=3.5) == 0
-
-
-class TestLambdaCap:
-    def test_littles_law_rearranged(self) -> None:
-        assert lambda_cap_per_instance(1.0, s_mean_s=0.12) == pytest.approx(8.333, abs=1e-3)
-
-    def test_kokoro_measured_ceiling(self) -> None:
-        # C_max=1 at S=0.12s is the ~8.3 rps that the closed-loop harness
-        # mistook for a plateau at concurrency 4.
-        assert lambda_cap_per_instance(1.0, 0.12) == pytest.approx(25.0 / 3.0)
-
-
-class TestQPerInstance:
-    def test_depth_is_a_time_budget(self) -> None:
-        # 8.33 rps drain rate x 2s of slack = 16 slots.
-        assert q_per_instance(1.0, s_mean_s=0.12, max_added_wait_s=2.0) == 16
-
-    def test_rounds_down(self) -> None:
-        # 10 rps x 0.55s = 5.5 -> 5. A slot that cannot drain in time is worse
-        # than a rejection: the client waits and fails anyway.
-        assert q_per_instance(1.0, s_mean_s=0.1, max_added_wait_s=0.55) == 5
-
-    def test_zero_wait_budget_means_no_queue(self) -> None:
-        assert q_per_instance(1.0, s_mean_s=0.12, max_added_wait_s=0.0) == 0
-
-    def test_sagemaker_ceiling_case(self) -> None:
-        # W_max=50s (under the 60s invocation limit) on Kokoro allows a deep
-        # queue — this is why the queue can cover a doubling here.
-        assert q_per_instance(1.0, s_mean_s=0.12, max_added_wait_s=50.0) == 416
-
-
-class TestWAbsorbed:
-    def test_flat_traffic_covers_any_lag(self) -> None:
-        assert w_absorbed(2.0, k=1.0) == math.inf
-
-    def test_doubling_consumes_slack_at_wall_clock_rate(self) -> None:
-        # Worked example: W_max=2s, k=2 -> W_absorbed=2s.
-        assert w_absorbed(2.0, k=2.0) == pytest.approx(2.0)
-
-    def test_tripling_halves_the_absorbed_lag(self) -> None:
-        assert w_absorbed(2.0, k=3.0) == pytest.approx(1.0)
-
-    def test_sagemaker_ceiling_absorbs_a_doubling(self) -> None:
-        # The load-bearing fact for our queue design: 50s of slack covers a
-        # doubling for 50s, which exceeds a T_total we can plausibly reach.
-        assert w_absorbed(50.0, k=2.0) == pytest.approx(50.0)
-
-    def test_rejects_k_below_one(self) -> None:
-        with pytest.raises(ValueError):
-            w_absorbed(2.0, k=0.5)
-
-
-class TestQueueCoversSurge:
-    def test_true_when_slack_exceeds_lag(self) -> None:
-        assert queue_covers_surge(max_added_wait_s=50.0, k=2.0, t_total_s=45.0)
-
-    def test_false_when_lag_exceeds_slack(self) -> None:
-        assert not queue_covers_surge(max_added_wait_s=50.0, k=2.0, t_total_s=180.0)
-
-    def test_boundary_is_inclusive(self) -> None:
-        assert queue_covers_surge(max_added_wait_s=50.0, k=2.0, t_total_s=50.0)
-
-    def test_tighter_at_higher_k(self) -> None:
-        # Same 50s budget, same 45s lag: covers k=2, fails k=3.
-        assert queue_covers_surge(50.0, k=2.0, t_total_s=45.0)
-        assert not queue_covers_surge(50.0, k=3.0, t_total_s=45.0)
-
-    def test_matches_the_closed_form(self) -> None:
-        # W_max >= (k-1) x T_total, stated directly.
-        for k in (2.0, 3.0, 5.0):
-            for t_total in (10.0, 45.0, 120.0):
-                expected = 50.0 >= (k - 1) * t_total
-                assert queue_covers_surge(50.0, k, t_total) is expected
-
-
-class TestEffectiveHeadroomLag:
-    def test_queue_covering_everything_floors_at_metric_period(self) -> None:
-        lag, floored = effective_headroom_lag_s(50.0, k=2.0, t_total_s=45.0)
-        assert floored is True
-        assert lag == CLOUDWATCH_HIGH_RES_PERIOD_S
-
-    def test_uncovered_remainder_is_reported(self) -> None:
-        # 2s of slack at k=2 absorbs 2s of a 180s lag.
-        lag, floored = effective_headroom_lag_s(2.0, k=2.0, t_total_s=180.0)
-        assert floored is False
-        assert lag == pytest.approx(178.0)
-
-    def test_flat_traffic_needs_no_standing_headroom(self) -> None:
-        lag, floored = effective_headroom_lag_s(2.0, k=1.0, t_total_s=180.0)
-        assert floored is True
-        assert lag == CLOUDWATCH_HIGH_RES_PERIOD_S
-
-    def test_never_returns_below_the_floor(self) -> None:
-        for t_total in (0.0, 1.0, 9.9, 10.0, 60.0):
-            lag, _ = effective_headroom_lag_s(2.0, k=2.0, t_total_s=t_total)
-            assert lag >= CLOUDWATCH_HIGH_RES_PERIOD_S
-
-
-class TestUtilizationAtK:
-    def test_headroom_is_the_cost_of_surge_tolerance(self) -> None:
-        assert utilization_at_k(1.0, derate=1.0) == pytest.approx(1.0)
-        assert utilization_at_k(2.0, derate=1.0) == pytest.approx(0.5)
-        assert utilization_at_k(5.0, derate=1.0) == pytest.approx(0.2)
-
-    def test_k_of_five_is_the_stop_and_rethink_signal(self) -> None:
-        # ~17% utilization: six instances paid for per instance of load. This is
-        # the number the report cites when recommending against autoscaling as
-        # the primary tool.
-        assert utilization_at_k(5.0) == pytest.approx(0.175)
-
-    def test_is_the_inverse_of_the_c_target_derating(self) -> None:
-        for k in (1.0, 2.0, 3.0, 4.0):
-            assert utilization_at_k(k) == pytest.approx(c_target(1.0, k) / 1.0)
-
-
-class TestMinSamplesForK:
-    def test_counts_whole_windows(self) -> None:
-        assert min_samples_for_k(3600.0, t_total_s=180.0) == 20
-
-    def test_partial_window_does_not_count(self) -> None:
-        assert min_samples_for_k(350.0, t_total_s=180.0) == 1
-
-    def test_no_history_yields_no_samples(self) -> None:
-        # Our current situation: this is what makes measuring k impossible and
-        # forces the scenario-argument approach.
-        assert min_samples_for_k(0.0, t_total_s=180.0) == 0
-
-    def test_rejects_nonpositive_lag(self) -> None:
-        with pytest.raises(ValueError):
-            min_samples_for_k(3600.0, t_total_s=0.0)
-
-
-class TestDefaultDerate:
-    def test_matches_the_methodology(self) -> None:
-        assert DEFAULT_DERATE == 0.875
 
 
 class TestRequestDeadline:
