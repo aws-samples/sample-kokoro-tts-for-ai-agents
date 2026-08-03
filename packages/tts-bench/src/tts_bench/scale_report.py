@@ -1,4 +1,4 @@
-"""Render a scaling plan: the sweep table, the findings, and a paste-ready config block.
+"""Render a scaling plan: the six variables, the findings, and a paste-ready config block.
 
 Separated from :mod:`tts_bench.planner` so the arithmetic is testable without asserting
 on strings, and so the string layout can change without touching a single equation.
@@ -9,6 +9,11 @@ measurement to a deployed policy ran through hand-arithmetic in a comment block 
 four numbers nobody could re-derive without redoing the algebra. :func:`render_config`
 emits exactly the fields ``ModelEndpointConfig`` declares, with the derivation beside
 each one, so the loop closes by copy-paste.
+
+**The rendering keeps client units and CloudWatch units visibly apart.** Every threshold
+appears twice: as the occupancy that was measured and as the ``Maximum``-statistic value
+that deploys, with the measured ratio between them. Collapsing those two into one column
+is what put 0.713 — a client mean read as a server peak — onto a live endpoint.
 """
 
 from __future__ import annotations
@@ -19,9 +24,7 @@ from shared.capacity import SAGEMAKER_INVOCATION_CEILING_S
 from tts_bench.types import Verdict
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from tts_bench.planner import SweepRow, TTotalStages
+    from tts_bench.planner import TTotalStages
     from tts_bench.types import ScalingPlan
 
 #: Marker per verdict. ``SUPPRESSED`` is not a pass and is not marked as one — it means
@@ -35,12 +38,11 @@ _VERDICT_MARK: dict[Verdict, str] = {
 
 
 def render_inputs(plan: ScalingPlan, stages: TTotalStages | None = None) -> str:
-    """The measured and assumed inputs, before any of the derived output.
+    """The four inputs — two measured, two chosen — before any derived output.
 
-    First because the reader's first question is "on what". A plan whose ``C_max``
-    came from an unfrozen run or whose ``T_total`` came from a ``force-desired`` probe
-    is a different object from one built on a clean measurement, and the difference is
-    not visible in the derived numbers.
+    First because the reader's first question is "on what". A plan whose ``Q_max`` came
+    from an unfrozen run, or from a container that sheds, is a different object from one
+    built on a clean measurement, and the difference is not visible downstream.
     """
     measured, scenario = plan.measured, plan.scenario
     lines = [
@@ -48,28 +50,20 @@ def render_inputs(plan: ScalingPlan, stages: TTotalStages | None = None) -> str:
         f"({measured.endpoint}), via {measured.transport}",
         "",
         "  measured:",
-        f"    C_max            {plan.c_max:.2f} concurrent, {_c_max_basis(plan)}",
+        f"    Q_max            {plan.q_max} concurrent per instance"
+        + (
+            " — LOWER BOUND, nothing above it was seen to fail"
+            if plan.q_max_is_lower_bound
+            else f", bracketed against the {measured.slo_ms}ms SLO"
+        ),
         f"    S                mean {measured.s_mean_s * 1000:.0f}ms, "
-        f"p95 {measured.s_p95_s * 1000:.0f}ms",
-        f"    Lambda_cap       {plan.c_max / measured.s_mean_s:.2f} rps per instance (C_max / S)",
+        f"p95 {measured.s_p95_s * 1000:.0f}ms (includes the client round trip)",
     ]
     if measured.chars_per_request > 0:
         lines.append(f"    chars/request    {measured.chars_per_request:.0f}")
 
-    # The measured total, not this row's. `plan.measured.t_total_s` has already had a
-    # provision time substituted into it by the sweep, so printing it here under the
-    # heading "measured" -- directly above a stage breakdown that sums to something
-    # else -- states two different totals as if both were observed. The per-row totals
-    # are the sweep table's job.
-    if stages is not None and stages.total_s is not None:
-        lines.append(f"    T_total          {stages.total_s:.0f}s as measured")
-        lines.extend(_render_stage_provenance(stages))
-    elif stages is not None:
-        # State the number in use, not only that it is unmeasured. "not measured" alone
-        # sends the reader hunting for the lag every row below was built from, and it
-        # belongs under a heading that says stated rather than one that says measured.
-        lines.append(f"    T_total          {measured.t_total_s:.0f}s STATED, not measured")
-        lines.extend(_render_stage_provenance(stages))
+    if stages is not None:
+        lines.extend(_render_lag(plan, stages))
     else:
         lines.append(f"    T_total          {measured.t_total_s:.0f}s")
 
@@ -82,139 +76,88 @@ def render_inputs(plan: ScalingPlan, stages: TTotalStages | None = None) -> str:
     lines.extend(
         [
             "",
-            "  assumed (these are inputs, not observations):",
-            f"    peak             {_load_str(scenario.peak_rps, scenario.peak_streams)}",
-            f"    trough           {_load_str(scenario.trough_rps, scenario.trough_streams)}",
-            f"    k                {scenario.growth_factor_k:g}x growth within one T_total",
+            "  chosen (these are inputs, not observations):",
             f"    SLO              {scenario.ttfab_slo_ms / 1000:.1f}s to first byte, "
             "queue included",
-            f"    derate           {scenario.derate}",
+            f"    surge ratio      {scenario.max_scaling_per_t_total:g}x traffic growth "
+            "within one T_total",
+            f"    peak             {_load_str(scenario.peak_rps, scenario.peak_streams)}",
+            f"    trough           {_load_str(scenario.trough_rps, scenario.trough_streams)}",
             "",
-            "  derived from the SLO (not an input — it cannot be set independently):",
+            "  derived (none of these can be set independently):",
+            f"    C_scale_max      {plan.c_scale_max:.2f} concurrent — scale out here "
+            f"({1 - (scenario.max_scaling_per_t_total - 1):.2f} x Q_max)",
+            f"    C_scale_min      {plan.c_scale_min:.2f} concurrent — scale in here "
+            f"({1 - 2 * (scenario.max_scaling_per_t_total - 1):.2f} x Q_max)",
             f"    W_max            {plan.w_max_s:.2f}s queueing budget = "
             f"{scenario.ttfab_slo_ms / 1000:.1f}s SLO - {measured.s_p95_s:.3f}s p95 service",
+            f"    utilization      {plan.utilization_at_c_scale_max:.1%} at C_scale_max "
+            "(L/(1+L) on one server — steeply non-linear, hence surge_survival)",
         ]
     )
+    lines.append(_render_units_line(plan))
     return "\n".join(lines)
 
 
-def _c_max_basis(plan: ScalingPlan) -> str:
-    """Which measurement ``C_max`` came from, and whether it is bounded.
+def _render_units_line(plan: ScalingPlan) -> str:
+    """``C_scale_max`` in the units the deployed alarm reads, or why it is unavailable.
 
-    Printed beside the number rather than left to the findings, because ``C_max`` is
-    the one input every fleet size below divides by: a reader who takes a throughput
-    ceiling for a latency knee will go looking for the wrong lever, and one who takes a
-    lower bound for a measurement will not know the fleet is over-sized.
+    Its own line, immediately under the occupancy it converts, because the two numbers
+    are easy to mistake for a rounding difference and hard to mistake for one when the
+    multiplier is printed between them.
     """
-    budget_ms = plan.scenario.ttfab_budget_ms
-    basis = {
-        "throughput_ceiling": "at the throughput ceiling",
-        "latency_knee": f"at the p95 TTFAB {budget_ms}ms latency knee",
-    }.get(plan.c_max_source, f"at the p95 TTFAB {budget_ms}ms latency knee, ceiling unmeasured")
-    if plan.c_max_is_lower_bound is None:
-        return f"{basis} (bracketing unrecorded)"
-    if plan.c_max_is_lower_bound:
-        return f"{basis} — LOWER BOUND, so the fleet below is over-sized"
-    return basis
+    if plan.c_scale_max_in_cw_units is None or plan.cw_units_ratio is None:
+        return (
+            "    in CW units      UNAVAILABLE — the ladder recorded no "
+            "ConcurrentRequestsPerModel/Maximum, so the client occupancy above cannot be "
+            "converted into what the alarm compares against"
+        )
+    return (
+        f"    in CW units      {plan.c_scale_max_in_cw_units:.2f} = C_scale_max x "
+        f"{plan.cw_units_ratio:.2f} (ConcurrentRequestsPerModel/Maximum per client mean "
+        "in-flight, measured on the same ladder) — THIS is what deploys"
+    )
 
 
-def _render_stage_provenance(stages: TTotalStages) -> list[str]:
-    """Which part of ``T_total`` was measured and which is stated.
+def _render_lag(plan: ScalingPlan, stages: TTotalStages) -> list[str]:
+    """``T_total`` and which of its parts were measured.
 
     The most important caveat on the output, so it sits inline with the number rather
-    than in a footnote: the deliverable is a plan for a reserved-capacity account whose
-    placement latency nobody here can measure.
+    than in a footnote. Two parts can be non-measurements for different reasons: the EC2
+    provision stage is measured here but contractual in a reserved-capacity account, and
+    the policy detection lag is bypassed by the ``force-desired`` trigger and bounded
+    from the deployed alarm's own configuration instead.
     """
     out: list[str] = []
+    if stages.total_s is None:
+        out.append(f"    T_total          {plan.measured.t_total_s:.0f}s STATED, not measured")
+        out.append(
+            "      no stage breakdown behind it — run `tts-bench ttotal` to get one worth "
+            "planning on"
+        )
+        return out
+
+    out.append(f"    T_total          {plan.measured.t_total_s:.0f}s, planned against")
+    out.append(f"      measured        {stages.total_s:.0f}s capacity request -> traffic served")
+    if stages.policy_bound_s:
+        out.append(
+            f"      + BOUND         {stages.policy_bound_s:.0f}s policy detection, from the "
+            "alarm's periods and cooldown — arithmetic, not a measurement"
+        )
     if stages.provision_measured:
         assert stages.provision_s is not None  # provision_measured
         out.append(
-            f"      of which        {stages.provision_s:.0f}s EC2 provision (this account's "
-            "spare capacity; swept below)"
+            f"      of which        {stages.provision_s:.0f}s EC2 provision + image pull "
+            "(this account's spare capacity, not the configuration's)"
         )
-        transferable = stages.transferable_s
-        if transferable is not None:
-            out.append(
-                f"      transferable    {transferable:.0f}s detection + pull + container "
-                "(properties of the image)"
-            )
     else:
         out.append(
-            "      provision stage not observed, so nothing to substitute out — the whole "
-            "lag is treated as transferable"
+            "      provision stage not observed, so the plan cannot say which part is this "
+            "account's placement latency"
         )
     if stages.bounded:
-        out.append("      BOUNDED         recovery was inferred, so T_total is a floor")
-    if stages.trigger == "force-desired":
-        out.append(
-            "      HALF            trigger=force-desired skips detection and alarm, so "
-            "this is not a full T_total"
-        )
+        out.append("      FLOOR           recovery was inferred, so the measured half is a floor")
     return out
-
-
-def render_sweep(rows: Sequence[SweepRow]) -> str:
-    """One line per (provision time, k) pair — the sweep that is the deliverable.
-
-    Columns are ordered by what a reader acts on: the two assumptions, then the lag
-    they produce, then the four numbers that go into ``config.py``, then the cost of
-    holding them.
-    """
-    if not rows:
-        return "No plans: the sweep produced nothing."
-
-    header = (
-        f"{'provision':>10} {'k':>4} {'T_total':>8} {'C_target':>9} {'Q_max':>6} "
-        f"{'min':>4} {'max':>4} {'util':>6} {'$/hr':>8} {'vs k=1':>7}  verdict"
-    )
-    lines = [header, "-" * len(header)]
-    for row in rows:
-        plan = row.plan
-        # "stated" when the whole lag came from --assume-t-total: nothing about it was
-        # measured, and this column is the reader's shorthand for how much of the row
-        # to trust.
-        provision = f"{row.provision_s:.0f}s" if row.provision_s is not None else _lag_label(row)
-        lines.append(
-            f"{provision:>10} {row.k:>4g} {row.t_total_s:>7.0f}s {plan.c_target:>9.3f} "
-            f"{plan.queue_max_depth:>6} {plan.min_instances:>4} {plan.max_instances:>4} "
-            f"{plan.utilization_at_target:>5.0%} {plan.peak_cost_per_hour:>8.2f} "
-            f"{plan.relative_fleet_cost_vs_k1:>6.1f}x  {_verdict_of(plan)}"
-        )
-
-    lines.append("")
-    if any(row.provision_s is None and not row.plan.measured.t_total_measured for row in rows):
-        lines.append(
-            "  provision 'stated' means the whole T_total came from --assume-t-total, so there "
-            "is no"
-        )
-        lines.append(
-            "  stage breakdown behind it — run `tts-bench ttotal` to get one worth sweeping."
-        )
-    else:
-        lines.append(
-            "  provision 'measured' means T_total was used as observed here. Every other row "
-            "substitutes"
-        )
-        lines.append(
-            "  a stated EC2 provision time for the measured one, holding the container stages "
-            "fixed — that"
-        )
-        lines.append("  is the row to read for a reserved-capacity account.")
-    lines.append(
-        "  $/hr is the peak fleet at on-demand rates: an UPPER BOUND. A committed account "
-        "pays less."
-    )
-    return "\n".join(lines)
-
-
-def _lag_label(row: SweepRow) -> str:
-    """How a row's unswept ``T_total`` was obtained, for the provision column.
-
-    Two rows can both show no substituted provision time for opposite reasons: one was
-    measured whole, the other stated whole. Printing "measured" for both puts a
-    command-line argument in a column headed by the word measured.
-    """
-    return "measured" if row.plan.measured.t_total_measured else "stated"
 
 
 def render_findings(plan: ScalingPlan) -> str:
@@ -240,36 +183,69 @@ def render_config(plan: ScalingPlan) -> str:
     """A ``ModelEndpointConfig`` block, ready to paste into ``config.py``.
 
     Every scaling field the config declares, each with the derivation that produced it
-    as a trailing comment. The comments are not decoration: the four numbers currently
-    in ``config.py`` were derived by hand once, and without their derivations beside
-    them nobody could tell later which measurement they came from or whether a new one
+    as a trailing comment. The comments are not decoration: the numbers currently in
+    ``config.py`` were derived by hand once, and without their derivations beside them
+    nobody could tell later which measurement they came from or whether a new one
     invalidated them.
+
+    ``scaling_target_value`` and ``scale_in_threshold`` are emitted in **CloudWatch
+    ``Maximum`` units**, which is what the alarms compare against. When the ladder
+    recorded no server statistic there is no conversion to make, so the field is
+    commented out rather than filled with the client figure — an unconverted threshold
+    is the 0.713 defect, and a config that fails to parse is a better outcome than one
+    that deploys a number no traffic satisfies.
     """
     measured, scenario = plan.measured, plan.scenario
-    lambda_cap = plan.c_max / measured.s_mean_s
-    return "\n".join(
+    surge = scenario.max_scaling_per_t_total
+    lines = [
+        f'    "{measured.model_name}": ModelEndpointConfig(',
+        f'        model_name="{measured.model_name}",',
+        f'        instance_type="{plan.instance_type}",',
+        f"        min_instances={plan.min_instances},"
+        f"  # trough {_load_str(scenario.trough_rps, scenario.trough_streams)}"
+        + (
+            f"; {plan.min_safe_instances} is the smallest safe for scale-in"
+            if plan.min_safe_instances is not None and plan.min_instances < plan.min_safe_instances
+            else ""
+        ),
+        f"        max_instances={plan.max_instances},"
+        f"  # peak {_load_str(scenario.peak_rps, scenario.peak_streams)}",
+    ]
+
+    ratio = plan.cw_units_ratio
+    if plan.c_scale_max_in_cw_units is None or ratio is None:
+        lines.extend(
+            [
+                "        # scaling_target_value=?,  # NO CONVERSION MEASURED. C_scale_max is "
+                f"{plan.c_scale_max:.2f}",
+                "        #   client-measured concurrency, but the alarm reads "
+                "ConcurrentRequestsPerModel/Maximum,",
+                "        #   which ran 1.35x-9.8x higher on one kokoro ladder. Re-run "
+                "`tts-bench qmax --cloudwatch`;",
+                "        #   deploying the raw occupancy is how 0.713 reached this endpoint.",
+                "        # scale_in_threshold=?,  # same conversion, same reason",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"        scaling_target_value={plan.c_scale_max_in_cw_units:.3f},"
+                f"  # C_scale_max {plan.c_scale_max:.2f} x {ratio:.2f} CW units; "
+                f"= (1-h) x Q_max {plan.q_max} at h={surge - 1:.2f}",
+                f"        scale_in_threshold={plan.c_scale_min * ratio:.3f},"
+                f"  # C_scale_min {plan.c_scale_min:.2f} x {ratio:.2f}; "
+                f"= (1-2h) x Q_max, one surge of excess headroom",
+            ]
+        )
+
+    lines.extend(
         [
-            f'    "{measured.model_name}": ModelEndpointConfig(',
-            f'        model_name="{measured.model_name}",',
-            f'        instance_type="{plan.instance_type}",',
-            f"        min_instances={plan.min_instances},"
-            f"  # trough {_load_str(scenario.trough_rps, scenario.trough_streams)}",
-            f"        max_instances={plan.max_instances},"
-            f"  # peak {_load_str(scenario.peak_rps, scenario.peak_streams)}",
-            f"        scaling_target_value={plan.c_target:.3f},"
-            f"  # {plan.binding_constraint}: derate {scenario.derate} x C_max "
-            f"{plan.c_max:.2f} / k {scenario.growth_factor_k:g}",
-            f"        scale_in_threshold={_scale_in_threshold(plan):.3f},"
-            "  # well under the target so the two policies do not oscillate",
             f"        ttfab_slo_ms={scenario.ttfab_slo_ms},"
             f"  # end-to-end promise; W_max {plan.w_max_s:.2f}s + p95 service "
-            f"{measured.s_p95_s:.2f}s fits the "
-            f"{SAGEMAKER_INVOCATION_CEILING_S:.0f}s invocation ceiling",
-            f"        ttfab_budget_ms={scenario.ttfab_budget_ms},"
-            "  # which measured budget C_max was read at",
+            f"{measured.s_p95_s:.2f}s {_ceiling_clause(plan)}",
             f"        queue_max_depth={plan.queue_max_depth},"
-            f"  # Lambda_cap {lambda_cap:.2f} rps x W_max {plan.w_max_s:.2f}s "
-            f"(= {scenario.ttfab_slo_ms / 1000:.1f}s SLO - {measured.s_p95_s:.3f}s p95)",
+            f"  # = Q_max: past it a request cannot reach first byte inside the "
+            f"{scenario.ttfab_slo_ms / 1000:.1f}s SLO",
             f"        scale_out_cooldown_s={plan.scale_out_cooldown_s},"
             "  # short: target tracking adds one instance at a time",
             f"        scale_in_cooldown_s={plan.scale_in_cooldown_s},"
@@ -277,16 +253,45 @@ def render_config(plan: ScalingPlan) -> str:
             "    ),",
         ]
     )
+    return "\n".join(lines)
 
 
-def _scale_in_threshold(plan: ScalingPlan) -> float:
-    """Concurrency at or below which an instance is removed.
+def _ceiling_clause(plan: ScalingPlan) -> str:
+    """Whether the deadline fits the invocation ceiling, per the finding that judged it.
 
-    A fraction of ``C_target`` rather than a constant, so it keeps its separation from
-    the target when the target moves — a fixed 0.2 sits *above* a ``C_target`` of 0.15
-    and the two policies then fight each other.
+    Read off ``invocation_ceiling`` rather than restated here, because the ceiling is not
+    always SageMaker's: ``--ceiling-s`` moves it, and a block that hardcoded 60s once
+    printed "fits the 60s invocation ceiling" on a plan the ceiling check had just
+    STOPped. This block gets pasted into ``config.py``, so a comment contradicting the
+    findings above it is worse than no comment.
     """
-    return round(plan.c_target * 0.3, 3)
+    finding = next((f for f in plan.findings if f.name == "invocation_ceiling"), None)
+    if finding is not None and finding.verdict is Verdict.INFEASIBLE:
+        return "EXCEEDS the invocation ceiling — see the STOP finding above; do not deploy this"
+    return f"fits the {SAGEMAKER_INVOCATION_CEILING_S:.0f}s invocation ceiling"
+
+
+def render_alarm_threshold(plan: ScalingPlan) -> str:
+    """The ``FirstChunkLatencyP95`` alarm's threshold, which is not the SLO.
+
+    That alarm watches service time on an instance already serving, where the request
+    has spent none of its queue allowance. At an SLO-sized 3000 ms it fires only once
+    the endpoint is roughly 10x past keeping up, which is not an alarm. The ladder's
+    ``N=1`` rung is the number it wants, and it is measured on every rerun rather than
+    hand-set — which is what the deleted second latency field used to be.
+    """
+    c1 = plan.measured.ttfab_p95_at_c1_ms
+    if c1 is None:
+        return (
+            "FirstChunkLatencyP95 alarm: NO THRESHOLD — the ladder had no N=1 rung, so there "
+            "is no measured service time to alarm on. Re-run `tts-bench qmax --concurrency "
+            "1,...`; an alarm threshold has to come from somewhere real."
+        )
+    return (
+        f"FirstChunkLatencyP95 alarm: {c1:.0f}ms (p95 TTFAB at one outstanding request). "
+        f"NOT the {plan.scenario.ttfab_slo_ms}ms SLO: this alarm watches service time on an "
+        "instance already serving, where a request has spent none of its queue allowance."
+    )
 
 
 def _verdict_of(plan: ScalingPlan) -> str:
@@ -321,58 +326,34 @@ def _load_str(rps: float | None, streams: float | None) -> str:
     return "not stated"
 
 
-def render_plan(
-    rows: Sequence[SweepRow],
-    stages: TTotalStages | None = None,
-) -> str:
-    """The whole report: inputs, sweep, then findings and a config block per row.
+def render_plan(plan: ScalingPlan, stages: TTotalStages | None = None) -> str:
+    """The whole report: inputs, findings, the config block, then the alarm threshold."""
+    return "\n".join(
+        [
+            render_inputs(plan, stages),
+            "",
+            render_findings(plan),
+            "",
+            render_config(plan),
+            "",
+            render_alarm_threshold(plan),
+        ]
+    )
 
-    Findings are printed per row rather than once because they are not row-invariant —
-    the 60s ceiling verdict and the queue-covers-surge verdict both move with ``k``,
-    which is exactly what a sweep exists to show.
+
+def plan_to_dict(plan: ScalingPlan) -> dict[str, object]:
+    """The plan as JSON, for an artifact.
+
+    Carries the rendered config block alongside the structured plan: the block is the
+    thing an operator pastes, and regenerating it later means re-running this module
+    against a plan whose renderer may have changed in between.
     """
-    if not rows:
-        return "No plans to report."
-
-    sections = [render_inputs(rows[0].plan, stages), "", render_sweep(rows), ""]
-
-    for row in rows:
-        label = (
-            f"provision {row.provision_s:.0f}s, k={row.k:g}"
-            if row.provision_s is not None
-            else f"T_total as {_lag_label(row)}, k={row.k:g}"
-        )
-        sections.extend(
-            [
-                f"=== {label} " + "=" * max(0, 60 - len(label)),
-                "",
-                render_findings(row.plan),
-                "",
-                render_config(row.plan),
-                "",
-            ]
-        )
-    return "\n".join(sections)
-
-
-def plan_to_dict(row: SweepRow) -> dict[str, object]:
-    """One sweep row as JSON, for an artifact.
-
-    Flattens the assumptions in beside the plan: a row read back without its
-    ``provision_s`` cannot be told from a measured one, and that is the distinction
-    the whole sweep exists to preserve.
-    """
-    plan = row.plan
     return {
-        "provision_s": row.provision_s,
-        "provision_assumed": row.provision_assumed,
-        # Not the same question as `provision_assumed`: a row with no substituted
-        # provision time may have had its whole lag stated instead, and the two read
-        # identically without this.
+        # Not derivable from the plan alone: a lag that was stated whole reads identically
+        # to one that was measured, and that is the distinction the provenance exists for.
         "t_total_measured": plan.measured.t_total_measured,
-        "growth_factor_k": row.k,
-        "t_total_s": row.t_total_s,
         "plan": plan.model_dump(mode="json"),
         "verdict": _verdict_of(plan),
         "config_block": render_config(plan),
+        "alarm_threshold": render_alarm_threshold(plan),
     }
