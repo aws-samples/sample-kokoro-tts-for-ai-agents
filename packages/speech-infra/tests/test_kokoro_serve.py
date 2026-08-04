@@ -10,10 +10,9 @@ These tests drive the real Starlette app with a fake pipeline that mimics the
 model by yielding torch tensors, and assert the streamed WAV body is produced in
 full (multiple chunks, valid RIFF header) without raising.
 
-They also cover the SSE and MP3 wire formats added for the AgentCore relay,
-including the lameenc constraints that path depends on: the flush tail carries
-real audio, short utterances produce output only via flush, and an encoder
-cannot be reused after flush.
+They also cover the MP3 wire format, including the lameenc constraints that
+path depends on: the flush tail carries real audio, short utterances produce
+output only via flush, and an encoder cannot be reused after flush.
 
 Startup warm-up and the bidirectional binary-frame path are covered too: the
 former keeps first-inference cost off the first real request, the latter is the
@@ -26,9 +25,7 @@ image, where those deps exist.
 
 from __future__ import annotations
 
-import base64
 import importlib.util
-import json
 import sys
 import types
 from pathlib import Path
@@ -128,25 +125,6 @@ def make_serve_module():
             _unload_serve()
 
 
-def _parse_sse(body: str) -> list[tuple[str, dict]]:
-    """Parse an SSE body into (event, payload) pairs."""
-    events = []
-    for block in body.strip().split("\n\n"):
-        if not block.strip():
-            continue
-        event = None
-        data = None
-        for line in block.split("\n"):
-            if line.startswith("event: "):
-                event = line[len("event: ") :]
-            elif line.startswith("data: "):
-                data = line[len("data: ") :]
-        assert event is not None, f"SSE block missing event: {block!r}"
-        assert data is not None, f"SSE block missing data: {block!r}"
-        events.append((event, json.loads(data)))
-    return events
-
-
 def _expected_mp3_bytes(segment_samples: int, segment_count: int) -> int:
     """Encode the same audio the fake pipeline yields, to get an exact byte target.
 
@@ -244,99 +222,17 @@ def test_binary_mp3_returns_audio_mpeg(serve_module) -> None:
     assert len(resp.content) == _expected_mp3_bytes(SEGMENT_SAMPLES, SEGMENT_COUNT)
 
 
-def test_sse_emits_ordered_audio_events(serve_module) -> None:
-    from starlette.testclient import TestClient
-
-    with TestClient(serve_module.app) as client:
-        resp = client.post(
-            "/invocations",
-            json={
-                "text": "One. Two. Three.",
-                "transport": "sse",
-                "format": "mp3",
-                "request_id": "req-1",
-            },
-        )
-
-    assert resp.status_code == 200
-    assert resp.headers["content-type"].startswith("text/event-stream")
-    assert resp.headers["x-accel-buffering"] == "no"
-
-    events = _parse_sse(resp.text)
-    names = [name for name, _ in events]
-    assert names[0] == "audio_stream_start"
-    assert names[-1] == "audio_stream_end"
-    assert "error" not in names
-
-    chunks = [payload for name, payload in events if name == "audio_chunk"]
-    assert chunks, "expected at least one audio_chunk"
-    assert [c["seq"] for c in chunks] == list(range(len(chunks)))
-    assert all(c["request_id"] == "req-1" for c in chunks)
-
-    start = events[0][1]
-    assert start["format"] == "mp3"
-    assert start["sample_rate"] == serve_module.SAMPLE_RATE
-
-    end = events[-1][1]
-    assert end["total_chunks"] == len(chunks)
-    expected_duration = SEGMENT_COUNT * SEGMENT_SAMPLES / serve_module.SAMPLE_RATE
-    assert end["duration_s"] == pytest.approx(expected_duration, abs=0.001)
-
-
-def test_sse_chunks_reassemble_into_valid_mp3(serve_module) -> None:
-    from starlette.testclient import TestClient
-
-    with TestClient(serve_module.app) as client:
-        resp = client.post(
-            "/invocations",
-            json={"text": "One. Two. Three.", "transport": "sse", "format": "mp3"},
-        )
-
-    audio = b"".join(
-        base64.b64decode(payload["data"])
-        for name, payload in _parse_sse(resp.text)
-        if name == "audio_chunk"
-    )
-    assert int.from_bytes(audio[:2], "big") & 0xFFE0 == 0xFFE0
-    # The SSE path must carry every byte the binary path would, flush tail included.
-    assert len(audio) == _expected_mp3_bytes(SEGMENT_SAMPLES, SEGMENT_COUNT)
-
-
-def test_sse_wav_format_is_supported(serve_module) -> None:
-    from starlette.testclient import TestClient
-
-    with TestClient(serve_module.app) as client:
-        resp = client.post(
-            "/invocations",
-            json={"text": "One. Two. Three.", "transport": "sse", "format": "wav"},
-        )
-
-    events = _parse_sse(resp.text)
-    assert events[0][1]["format"] == "wav"
-    audio = b"".join(
-        base64.b64decode(payload["data"]) for name, payload in events if name == "audio_chunk"
-    )
-    assert audio[:4] == b"RIFF"
-    assert len(audio) == 44 + SEGMENT_COUNT * SEGMENT_SAMPLES * 2
-
-
 def test_short_utterance_still_produces_mp3_via_flush(make_serve_module) -> None:
     """A 50ms segment yields nothing from encode(); the flush tail carries all audio."""
     from starlette.testclient import TestClient
 
     module = make_serve_module(1200, 1)
     with TestClient(module.app) as client:
-        resp = client.post(
-            "/invocations",
-            json={"text": "Hi.", "transport": "sse", "format": "mp3"},
-        )
+        resp = client.post("/invocations", json={"text": "Hi.", "format": "mp3"})
 
-    events = _parse_sse(resp.text)
-    chunks = [p for name, p in events if name == "audio_chunk"]
-    assert chunks, "short utterance produced no audio at all"
-    audio = b"".join(base64.b64decode(c["data"]) for c in chunks)
+    audio = resp.content
+    assert audio, "short utterance produced no audio at all"
     assert int.from_bytes(audio[:2], "big") & 0xFFE0 == 0xFFE0
-    assert events[-1][0] == "audio_stream_end"
     # Most of a 50ms utterance arrives only in the flush tail (590 of 720 bytes).
     assert len(audio) == _expected_mp3_bytes(1200, 1)
 
@@ -383,7 +279,6 @@ def test_mp3_flush_tail_carries_audio(serve_module) -> None:
     ("payload", "expected"),
     [
         ({"text": "One.", "format": "flac"}, "format"),
-        ({"text": "One.", "transport": "grpc"}, "transport"),
         ({"text": ""}, "text"),
     ],
 )

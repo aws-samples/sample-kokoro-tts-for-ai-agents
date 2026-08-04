@@ -13,20 +13,15 @@ rather than assuming one. Single model instance with asyncio.Lock
 serialization; the model is fast enough (0.12s/inference on A10G) that
 multi-session adds negligible benefit.
 
-/invocations selects its wire shape from two body fields, both defaulting to
+/invocations selects its wire shape from one body field, defaulting to
 today's behaviour so existing callers are unaffected:
-- transport: "binary" (raw chunked bytes) | "sse" (text/event-stream)
-- format:    "wav" (raw PCM frames) | "mp3" (48 kbps mono)
+- format: "wav" (raw PCM frames) | "mp3" (48 kbps mono)
 
-SSE exists because audio reaches the browser over an AgentCore relay that
-already multiplexes other agent event types on one stream. SSE is UTF-8 only,
-so audio is base64-encoded (+33%); MP3 keeps that affordable and every prefix
-of an MP3 frame stream is independently decodable, which is what lets the
-client start playing before synthesis finishes.
+Every prefix of an MP3 frame stream is independently decodable, which is what
+lets the client start playing before synthesis finishes.
 """
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -56,8 +51,6 @@ MP3_QUALITY = 2
 
 FORMAT_WAV = "wav"
 FORMAT_MP3 = "mp3"
-TRANSPORT_BINARY = "binary"
-TRANSPORT_SSE = "sse"
 
 _MEDIA_TYPES = {FORMAT_WAV: "audio/wav", FORMAT_MP3: "audio/mpeg"}
 
@@ -339,63 +332,6 @@ async def _stream_sentences_generator(
         stats["samples"] = sample_count
 
 
-def _sse_frame(event: str, payload: dict) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
-
-
-async def _sse_generator(
-    text: str, voice: str, speed: float, audio_format: str, request_id: str
-) -> AsyncGenerator[bytes, None]:
-    """Wrap the audio byte stream in the AgentCore relay's SSE event contract.
-
-    start is emitted before inference begins so the client can build its decoder
-    while the model runs. A failure mid-stream becomes an in-band `error` event:
-    on the raw binary path the same failure just truncates the chunked body and
-    reaches the caller as an opaque ModelStreamError.
-
-    Consumers must buffer and split on a blank line rather than parsing each
-    delivery unit as one event. SageMaker fragments the body on its own
-    boundaries: a measured 4-frame response arrived as 6 PayloadParts with 2 of
-    them ending mid-frame, so per-part json.loads() fails on valid traffic.
-    """
-    yield _sse_frame(
-        "audio_stream_start",
-        {
-            "request_id": request_id,
-            "format": audio_format,
-            "voice": voice,
-            "sample_rate": SAMPLE_RATE,
-        },
-    )
-
-    stats: dict = {}
-    seq = 0
-    try:
-        async for chunk in _stream_sentences_generator(text, voice, speed, audio_format, stats):
-            yield _sse_frame(
-                "audio_chunk",
-                {
-                    "request_id": request_id,
-                    "seq": seq,
-                    "data": base64.b64encode(chunk).decode("ascii"),
-                },
-            )
-            seq += 1
-    except Exception as e:
-        _logger.exception("SSE synthesis failed")
-        yield _sse_frame("error", {"request_id": request_id, "message": str(e)})
-        return
-
-    yield _sse_frame(
-        "audio_stream_end",
-        {
-            "request_id": request_id,
-            "total_chunks": seq,
-            "duration_s": round(stats.get("samples", 0) / SAMPLE_RATE, 3),
-        },
-    )
-
-
 def _samples_to_mp3(samples: np.ndarray) -> bytes:
     encoder = Mp3StreamEncoder()
     return encoder.encode(samples) + encoder.flush()
@@ -456,7 +392,6 @@ async def invocations(request: Request) -> Response:
     speed = body.get("speed", 1.0)
     use_stream = body.get("stream", True)
     audio_format = body.get("format", FORMAT_WAV)
-    transport = body.get("transport", TRANSPORT_BINARY)
 
     request_ts = body.get("request_timestamp")
     if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
@@ -474,13 +409,6 @@ async def invocations(request: Request) -> Response:
             content={"error": f"format must be one of {sorted(_MEDIA_TYPES)}"},
         )
 
-    if transport not in (TRANSPORT_BINARY, TRANSPORT_SSE):
-        _inflight -= 1
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"transport must be '{TRANSPORT_BINARY}' or '{TRANSPORT_SSE}'"},
-        )
-
     async def _inflight_wrap(gen: AsyncGenerator[bytes, None]) -> AsyncGenerator[bytes, None]:
         global _inflight
         try:
@@ -488,15 +416,6 @@ async def invocations(request: Request) -> Response:
                 yield chunk
         finally:
             _inflight -= 1
-
-    if transport == TRANSPORT_SSE:
-        return StreamingResponse(
-            _inflight_wrap(
-                _sse_generator(text, voice, speed, audio_format, body.get("request_id", "unknown"))
-            ),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
 
     if not use_stream:
         try:

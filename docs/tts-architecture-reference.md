@@ -187,7 +187,7 @@ The library enforces batch_size=1. Until re-engineered:
 
 **Orpheus/Maya (SNAC-based):** Stage 1 emits tokens continuously. Every 7 tokens form one SNAC frame. Stage 2 decodes that frame immediately and yields audio bytes. Client receives audio chunks as they're produced -- no need to wait for full generation.
 
-**Kokoro:** KPipeline yields audio per segment, and each segment is a complete forward pass. Note that a segment is **not** a sentence: `serve.py` passes no `split_pattern`, so KPipeline's default `r"\n+"` applies and sentence-punctuated prose is one segment. Measured, a 7-sentence paragraph gives first audio at 503ms in 3 segments; the same sentences newline-separated give 143ms in 8. Kokoro also supports SSE and MP3 transports — see [kokoro-streaming-api.md](kokoro-streaming-api.md) for the wire contract, codec comparison, and segmentation measurements.
+**Kokoro:** KPipeline yields audio per segment, and each segment is a complete forward pass. Note that a segment is **not** a sentence: `serve.py` passes no `split_pattern`, so KPipeline's default `r"\n+"` applies and sentence-punctuated prose is one segment. Measured, a 7-sentence paragraph gives first audio at 503ms in 3 segments; the same sentences newline-separated give 143ms in 8. Kokoro also supports an MP3 output format — see [kokoro-streaming-api.md](kokoro-streaming-api.md) for the wire contract, codec comparison, and segmentation measurements.
 
 **Chatterbox-Turbo:** T3 emits semantic tokens. Groups of tokens feed into single-step S3Gen which produces audio. Stream pattern: T3 tokens -> S3Gen forward -> emit audio chunk -> repeat.
 

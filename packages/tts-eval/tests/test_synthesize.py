@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import struct
-
-import pytest
 
 from tts_eval.synthesize import ENDPOINT_MAP, POLLY_VOICES, _pcm_to_wav, wav_duration
 from tts_inference.types import TTSModelName
@@ -100,38 +97,15 @@ class TestPollyIntegration:
             assert config["voice_id"]
 
 
-def _sse_frame(event: str, payload: dict) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
-
-
-def _sse_body(chunks: list[bytes], duration_s: float = 2.0) -> bytes:
-    """Build a full SSE response body matching the kokoro container's contract."""
-    body = _sse_frame(
-        "audio_stream_start",
-        {"request_id": "r1", "format": "mp3", "voice": "af_heart", "sample_rate": 24000},
-    )
-    for seq, chunk in enumerate(chunks):
-        body += _sse_frame(
-            "audio_chunk",
-            {"request_id": "r1", "seq": seq, "data": base64.b64encode(chunk).decode("ascii")},
-        )
-    body += _sse_frame(
-        "audio_stream_end",
-        {"request_id": "r1", "total_chunks": len(chunks), "duration_s": duration_s},
-    )
-    return body
-
-
 class _FakeStreamClient:
-    """Stands in for a boto3 sagemaker-runtime client streaming an SSE body.
+    """Stands in for a boto3 sagemaker-runtime client streaming a chunked response.
 
     `parts` is the exact byte split delivered as PayloadParts, so a test can
     reproduce SageMaker fragmenting the body wherever it likes.
     """
 
-    def __init__(self, parts: list[bytes], delay_s: float = 0.0) -> None:
+    def __init__(self, parts: list[bytes]) -> None:
         self._parts = parts
-        self._delay_s = delay_s
         self.call_kwargs: dict = {}
 
     def invoke_endpoint_with_response_stream(self, **kwargs) -> dict:
@@ -139,110 +113,24 @@ class _FakeStreamClient:
         return {"ContentType": "text/event-stream", "Body": self._iter_parts()}
 
     def _iter_parts(self):
-        import time as _time
-
         for part in self._parts:
-            if self._delay_s:
-                _time.sleep(self._delay_s)
             yield {"PayloadPart": {"Bytes": part}}
 
 
-def _client_with(parts: list[bytes], delay_s: float = 0.0) -> tuple[object, _FakeStreamClient]:
+def _client_with(parts: list[bytes]) -> tuple[object, _FakeStreamClient]:
     """Build a SynthesisClient whose thread-local boto3 client is faked."""
     from tts_eval.synthesize import SynthesisClient
 
     client = SynthesisClient.__new__(SynthesisClient)
-    fake = _FakeStreamClient(parts, delay_s)
+    fake = _FakeStreamClient(parts)
     client._client = fake
     client._region = "us-east-1"
     client._get_thread_client = lambda: fake  # type: ignore[method-assign]
     return client, fake
 
 
-class TestSynthesizeSSE:
-    """The SSE transport used by the AgentCore relay.
-
-    The framing tests here are not hypothetical: against the live endpoint a
-    4-frame response arrived as 6 PayloadParts with 2 of them ending mid-frame,
-    so a client that parses each part independently fails on valid traffic.
-    """
-
-    def test_reassembles_frames_split_across_payload_parts(self) -> None:
-        audio = [b"\xff\xf3d\xc4" + bytes(range(64)), b"\xff\xf3" + bytes(range(32))]
-        body = _sse_body(audio)
-        # Split at byte offsets that land mid-frame, as SageMaker actually does.
-        parts = [body[:40], body[40:150], body[150:210], body[210:]]
-        assert not all(p.endswith(b"\n\n") for p in parts), "test setup must split mid-frame"
-
-        client, _ = _client_with(parts)
-        result = client.synthesize_sse(TTSModelName.KOKORO_82M, "hello there")
-
-        assert result["audio_bytes"] == b"".join(audio)
-        assert result["total_chunks"] == 2
-
-    def test_single_part_body_also_works(self) -> None:
-        audio = [b"\xff\xf3d\xc4" + bytes(range(48))]
-        client, _ = _client_with([_sse_body(audio)])
-        result = client.synthesize_sse(TTSModelName.KOKORO_82M, "hello")
-        assert result["audio_bytes"] == audio[0]
-
-    def test_requests_sse_mp3_transport(self) -> None:
-        client, fake = _client_with([_sse_body([b"\xff\xf3d\xc4"])])
-        client.synthesize_sse(TTSModelName.KOKORO_82M, "hello")
-
-        body = json.loads(fake.call_kwargs["Body"])
-        assert body["transport"] == "sse"
-        assert body["format"] == "mp3"
-        assert fake.call_kwargs["EndpointName"] == "speech-kokoro-82m"
-
-    def test_ttfab_measured_at_first_audio_chunk_not_stream_start(self) -> None:
-        """The start frame precedes inference, so timing it would report ~0ms.
-
-        Delivering audio_stream_start well before the first audio_chunk means a
-        client that stamps ttfab on the first byte reports a fraction of the real
-        wait. Two 50ms-delayed parts precede the audio, so a correct client
-        reports >=100ms.
-        """
-        audio = [b"\xff\xf3d\xc4" + bytes(range(64))]
-        body = _sse_body(audio)
-        start_frame, rest = body.split(b"\n\n", 1)
-        parts = [start_frame + b"\n\n", b"", rest]
-
-        client, _ = _client_with(parts, delay_s=0.05)
-        result = client.synthesize_sse(TTSModelName.KOKORO_82M, "hello")
-
-        assert result["ttfab_ms"] >= 100, (
-            f"ttfab {result['ttfab_ms']:.0f}ms implies timing was taken at "
-            "audio_stream_start rather than the first audio_chunk"
-        )
-
-    def test_duration_comes_from_stream_end_event(self) -> None:
-        client, _ = _client_with([_sse_body([b"\xff\xf3d\xc4"], duration_s=3.25)])
-        result = client.synthesize_sse(TTSModelName.KOKORO_82M, "hello")
-        assert result["duration_s"] == 3.25
-
-    def test_error_event_raises(self) -> None:
-        body = _sse_frame("audio_stream_start", {"request_id": "r1", "format": "mp3"}) + _sse_frame(
-            "error", {"request_id": "r1", "message": "synthesis exploded"}
-        )
-
-        client, _ = _client_with([body])
-        with pytest.raises(RuntimeError, match="synthesis exploded"):
-            client.synthesize_sse(TTSModelName.KOKORO_82M, "hello")
-
-    def test_reports_chars_and_voice(self) -> None:
-        client, _ = _client_with([_sse_body([b"\xff\xf3d\xc4"])])
-        result = client.synthesize_sse(TTSModelName.KOKORO_82M, "hello there")
-        assert result["chars"] == len("hello there")
-        assert result["voice"] == "af_heart"
-
-
 class TestSynthesizeStreamUnchanged:
-    """Guard the eval baseline: synthesize_stream must stay raw chunked WAV.
-
-    runner.py:156 calls this and asserts RIFF downstream. Adding the SSE path
-    must not move it.
-    """
+    """Guard the eval baseline: synthesize_stream must stay raw chunked WAV."""
 
     def test_stream_sends_no_transport_or_format_fields(self) -> None:
         wav = _make_minimal_wav(duration_s=1.0)

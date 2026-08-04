@@ -142,7 +142,7 @@ def raise_for_error_frame(message: str) -> None:
 
 
 #: Modeled bidi SDK exceptions, keyed by class name so this module never
-#: imports the SDK — a caller using only the response-stream/SSE transports
+#: imports the SDK — a caller using only the response-stream transport
 #: should not need it installed.
 _BIDI_EXCEPTION_ERRORS: dict[str, type[TTSClientError]] = {
     "ServiceUnavailableError": QueueSaturatedError,

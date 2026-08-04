@@ -3,8 +3,7 @@
 Two independently-callable methods, one per transport the Kokoro-style
 SageMaker contract exposes: :meth:`TTSClient.synthesize` (binary
 response-stream, chunked WAV/MP3) and :meth:`TTSClient.synthesize_bidi`
-(SageMaker bidirectional streaming, raw PCM). SSE is not covered: it is being
-dropped as an interface.
+(SageMaker bidirectional streaming, raw PCM).
 
 Pooling was investigated directly against the installed SDKs rather than
 assumed (see the plan this package was built from):
@@ -110,8 +109,8 @@ def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = BIDI_SAMPLE_RATE) -> bytes:
 def _build_payload(request: SynthesisRequest) -> bytes:
     """Serialize a :class:`SynthesisRequest` for ``/invocations``.
 
-    No ``transport`` field: the container's default (``TRANSPORT_BINARY``) is
-    exactly what :meth:`TTSClient.synthesize` wants, now that SSE is gone.
+    No ``transport`` field: the container's default (raw chunked bytes) is
+    exactly what :meth:`TTSClient.synthesize` wants.
 
     ``request_timestamp`` is the actual send time, which is what the
     containers subtract from ``time.time()`` to decide whether a request has

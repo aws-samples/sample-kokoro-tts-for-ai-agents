@@ -1,7 +1,7 @@
-"""Tests for TTSClient across all three transports.
+"""Tests for TTSClient across both transports.
 
 Fakes mirror the patterns already proven in tts_eval/tests/test_synthesize.py
-(response-stream, SSE) and tts_bench/tests/test_bidi.py (bidi). The bidi
+(response-stream) and tts_bench/tests/test_bidi.py (bidi). The bidi
 fakes patch ``tts_client.client.SageMakerRuntimeHTTP2Client`` directly rather
 than injecting a client, because :meth:`TTSClient.synthesize_bidi`
 deliberately builds its own client per call and accepts none — see the
