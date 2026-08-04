@@ -171,13 +171,13 @@ class TestTtfabP95AtC1Ms:
 
 
 class TestArtifactDir:
-    def test_default_points_at_the_repository_artifacts_dir(self) -> None:
-        # Four parents up from measurements.py. Locked down because the walk is
-        # positional: moving this module one directory would silently start reading
-        # the wrong place, and the failure would look like "no measurement" — which
-        # is a legitimate state, so nothing else would complain.
+    def test_default_points_at_the_speech_infra_artifacts_dir(self) -> None:
+        # Two parents up from measurements.py: speech_infra -> src -> packages/speech-infra.
+        # Locked down because the walk is positional: moving this module one directory
+        # would silently start reading the wrong place, and the failure would look like
+        # "no measurement" — which is a legitimate state, so nothing else would complain.
         assert measurements.ARTIFACT_DIR.name == "artifacts"
-        assert (measurements.ARTIFACT_DIR.parent / "packages" / "speech-infra").is_dir()
+        assert (measurements.ARTIFACT_DIR.parent / "src" / "speech_infra").is_dir()
 
 
 def _plan(

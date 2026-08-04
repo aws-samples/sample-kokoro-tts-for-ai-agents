@@ -1407,6 +1407,13 @@ def drift(region: str, output: str | None, fail_on_error: bool) -> None:
 @click.option("--max-samples", default=50, type=int, help="Texts drawn into the pool.")
 @click.option("--region", default="us-east-1", show_default=True, help="AWS region.")
 @click.option("--output", default=None, type=click.Path(), help="Write findings JSON here.")
+@click.option(
+    "--surge-ratio",
+    "surge_ratio",
+    default=None,
+    type=float,
+    help="Load multiplier for the surge_absorption check (default: read from plan).",
+)
 @click.option("--dry-run", is_flag=True, help="Print the check schedule without touching AWS.")
 def validate(
     model: str,
@@ -1417,6 +1424,7 @@ def validate(
     max_samples: int,
     region: str,
     output: str | None,
+    surge_ratio: float | None,
     dry_run: bool,
 ) -> None:
     """Confirm deployed autoscaling policy behaves as the plan predicts.
@@ -1437,6 +1445,7 @@ def validate(
         voice=voice,
         texts=texts,
         region=region,
+        surge_ratio=surge_ratio,
         dry_run=dry_run,
     )
 

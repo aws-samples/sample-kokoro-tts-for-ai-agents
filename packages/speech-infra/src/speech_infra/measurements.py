@@ -40,9 +40,9 @@ from typing import Any
 
 from loguru import logger
 
-#: Where ``tts-bench`` writes by default, relative to the repository root. Four parents
-#: up from this file: ``speech_infra`` -> ``src`` -> ``speech-infra`` -> ``packages``.
-ARTIFACT_DIR = Path(__file__).resolve().parents[4] / "artifacts"
+#: Where ``tts-bench`` writes plan and qmax artifacts. Two parents up from this file:
+#: ``speech_infra`` -> ``src`` -> ``packages/speech-infra``.
+ARTIFACT_DIR = Path(__file__).resolve().parents[2] / "artifacts"
 
 #: Filename prefix ``tts-bench qmax`` uses. The rest of the stem is the configuration
 #: fingerprint, which is why a glob is needed rather than a fixed name — see
