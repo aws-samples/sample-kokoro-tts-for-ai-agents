@@ -430,7 +430,7 @@ artifacts whose configuration fingerprints disagree cannot be combined.
 3. `ttotal` — new `T_total` by stage (image size and model load dominate; provision is
    labelled separately).
 4. `plan` — same chosen inputs, new config block.
-5. Paste the block into `config.py`, `cdk diff`, `cdk deploy`.
+5. Paste the block into `config.py`, `uv run speech-infra diff kokoro-82m`, `uv run speech-infra deploy kokoro-82m`.
 6. `drift` again — the policy that is live is the policy that was computed.
 
 **A different instance type is a rerun, not a re-derivation.** Nothing in the model is

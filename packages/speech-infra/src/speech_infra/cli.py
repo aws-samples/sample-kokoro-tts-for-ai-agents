@@ -27,6 +27,38 @@ def cli() -> None:
 
 @cli.command()
 @click.argument("models", nargs=-1)
+@click.option("--all", "diff_all", is_flag=True, help="Diff all configured models.")
+@click.option("--image-uri", default=None, help="Full container image URI (skips Docker build).")
+@click.option(
+    "--hf-token-secret",
+    default="hf-token-dev",
+    help="Secrets Manager secret name for HuggingFace token.",
+)
+def diff(
+    models: tuple[str, ...],
+    diff_all: bool,
+    image_uri: str | None,
+    hf_token_secret: str,
+) -> None:
+    """Show what would change for one or more model endpoints."""
+    targets = _resolve_targets(models, diff_all)
+    if not targets:
+        click.echo("No targets to diff.", err=True)
+        sys.exit(1)
+
+    stack_names = ["SpeechFoundation", "SpeechModelCache"]
+    stack_names += [config.stack_id for config in targets]
+
+    context: dict[str, str] = {"hf_token_secret": hf_token_secret}
+    if image_uri:
+        context["image_uri"] = image_uri
+
+    click.echo(f"Diffing stacks: {', '.join(stack_names)}")
+    _run_cdk("diff", stack_names, context=context)
+
+
+@cli.command()
+@click.argument("models", nargs=-1)
 @click.option("--all", "deploy_all", is_flag=True, help="Deploy all configured models.")
 @click.option("--image-uri", default=None, help="Full container image URI (skips Docker build).")
 @click.option(

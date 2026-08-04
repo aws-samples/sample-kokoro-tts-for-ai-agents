@@ -196,14 +196,14 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         instance_type="ml.g5.xlarge",
         container_type=ContainerType.PYTORCH_CUSTOM,
         streaming_mode=StreamingMode.RESPONSE_STREAM,
-        # min=1 rather than 0 because SageMaker real-time variants cannot scale to
-        # zero; max(min_instances, 1) already coerced it, so 1 is what deploys.
-        min_instances=1,
-        # Sits exactly at the ml.g5.xlarge quota (L-1928E07B), so a quota increase
-        # precedes any higher peak. Nothing else depends on it: the thresholds are
-        # fractions of Q_max, so raising this is one number and touches no other field.
-        max_instances=4,
-        ttfab_slo_ms=3000,
+        min_instances=1,  # trough 10 rps; 3 is the smallest safe for scale-in
+        max_instances=9,  # peak 5000 rps
+        scaling_target_value=37.500,  # C_scale_max 37.50 x 1.00 CW units; = (1-h) x Q_max 50 at h=0.25
+        scale_in_threshold=25.000,  # C_scale_min 25.00 x 1.00; = (1-2h) x Q_max, one surge of excess headroom
+        ttfab_slo_ms=3000,  # end-to-end promise; W_max 2.93s + p95 service 0.07s fits the 60s invocation ceiling
+        queue_max_depth=50,  # = Q_max: past it a request cannot reach first byte inside the 3.0s SLO
+        scale_out_cooldown_s=30,  # short: target tracking adds one instance at a time
+        scale_in_cooldown_s=960,  # long: removed capacity costs a full 320s to replace
     ),
     "kokoro-82m-cpu": ModelEndpointConfig(
         model_name="kokoro-82m-cpu",

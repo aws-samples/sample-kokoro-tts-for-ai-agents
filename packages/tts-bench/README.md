@@ -162,12 +162,11 @@ refused rather than converted — `Q_max` is *defined* by the SLO.
 
 Then paste the block over the model's entry in
 [`packages/speech-infra/src/speech_infra/config.py`](../speech-infra/src/speech_infra/config.py)
-(`TTS_MODEL_CONFIGS`) and deploy it. The `cdk` commands run from
-`packages/speech-infra`, where `cdk.json` lives; `drift` runs from the workspace root.
+(`TTS_MODEL_CONFIGS`) and deploy it.
 
 ```bash
-cdk diff   Speech-kokoro-82m    # confirm only the scaling fields moved
-cdk deploy Speech-kokoro-82m
+uv run speech-infra diff   kokoro-82m    # confirm only the scaling fields moved
+uv run speech-infra deploy kokoro-82m
 ```
 
 ```bash
