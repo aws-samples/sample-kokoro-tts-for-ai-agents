@@ -1383,6 +1383,102 @@ def drift(region: str, output: str | None, fail_on_error: bool) -> None:
 
 
 @main.command()
+@click.option(
+    "--model",
+    required=True,
+    help="Model name, e.g. kokoro-82m.",
+)
+@click.option(
+    "--plan",
+    "plan_path",
+    required=True,
+    type=click.Path(exists=True),
+    help="Plan artifact from `tts-bench plan`, e.g. artifacts/plan-kokoro-82m.json",
+)
+@click.option(
+    "--transport",
+    default="response-stream",
+    type=click.Choice(["response-stream", "bidi"]),
+    show_default=True,
+    help="Wire protocol; must match the one used when measuring Q_max.",
+)
+@click.option("--voice", default=None, help="Override the model's default voice.")
+@click.option("--samples", default=None, type=click.Path(), help="Override the sample JSON path.")
+@click.option("--max-samples", default=50, type=int, help="Texts drawn into the pool.")
+@click.option("--region", default="us-east-1", show_default=True, help="AWS region.")
+@click.option("--output", default=None, type=click.Path(), help="Write findings JSON here.")
+@click.option("--dry-run", is_flag=True, help="Print the check schedule without touching AWS.")
+def validate(
+    model: str,
+    plan_path: str,
+    transport: str,
+    voice: str | None,
+    samples: str | None,
+    max_samples: int,
+    region: str,
+    output: str | None,
+    dry_run: bool,
+) -> None:
+    """Confirm deployed autoscaling policy behaves as the plan predicts.
+
+    Runs two checks against the live fleet with autoscaling active:
+
+    \b
+    1. scale_out      — drive over C_scale_max and confirm DesiredInstanceCount rises
+    2. slo_under_load — hold at 80% C_scale_max after scale-out and confirm p95 < SLO
+    """
+    import tts_bench.validate as validate_mod
+
+    texts = _load_texts(samples, max_samples)
+
+    findings = validate_mod.run(
+        plan_path,
+        transport,
+        voice=voice,
+        texts=texts,
+        region=region,
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        return
+
+    from tts_bench.validate import load_plan
+
+    plan = load_plan(plan_path)
+    click.echo(
+        f"\nValidate {plan['model_name']}  "
+        f"({plan['endpoint']}  {plan['instance_type']})"
+    )
+
+    verdict_label = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}
+    ok_count = sum(1 for f in findings if f.verdict == "ok")
+    warn_count = sum(1 for f in findings if f.verdict == "warn")
+    fail_count = sum(1 for f in findings if f.verdict == "fail")
+
+    for f in findings:
+        label = verdict_label.get(f.verdict, f.verdict.upper()[:4])
+        click.echo(f"  [{label}] {f.check:<20} {f.detail}")
+
+    click.echo(
+        f"\n  {len(findings)}/{len(findings)} checks run: "
+        f"{ok_count} ok, {warn_count} warning, {fail_count} fail"
+    )
+
+    if output:
+        Path(output).write_text(
+            json.dumps(
+                [{"check": f.check, "verdict": f.verdict, "detail": f.detail} for f in findings],
+                indent=2,
+            )
+        )
+        click.echo(f"Findings: {output}")
+
+    if fail_count:
+        raise SystemExit(1)
+
+
+@main.command()
 @click.option("--endpoint", required=True, help="Endpoint name, e.g. speech-kokoro-82m")
 @click.option("--variant", default="primary", help="Production variant on the endpoint")
 @click.option("--region", default="us-east-1", help="AWS region every client is built in")

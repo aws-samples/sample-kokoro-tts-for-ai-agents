@@ -627,38 +627,17 @@ class TestTheDeployedConfigIsCompared:
 
     ``queue_max_depth`` and ``scaling_target_value`` are the values ``config.py`` stores
     rather than computes, because both need a measurement — so both can go stale
-    silently, and both did. This check is what makes the staleness visible, and the
-    fixture is deliberately the numbers this branch measured against the ones deployed.
+    silently, and both did. This check is what makes the staleness visible.
+
+    config.py now carries the measured values (Q_max=50, scaling_target_value=37.5 with
+    cw_units_ratio=1.0). The stale-warning tests use synthetic fixtures to reproduce
+    the scenario where the deployed value disagrees with a fresh measurement.
     """
 
     def test_a_stale_queue_depth_warns_with_both_numbers(self, runner: CliRunner) -> None:
-        # 41 deployed against a measured Q_max of 50. Naming both, and what the deployed
-        # value does wrong, is the whole content of the message.
-        result = _run(runner, "--peak-rps", "450")
-        assert result.exit_code == 0
-        assert "queue_max_depth=41 deployed" in result.output
-        assert "3000ms end-to-end SLO is 50" in result.output
-        assert "admits requests it can only serve late" in result.output
-
-    def test_a_stale_target_is_compared_in_cloudwatch_units(self, runner: CliRunner) -> None:
-        # Both sides in the units the alarm reads. Comparing the deployed value against
-        # the client occupancy would report a mismatch of exactly the size of the
-        # conversion and call it drift.
-        result = _run(runner, "--peak-rps", "450")
-        assert "scaling_target_value=0.713 deployed" in result.output
-        assert "this plan derives 50.625" in result.output
-        assert "into ConcurrentRequestsPerModel/Maximum units" in result.output
-
-    def test_it_warns_rather_than_failing_the_command_that_found_it(
-        self, runner: CliRunner
-    ) -> None:
-        # The plan *is* the answer, and finding the deployed value wrong is why it was
-        # run. Exiting non-zero would fail the command that just told you what to fix.
-        assert _run(runner, "--peak-rps", "450").exit_code == 0
-
-    def test_agreement_is_silent(self, runner: CliRunner) -> None:
-        # A ladder that bracketed at 41 with the deployed conversion reproduces both
-        # stored numbers, and then there is nothing to say.
+        # Simulate: config.py has queue_max_depth=50 but a fresh ladder finds Q_max=41
+        # (e.g. after a service-time regression). Both numbers named, and what the
+        # deployed value does wrong, is the whole content of the message.
         ladder = {rung: p95 for rung, p95 in LADDER.items() if rung != 50}
         steps = [
             {
@@ -671,9 +650,7 @@ class TestTheDeployedConfigIsCompared:
                 "chars": 2500,
                 "ttfab_p95_ms": p95,
                 "concurrency_mean": float(rung),
-                # 0.713 / 30.75 -- the conversion that reproduces the deployed target
-                # from C_scale_max at Q_max 41.
-                "server_concurrency_peak": rung * (0.713 / 30.75),
+                "server_concurrency_peak": float(rung),
                 "meets_slo": True,
                 "saturated": False,
                 "settled": True,
@@ -691,6 +668,60 @@ class TestTheDeployedConfigIsCompared:
                 "ttfab_p95_at_q_max_ms": 2400.0,
                 "steps": steps,
             },
+            ttotal={},
+        )
+        assert result.exit_code == 0
+        assert "queue_max_depth=50 deployed" in result.output
+        assert "3000ms end-to-end SLO is 41" in result.output
+        assert "admits requests it can only serve late" in result.output
+
+    def test_a_stale_target_is_compared_in_cloudwatch_units(self, runner: CliRunner) -> None:
+        # Both sides in the units the alarm reads. The default fixture has Q_max=50 and
+        # RATIOS[50]=1.35, so the plan derives C_scale_max=37.5 x 1.35 = 50.625 CW units,
+        # which disagrees with the deployed 37.5 (measured at cw_units_ratio=1.0).
+        # Comparing the deployed value against the client occupancy would report a mismatch
+        # of exactly the size of the conversion and call it drift.
+        result = _run(runner, "--peak-rps", "450")
+        assert "scaling_target_value=37.5 deployed" in result.output
+        assert "this plan derives 50.625" in result.output
+        assert "into ConcurrentRequestsPerModel/Maximum units" in result.output
+
+    def test_it_warns_rather_than_failing_the_command_that_found_it(
+        self, runner: CliRunner
+    ) -> None:
+        # The plan *is* the answer, and finding the deployed value wrong is why it was
+        # run. Exiting non-zero would fail the command that just told you what to fix.
+        assert _run(runner, "--peak-rps", "450").exit_code == 0
+
+    def test_agreement_is_silent(self, runner: CliRunner) -> None:
+        # A ladder that produces Q_max=50 and cw_units_ratio=1.0 reproduces both stored
+        # numbers (queue_max_depth=50, scaling_target_value=37.5), and then there is
+        # nothing to say.
+        steps = [
+            {
+                "run_index": 0,
+                "step_index": index,
+                "concurrency": rung,
+                "achieved_rps": 9.0,
+                "completed": 100,
+                "ok": 100,
+                "chars": 2500,
+                "ttfab_p95_ms": p95,
+                "concurrency_mean": float(rung),
+                # ratio = 1.0: server_concurrency_peak == client concurrency mean
+                "server_concurrency_peak": float(rung),
+                "meets_slo": True,
+                "saturated": False,
+                "settled": True,
+                "usable": True,
+            }
+            for index, (rung, p95) in enumerate(LADDER.items())
+        ]
+        result = _run_with(
+            runner,
+            "--peak-rps",
+            "450",
+            qmax={"steps": steps},
             ttotal={},
         )
         assert result.exit_code == 0
