@@ -1,0 +1,174 @@
+{
+  "model_name": "kokoro-82m",
+  "endpoint": "speech-kokoro-82m",
+  "run_id": "2cd00ae01f84",
+  "trigger": "force-desired",
+  "deployed_config": {
+    "instance_type": "ml.g5.xlarge",
+    "image_digest": "8b1b96bc4dc0b30ddd84d8fe37af7c490937333c44a9f8f7d77b918c3d7eaced",
+    "container_env": {}
+  },
+  "config_slug": "g5xlarge-8b1b96bc",
+  "t_total_s": 260.248496,
+  "t_total_with_policy_bound_s": 320.248496,
+  "policy_lag_bound_s": 60.0,
+  "t_total_bounded": false,
+  "aws_share_s": 184.559132,
+  "container_share_s": 7.535,
+  "instance_id": "i-0d1970b845748a200",
+  "from_instances": 1,
+  "to_instances": 2,
+  "probe_concurrency": 10,
+  "p95_expected_before_ms": 568.4855983126909,
+  "p95_recovered_target_ms": 357.71437926450744,
+  "p95_before_ms": 568.3100483845919,
+  "p95_after_ms": 558.4259638097137,
+  "requests_before": 3812,
+  "requests_after": 5332,
+  "timeline": [
+    {
+      "stage": "load_applied",
+      "at": "2026-08-04T14:44:21.706308+00:00",
+      "bounded": false,
+      "source": "probe start",
+      "note": "probe established before the trigger; not the start of the clock"
+    },
+    {
+      "stage": "desired_set",
+      "at": "2026-08-04T14:44:51.707868+00:00",
+      "bounded": false,
+      "source": "UpdateEndpointWeightsAndCapacities call",
+      "note": "the clock starts here"
+    },
+    {
+      "stage": "instance_logging",
+      "at": "2026-08-04T14:47:52.543000+00:00",
+      "bounded": true,
+      "source": "log stream firstEventTimestamp",
+      "note": "upper bound on provisioning plus image pull, which a container cannot time itself"
+    },
+    {
+      "stage": "framework_init",
+      "at": "2026-08-04T14:47:56.281000+00:00",
+      "bounded": false,
+      "source": "container log marker (elapsed_s=0.014)",
+      "note": null
+    },
+    {
+      "stage": "weights_ready",
+      "at": "2026-08-04T14:48:02.756000+00:00",
+      "bounded": false,
+      "source": "container log marker (elapsed_s=6.489)",
+      "note": null
+    },
+    {
+      "stage": "warmup_done",
+      "at": "2026-08-04T14:48:03.802000+00:00",
+      "bounded": false,
+      "source": "container log marker (elapsed_s=7.534)",
+      "note": null
+    },
+    {
+      "stage": "ready",
+      "at": "2026-08-04T14:48:03.802000+00:00",
+      "bounded": false,
+      "source": "container log marker (elapsed_s=7.534)",
+      "note": null
+    },
+    {
+      "stage": "container_started",
+      "at": "2026-08-04T14:47:56.267000+00:00",
+      "bounded": true,
+      "source": "derived from elapsed_s",
+      "note": "reconstructed as framework_init minus its elapsed_s=0.014s; no container_start line was in the stream"
+    },
+    {
+      "stage": "in_service",
+      "at": "2026-08-04T14:48:24.515499+00:00",
+      "bounded": false,
+      "source": "DescribeEndpoint CurrentInstanceCount",
+      "note": null
+    },
+    {
+      "stage": "traffic_recovered",
+      "at": "2026-08-04T14:49:11.956364+00:00",
+      "bounded": true,
+      "source": "client-side p95 recovery",
+      "note": "probe p95 TTFAB held at or under 358ms across 1986 completions in the following 60s \u2014 the router had split the probe, so a second instance was serving"
+    }
+  ],
+  "durations": [
+    {
+      "from": "load_applied",
+      "to": "desired_set",
+      "seconds": 30.002,
+      "bounded": false,
+      "share": 0.1153
+    },
+    {
+      "from": "desired_set",
+      "to": "instance_logging",
+      "seconds": 180.835,
+      "bounded": true,
+      "share": 0.6949
+    },
+    {
+      "from": "instance_logging",
+      "to": "container_started",
+      "seconds": 3.724,
+      "bounded": true,
+      "share": 0.0143
+    },
+    {
+      "from": "container_started",
+      "to": "framework_init",
+      "seconds": 0.014,
+      "bounded": true,
+      "share": 0.0001
+    },
+    {
+      "from": "framework_init",
+      "to": "weights_ready",
+      "seconds": 6.475,
+      "bounded": false,
+      "share": 0.0249
+    },
+    {
+      "from": "weights_ready",
+      "to": "ready",
+      "seconds": 1.046,
+      "bounded": false,
+      "share": 0.004
+    },
+    {
+      "from": "ready",
+      "to": "warmup_done",
+      "seconds": 0.0,
+      "bounded": false,
+      "share": 0.0
+    },
+    {
+      "from": "warmup_done",
+      "to": "in_service",
+      "seconds": 20.713,
+      "bounded": false,
+      "share": 0.0796
+    },
+    {
+      "from": "in_service",
+      "to": "traffic_recovered",
+      "seconds": 47.441,
+      "bounded": true,
+      "share": 0.1823
+    }
+  ],
+  "dominant_stage": {
+    "from": "desired_set",
+    "to": "instance_logging",
+    "seconds": 180.835
+  },
+  "missing_stages": [],
+  "notes": [
+    "trigger was --force-desired under a scaling freeze, so the policy's own detection lag is not in this number. It is bounded separately at 60s and reported as t_total_with_policy_bound_s; that field, not t_total_s, is what the planner sizes headroom against."
+  ]
+}

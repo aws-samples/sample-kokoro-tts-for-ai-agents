@@ -1,0 +1,163 @@
+{
+  "t_total_measured": true,
+  "plan": {
+    "model_name": "kokoro-82m",
+    "endpoint": "speech-kokoro-82m",
+    "instance_type": "ml.g5.xlarge",
+    "q_max": 50,
+    "q_max_is_lower_bound": false,
+    "c_scale_max": 37.5,
+    "c_scale_min": 25.0,
+    "c_scale_max_in_cw_units": 37.5,
+    "cw_units_ratio": 1.0,
+    "min_safe_instances": 3,
+    "w_max_s": 2.9338649033568798,
+    "ceiling_s": 60.0,
+    "min_instances": 1,
+    "max_instances": 9,
+    "peak_instances": 9,
+    "trough_instances": 1,
+    "queue_max_depth": 50,
+    "scale_out_cooldown_s": 30,
+    "scale_in_cooldown_s": 960,
+    "utilization_at_c_scale_max": 0.974025974025974,
+    "shed_probability_at_c_scale_max": 0.995,
+    "peak_cost_per_hour": 12.671999999999999,
+    "peak_cost_per_m_chars": 0.027913836948391918,
+    "findings": [
+      {
+        "name": "measurement_trust",
+        "verdict": "ok",
+        "detail": "Q_max was measured with autoscaling suspended, capacity pinned to (1,), and no container queue bound, so it reads as one instance's own limit",
+        "recommendation": null
+      },
+      {
+        "name": "curve_repeatability",
+        "verdict": "suppressed",
+        "detail": "Q_max 50 came from a single ladder pass, so whether it is repeatable was never established \u2014 a 0% spread across one run is not an agreement",
+        "recommendation": "re-run `tts-bench qmax --runs 2` or more to get a spread"
+      },
+      {
+        "name": "slo_budget",
+        "verdict": "ok",
+        "detail": "W_max 2.93s = 3.0s SLO - 0.066s p95 service \u2014 derived, not configured, so the queue allowance cannot drift away from the promise it is spending",
+        "recommendation": null
+      },
+      {
+        "name": "invocation_ceiling",
+        "verdict": "ok",
+        "detail": "a queued request finishes in 3.0s worst case (W_max 2.9s + p95 service 0.07s), inside the 60s SageMaker invocation ceiling",
+        "recommendation": null
+      },
+      {
+        "name": "queue_depth",
+        "verdict": "ok",
+        "detail": "queue_max_depth 50 is the measured Q_max, bracketed from above. The SLO's wait budget independently implies about 48 (W_max 2.93s / S 0.061s); past the bound a request cannot reach first byte in time, so it is refused rather than served late",
+        "recommendation": null
+      },
+      {
+        "name": "threshold_units",
+        "verdict": "ok",
+        "detail": "scaling_target_value 37.50 = C_scale_max 37.50 x 1.00, the measured ratio of ConcurrentRequestsPerModel / Maximum to client mean in-flight at the nearest rung. The converted figure is what deploys; the occupancy is what was measured",
+        "recommendation": null
+      },
+      {
+        "name": "surge_survival",
+        "verdict": "warn",
+        "detail": "holding C_scale_max 37.50 of Q_max 50 is 97.4% utilization on a single-server queue, and a replacement takes 320s to arrive \u2014 so P(the queue reaches Q_max before then) is 100%, past the 10% line. The 1.25x surge ratio reserves queue slots, which is a stock; surviving a surge is about drain rate, which is a flow, and at this utilization there is very little of it left",
+        "recommendation": "scale out earlier than the simple rule (a smaller share of Q_max), shorten T_total, or hold standing headroom in instances"
+      },
+      {
+        "name": "scale_in_safety",
+        "verdict": "warn",
+        "detail": "scale-in is only stable from 3 instances up: removing one of N multiplies each survivor's concurrency by N/(N-1), which must stay under 1.50 (= C_scale_max 37.50 / C_scale_min 25.00). This plan's floor is 1, so a 2->1 scale-in leaves the survivors at 50.00",
+        "recommendation": "raise --min-floor to 3, or accept the flap that the scale-in cooldown damps but does not remove"
+      },
+      {
+        "name": "fleet_cost",
+        "verdict": "ok",
+        "detail": "reserving headroom for a 1.25x surge costs 1.3x a fleet scaled at Q_max (9 instances at C_scale_max 37.50 against 7 at Q_max); on-demand rates, so an upper bound",
+        "recommendation": null
+      },
+      {
+        "name": "provision_stage",
+        "verdict": "ok",
+        "detail": "T_total 320s, of which 181s (56%) is EC2 provisioning and image pull \u2014 a property of this account's spare capacity, not of the configuration. A reserved-capacity account, where placement is guaranteed, will differ on that part and only that part. Of that, 60s is the policy's detection lag, which the force-desired trigger bypasses and so is BOUNDED from the deployed alarm's periods and cooldown rather than measured.",
+        "recommendation": null
+      }
+    ],
+    "measured": {
+      "model_name": "kokoro-82m",
+      "endpoint": "speech-kokoro-82m",
+      "instance_type": "ml.g5.xlarge",
+      "q_max": 50,
+      "q_max_bracketed": true,
+      "slo_ms": 3000,
+      "ttfab_p95_at_c1_ms": 65.37169031798838,
+      "s_mean_s": 0.06132258724884511,
+      "s_p95_s": 0.06613509664312005,
+      "t_total_s": 320.248496,
+      "t_total_measured": true,
+      "chars_per_request": 25.220466871020985,
+      "frozen": true,
+      "unbounded_queue": true,
+      "instance_counts_observed": [
+        1
+      ],
+      "transport": "response-stream",
+      "deployed_config": {
+        "instance_type": "ml.g5.xlarge",
+        "image_digest": "8b1b96bc4dc0b30ddd84d8fe37af7c490937333c44a9f8f7d77b918c3d7eaced",
+        "container_env": {}
+      },
+      "q_max_spread": 0.0,
+      "runs_contributing": 1,
+      "ladder_p95_ms": {
+        "1": 65.37169031798838,
+        "5": 286.17150341160595,
+        "10": 568.4855983126909,
+        "20": 1129.3242457322776,
+        "30": 1689.802357647568,
+        "40": 2245.0045480392873,
+        "50": 2805.6634329725057,
+        "60": 3374.7788213193417
+      },
+      "cw_units_ratio_by_rung": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0,
+        "30": 1.0,
+        "40": 1.0,
+        "50": 1.0,
+        "60": 1.0
+      },
+      "provenance": {
+        "origin": "measured",
+        "run_id": "b8fa8ef48043",
+        "measured_at": "2026-08-04T14:42:58.733810+00:00",
+        "endpoint": "speech-kokoro-82m",
+        "note": "Q_max at the 3000ms p95 TTFAB SLO on response-stream, autoscaling frozen; T_total measured, trigger=force-desired; 260s measured + 60s policy lag bounded from the deployed alarm, not measured"
+      }
+    },
+    "scenario": {
+      "peak_rps": 5000.0,
+      "trough_rps": 10.0,
+      "peak_streams": null,
+      "trough_streams": null,
+      "max_scaling_per_t_total": 1.25,
+      "ttfab_slo_ms": 3000,
+      "min_instances_floor": 1,
+      "provenance": {
+        "origin": "assumption",
+        "run_id": null,
+        "measured_at": null,
+        "endpoint": null,
+        "note": "supplied as a CLI argument; no production traffic to measure"
+      }
+    }
+  },
+  "verdict": "warn (2)",
+  "config_block": "    \"kokoro-82m\": ModelEndpointConfig(\n        model_name=\"kokoro-82m\",\n        instance_type=\"ml.g5.xlarge\",\n        min_instances=1,  # trough 10 rps; 3 is the smallest safe for scale-in\n        max_instances=9,  # peak 5000 rps\n        scaling_target_value=37.500,  # C_scale_max 37.50 x 1.00 CW units; = (1-h) x Q_max 50 at h=0.25\n        scale_in_threshold=25.000,  # C_scale_min 25.00 x 1.00; = (1-2h) x Q_max, one surge of excess headroom\n        ttfab_slo_ms=3000,  # end-to-end promise; W_max 2.93s + p95 service 0.07s fits the 60s invocation ceiling\n        queue_max_depth=50,  # = Q_max: past it a request cannot reach first byte inside the 3.0s SLO\n        scale_out_cooldown_s=30,  # short: target tracking adds one instance at a time\n        scale_in_cooldown_s=960,  # long: removed capacity costs a full 320s to replace\n    ),",
+  "alarm_threshold": "FirstChunkLatencyP95 alarm: 65ms (p95 TTFAB at one outstanding request). NOT the 3000ms SLO: this alarm watches service time on an instance already serving, where a request has spent none of its queue allowance."
+}

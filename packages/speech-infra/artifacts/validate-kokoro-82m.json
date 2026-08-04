@@ -1,0 +1,22 @@
+[
+  {
+    "check": "scale_out",
+    "verdict": "ok",
+    "detail": "fleet 1\u21922 within ~61s  (T_total budget 320s)"
+  },
+  {
+    "check": "slo_under_load",
+    "verdict": "fail",
+    "detail": "p95 TTFAB 6612ms  (SLO 3000ms, fleet 2 instances, concurrency 60)"
+  },
+  {
+    "check": "rejection_level",
+    "verdict": "warn",
+    "detail": "43697 rejections at conc 80 (below Q_max=50); 41617 (98.3%) at conc 140 (above Q_max)"
+  },
+  {
+    "check": "surge_absorption",
+    "verdict": "ok",
+    "detail": "fleet 2\u21923; p95 2712ms in surge window; 0.0% shed  (concurrency 94, ratio 1.25\u00d7)"
+  }
+]
