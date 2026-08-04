@@ -27,8 +27,14 @@ Four commands, in this order. Each one prints a `Next:` line naming the one afte
 
 Then `cdk diff`, one `cdk deploy`, and `tts-bench drift` again.
 
-Run everything from the workspace root, so `speech_infra.config` resolves — `drift` and
-`plan` both read it, and `drift` cannot work at all without it.
+Run everything from `packages/speech-infra/`, so artifacts land in
+`packages/speech-infra/artifacts/` — the directory CDK reads at synth time via
+`speech_infra.measurements`. Running from the repo root writes artifacts to
+`<root>/artifacts/` (a different directory that CDK never reads), which would cause
+`cdk synth` to silently omit all autoscaling infrastructure.
+
+`speech_infra.config` is also resolvable from `packages/speech-infra/` — `drift` and
+`plan` both require it.
 
 ---
 
