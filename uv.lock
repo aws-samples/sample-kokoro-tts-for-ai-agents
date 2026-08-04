@@ -16,6 +16,7 @@ members = [
     "stt-inference",
     "stt-tts-model-eval",
     "tts-bench",
+    "tts-client",
     "tts-eval",
     "tts-inference",
 ]
@@ -1902,7 +1903,7 @@ requires-dist = [
 [[package]]
 name = "stt-tts-model-eval"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "boto3" },
     { name = "pydantic" },
@@ -1923,6 +1924,7 @@ dev = [
     { name = "stt-bench" },
     { name = "stt-eval" },
     { name = "tts-bench" },
+    { name = "tts-client" },
     { name = "tts-eval" },
 ]
 
@@ -1947,6 +1949,7 @@ dev = [
     { name = "stt-bench", editable = "packages/stt-bench" },
     { name = "stt-eval", editable = "packages/stt-eval" },
     { name = "tts-bench", editable = "packages/tts-bench" },
+    { name = "tts-client", editable = "packages/tts-client" },
     { name = "tts-eval", editable = "packages/tts-eval" },
 ]
 
@@ -1984,6 +1987,23 @@ requires-dist = [
     { name = "shared", editable = "packages/shared" },
     { name = "tts-eval", editable = "packages/tts-eval" },
     { name = "tts-inference", editable = "packages/tts-inference" },
+]
+
+[[package]]
+name = "tts-client"
+version = "0.1.0"
+source = { editable = "packages/tts-client" }
+dependencies = [
+    { name = "aws-sdk-sagemaker-runtime-http2" },
+    { name = "boto3" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aws-sdk-sagemaker-runtime-http2", specifier = ">=0.7.0" },
+    { name = "boto3", specifier = ">=1.34.0" },
+    { name = "pydantic", specifier = ">=2.5.0" },
 ]
 
 [[package]]

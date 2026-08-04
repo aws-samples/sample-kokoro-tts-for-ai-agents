@@ -15,6 +15,7 @@ dependencies = [
 shared = { workspace = true }
 stt-inference = { workspace = true }
 tts-inference = { workspace = true }
+tts-client = { workspace = true }
 stt-eval = { workspace = true }
 tts-eval = { workspace = true }
 stt-bench = { workspace = true }
@@ -26,6 +27,7 @@ members = [
     "packages/shared",
     "packages/stt-inference",
     "packages/tts-inference",
+    "packages/tts-client",
     "packages/stt-eval",
     "packages/tts-eval",
     "packages/stt-bench",
@@ -41,6 +43,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.8.0",
     "shared",
+    "tts-client",
     "stt-eval",
     "tts-eval",
     "stt-bench",
@@ -75,6 +78,7 @@ known-first-party = [
     "shared",
     "stt_inference",
     "tts_inference",
+    "tts_client",
     "stt_eval",
     "tts_eval",
     "stt_bench",
@@ -99,6 +103,7 @@ testpaths = [
     "packages/shared/tests",
     "packages/stt-inference/tests",
     "packages/tts-inference/tests",
+    "packages/tts-client/tests",
     "packages/stt-eval/tests",
     "packages/tts-eval/tests",
     "packages/stt-bench/tests",
@@ -110,9 +115,5 @@ python_classes = "Test*"
 python_functions = "test_*"
 addopts = ["-v", "--import-mode=importlib"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/stt_tts_model_eval"]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.uv]
+package = false
