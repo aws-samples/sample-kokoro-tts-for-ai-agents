@@ -50,6 +50,9 @@ class SpeechEndpointStack(cdk.Stack):
         env_overrides["AWS_REGION"] = self.region
         env_overrides["AWS_DEFAULT_REGION"] = self.region
 
+        if model_config.queue_max_depth > 0:
+            env_overrides["MAX_QUEUE_DEPTH"] = str(model_config.queue_max_depth)
+
         if model_bucket_name:
             s3_uri = f"s3://{model_bucket_name}/models/{model_config.hf_model_id}/"
             env_overrides["MODEL_S3_URI"] = s3_uri

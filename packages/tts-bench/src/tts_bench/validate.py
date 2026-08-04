@@ -8,8 +8,9 @@ Four checks, in order:
 2. ``slo_under_load`` — after the new instance is serving, hold at 80% of C_scale_max
    per instance for 60 s and confirm p95 TTFAB stays inside the SLO.
 
-3. ``rejection_level`` — run two steps: one at Q_max-5, one at Q_max+5. Confirm
-   zero 503s below the bound and non-zero above it.
+3. ``rejection_level`` — run two steps: one at Q_max-10, one at Q_max+20. Confirm
+   zero 503s below the bound and non-zero above it. The asymmetric margins account
+   for SageMaker round-robin routing variance across instances.
 
 4. ``surge_absorption`` — baseline at 80% C_scale_max, then surge to
    ``surge_ratio × C_scale_max`` and hold for 1.2 × T_total seconds. Confirm the
@@ -255,8 +256,8 @@ def _check_rejection_level(
     warmup_s = 10.0
     hold_s = 70.0
 
-    below_concurrency = max(1, math.floor(n_instances * (q_max - 5)))
-    above_concurrency = math.ceil(n_instances * (q_max + 5))
+    below_concurrency = max(1, math.floor(n_instances * (q_max - 10)))
+    above_concurrency = math.ceil(n_instances * (q_max + 20))
 
     below_result = run_step(
         client,
@@ -451,7 +452,7 @@ def run(
             f"    hold at floor(n × C_scale_max × 0.8) for 70 s, read p95 TTFAB vs {ttfab_slo_ms:.0f}ms\n"
             "\n"
             "  check 3 — rejection_level:\n"
-            f"    two steps: conc floor(n × {q_max - 5}) then ceil(n × {q_max + 5}),\n"
+            f"    two steps: conc floor(n × {q_max - 10}) then ceil(n × {q_max + 20}),\n"
             "    expect 0 rejections below Q_max, non-zero above\n"
             "\n"
             "  check 4 — surge_absorption:\n"

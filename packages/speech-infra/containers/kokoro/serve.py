@@ -34,7 +34,10 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "56"))
+MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "0"))
 SAMPLE_RATE = 24000
+
+_inflight: int = 0
 DEFAULT_VOICE = "af_heart"
 WARMUP_TEXT = os.environ.get("WARMUP_TEXT", "Warming up.")
 
@@ -270,6 +273,18 @@ async def _invocations_sync(text: str, voice: str, speed: float) -> Response:
 
 async def invocations(request: Request) -> Response:
     """TTS: accept text, return WAV audio (streaming by default)."""
+    global _inflight
+
+    if MAX_QUEUE_DEPTH > 0 and _inflight >= MAX_QUEUE_DEPTH:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "queue_saturated",
+                "queue_depth": _inflight,
+                "max_queue_depth": MAX_QUEUE_DEPTH,
+            },
+        )
+
     body = json.loads(await request.body())
     text = body.get("text", "")
     voice = body.get("voice", DEFAULT_VOICE)
@@ -283,11 +298,24 @@ async def invocations(request: Request) -> Response:
     if not text:
         return JSONResponse(status_code=400, content={"error": "text is required"})
 
+    _inflight += 1
+
     if not use_stream:
-        return await _invocations_sync(text, voice, speed)
+        try:
+            return await _invocations_sync(text, voice, speed)
+        finally:
+            _inflight -= 1
+
+    async def _counted_stream() -> AsyncGenerator[bytes, None]:
+        global _inflight
+        try:
+            async for chunk in _stream_sentences_generator(text, voice, speed):
+                yield chunk
+        finally:
+            _inflight -= 1
 
     return StreamingResponse(
-        _stream_sentences_generator(text, voice, speed),
+        _counted_stream(),
         media_type="audio/wav",
     )
 
