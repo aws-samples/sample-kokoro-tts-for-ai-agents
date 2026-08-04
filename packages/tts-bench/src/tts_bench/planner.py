@@ -1,45 +1,50 @@
 """Turn measurements into a scaling configuration.
 
-The step that closes the loop. ``cmax`` measures ``C_max`` and ``S``, ``ttotal``
+The step that closes the loop. ``qmax`` measures ``Q_max`` against the SLO, ``ttotal``
 measures the scaling lag stage by stage, and this module composes them with a stated
-scenario into the four numbers ``ModelEndpointConfig`` actually needs:
-``scaling_target_value``, ``queue_max_depth``, ``min_instances``, ``max_instances``.
+scenario into what ``ModelEndpointConfig`` actually needs: ``scaling_target_value``,
+``scale_in_threshold``, ``queue_max_depth``, ``min_instances``, ``max_instances``.
 
 No new math lives here. Every equation is in :mod:`shared.capacity`, which is
 modality-neutral and unit-tested without AWS in scope; this module's job is
 composition, provenance, and refusing to compose things that should not be combined.
 
-**The provision stage is swept, not assumed.** ``T_total`` is not one portable number.
-Its container stages are properties of the image and transfer between accounts; its
-EC2-provision stage is a property of *this* account's spare capacity, and the customer
-account uses reserved capacity where placement is guaranteed and faster. So the planner
-takes the measured stages, subtracts the provision stage, and re-adds a *stated* one —
-once per assumption — producing a plan per assumed provision time. See
-:func:`plan_sweep`. A single-number plan would be precisely wrong for the account it
-is meant to configure.
+**Six variables, and only two of them are measured.** ``SLO`` and
+``max_scaling_per_T_total`` are chosen; ``Q_max`` and ``T_total`` are measured;
+``C_scale_max`` and ``C_scale_min`` are arithmetic on the other four
+(:func:`shared.capacity.scale_thresholds`). There is no ceiling to compare against and
+no knee to pick a column from — one ladder, one SLO, one answer.
 
-**Two refusals, both hard.** A ``C_max`` curve and a ``T_total`` lag measured on
+**Three refusals, all hard.** A ``Q_max`` ladder and a ``T_total`` lag measured on
 different configurations cannot be combined (:func:`assert_pairable`) — that is what
-the fingerprint is for. And a queueing budget that does not fit inside SageMaker's 60s
-invocation ceiling is ``INFEASIBLE`` rather than a warning, because the requests it
-admits wait the full ``W_max`` and then fail anyway.
+the fingerprint is for. A ``Q_max`` measured against one SLO cannot be read against
+another, because the SLO is the line that *defines* it. And a queueing budget that does
+not fit inside SageMaker's 60s invocation ceiling is ``INFEASIBLE`` rather than a
+warning, because the requests it admits wait the full ``W_max`` and then fail anyway.
 
 **``W_max`` is derived, never stated.** The SLO is end-to-end — a request must reach
 first byte within ``ttfab_slo_ms`` *including* its time in the queue — so the queueing
 budget is ``SLO - S_p95`` and nothing else. It used to be a hand-set ``Scenario`` field
-sitting beside the latency budget with no relation between them, which is how kokoro
-came to be deployed with a 20 s queue allowance under a 300 ms budget. Two independent
-numbers can disagree with the promise; one derived number cannot.
+sitting beside a second latency budget with no relation between them, which is how
+kokoro came to be deployed with a 20 s queue allowance under a 300 ms budget. Two
+independent numbers can disagree with the promise; one derived number cannot.
 
-**``C_max`` is whichever of two limits binds.** ``cmax`` measures a latency knee and a
-throughput ceiling, and an instance is bound by the one it reaches first.
-:meth:`Measured.binding_c_max` takes the lower and names it; the findings distinguish a
-bracketed answer from a lower bound, because those want different follow-up runs.
+**The thresholds ship in CloudWatch units, not client units.** ``C_scale_max`` is a
+client-side occupancy; the deployed alarm reads ``ConcurrentRequestsPerModel`` /
+*Maximum*. Those differed by 1.35x to 9.8x across one kokoro ladder, so the conversion
+is measured per configuration on the same run and reported beside the raw figure.
+Deploying the unconverted number is the defect that put 0.713 on the endpoint — a value
+no positive arrival rate satisfies.
+
+**Two known limits of the simple rule, computed rather than asserted.**
+:func:`shared.capacity.shed_probability` says whether ``C_scale_max`` fires early
+enough to survive one ``T_total`` (``surge_survival``), and
+``ScaleThresholds.min_safe_instances`` says whether scale-in flaps at the planned fleet
+size (``scale_in_safety``). Both are findings, so a fragile plan is visibly fragile.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -48,20 +53,14 @@ from loguru import logger
 from shared.capacity import (
     CLOUDWATCH_HIGH_RES_PERIOD_S,
     SAGEMAKER_INVOCATION_CEILING_S,
-    c_slo_cap,
-    c_target,
-    effective_c_target,
-    effective_headroom_lag_s,
     fits_invocation_ceiling,
-    lambda_cap_per_instance,
     max_added_wait_under_ceiling,
     n_instances,
     n_instances_from_streams,
-    q_per_instance,
-    queue_covers_surge,
+    scale_thresholds,
+    shed_probability,
     slo_is_feasible,
-    utilization_at_k,
-    w_absorbed,
+    utilization_for_occupancy,
     w_max_for_slo,
 )
 from tts_bench.types import (
@@ -75,32 +74,23 @@ from tts_bench.types import (
 )
 
 if TYPE_CHECKING:
-    from tts_bench.types import CMaxReport
+    from tts_bench.types import QMaxReport
 
-#: Stages whose duration belongs to AWS provisioning an EC2 instance, from the
-#: scaling activity starting to the container's log stream opening. The one stage
-#: reserved capacity changes, and so the one this module sweeps rather than trusts.
-PROVISION_FROM_STAGE = "activity_started"
+#: Stages whose duration belongs to AWS provisioning an EC2 instance, from the capacity
+#: change being requested to the container's log stream opening. The one stage reserved
+#: capacity changes, and so the one the plan labels as this account's rather than the
+#: configuration's.
+PROVISION_FROM_STAGE = "desired_set"
 PROVISION_TO_STAGE = "instance_logging"
 
-#: Provision times to sweep when none are given, seconds. Spans "reserved capacity,
-#: warm" through "on-demand, contended" — the range within which the answer for the
-#: customer account is expected to fall, without claiming to know where.
-DEFAULT_PROVISION_SWEEP_S: tuple[float, ...] = (60.0, 120.0, 300.0, 600.0)
+#: Run-to-run spread in ``Q_max`` above which the ladder is measuring noise. Both
+#: thresholds are fractions of ``Q_max``, so its spread propagates to both.
+Q_MAX_SPREAD_WARN = 0.2
 
-#: Growth factors to sweep. ``k`` is the one input that cannot be measured without
-#: production traffic, so showing the config's sensitivity to it is more honest than
-#: printing one row and letting the reader assume it was derived.
-DEFAULT_K_SWEEP: tuple[float, ...] = (1.0, 2.0, 3.0, 5.0)
-
-#: Cost multiple above the k=1 fleet at which the surge reserve stops being the
-#: cheapest answer. Past this, shortening T_total or pre-warming beats buying idle
-#: instances, and the plan says so rather than quietly costing 4x.
-FLEET_COST_WARN_MULTIPLE = 3.0
-
-#: Curve spread above which the ladder is measuring noise. Matches the threshold
-#: documented on ``CMaxReport.curve_spread``.
-CURVE_SPREAD_WARN = 0.2
+#: P(shedding within one ``T_total``) above which ``C_scale_max`` is not early enough.
+#: Not zero: a queue is a stochastic object and some tail risk is the price of running
+#: it at all. 0.1 is one surge in ten reaching ``Q_max`` before help arrives.
+SHED_PROBABILITY_WARN = 0.1
 
 
 class PlannerError(RuntimeError):
@@ -117,68 +107,50 @@ class TTotalStages:
     ``provision_s`` is separated out for one reason: it is the only stage whose value
     in the customer's reserved-capacity account is knowably different from ours. Ours
     is a measurement of EC2 spare capacity in us-east-1 on one afternoon; theirs is a
-    property of a contract. Everything else — detection, alarm, image pull, weights,
-    framework init, warm-up, recovery — is a property of the configuration and carries
-    across.
+    property of a contract. Everything else — image pull, weights, framework init,
+    warm-up, recovery — is a property of the configuration and carries across.
     """
 
     total_s: float | None
-    """Load applied through to traffic recovered, as measured. ``None`` when the run
+    """``desired_set`` through to traffic recovered, as measured. ``None`` when the run
     never observed enough stages to span it."""
 
     provision_s: float | None
-    """``activity_started`` -> ``instance_logging``. ``None`` when either boundary was
-    not observed, in which case there is nothing to substitute and
-    :meth:`with_provision_s` says so."""
+    """``desired_set`` -> ``instance_logging``. ``None`` when either boundary was not
+    observed, in which case there is nothing to attribute to this account."""
+
+    policy_bound_s: float | None = None
+    """Detection lag the ``force-desired`` trigger bypasses, bounded from the deployed
+    policy's own configuration rather than measured. Carried separately so the sum
+    stays decomposable: see :attr:`plan_total_s`."""
 
     bounded: bool = False
     """Whether ``total_s`` rests on an inferred endpoint. A bounded total that stops at
     ``in_service`` *under*-reports the lag, which is the dangerous direction."""
 
     trigger: str = ""
-    """``drive-load`` or ``force-desired``. A ``force-desired`` run skips the metric and
-    alarm stages entirely, so its total is not a ``T_total`` at all."""
+    """Always ``force-desired``. That trigger raises ``DesiredInstanceCount`` directly,
+    so its total is the capacity half only — the policy half is the bound above."""
 
     config_slug: str = ""
     run_id: str = ""
     missing_stages: tuple[str, ...] = ()
 
     @property
-    def transferable_s(self) -> float | None:
-        """Measured lag with the provision stage removed, seconds.
+    def plan_total_s(self) -> float | None:
+        """The lag to plan against: the measured span plus the bounded policy lag.
 
-        The portable half. ``None`` when the total is unknown; equal to the total when
-        the provision stage was not observed, since removing an unknown is not a
-        subtraction we can do.
+        Production scales out through the policy, not through a capacity call, so the
+        measured half alone under-states what a surge has to be absorbed across. The
+        two terms stay separate on the artifact and are added exactly here, once.
         """
         if self.total_s is None:
             return None
-        if self.provision_s is None:
-            return self.total_s
-        return max(0.0, self.total_s - self.provision_s)
+        return self.total_s + (self.policy_bound_s or 0.0)
 
     @property
     def provision_measured(self) -> bool:
         return self.provision_s is not None
-
-    def with_provision_s(self, provision_s: float) -> float:
-        """The lag to plan against, substituting a stated provision time.
-
-        Raises:
-            PlannerError: If no measured total exists to substitute into. Callers that
-                have no ``T_total`` at all should sweep an assumed *total* instead —
-                see :func:`plan_sweep`'s ``assume_total`` path.
-        """
-        if provision_s < 0:
-            raise ValueError(f"provision_s must be non-negative, got {provision_s}")
-        transferable = self.transferable_s
-        if transferable is None:
-            raise PlannerError(
-                "no measured T_total to substitute a provision time into. The ttotal "
-                "artifact observed too few stages to span a total; re-run `tts-bench "
-                "ttotal`, or plan against an assumed total with --assume-t-total."
-            )
-        return transferable + provision_s
 
     @classmethod
     def from_artifact(cls, raw: dict[str, Any]) -> TTotalStages:
@@ -205,10 +177,15 @@ class TTotalStages:
                     break
 
         total = raw.get("t_total_s")
+        # Read the bound off the artifact rather than importing the constant: the
+        # deployed policy's periods and cooldown are what the number came from, and a
+        # plan built later should use the bound that applied when the lag was measured.
+        bound = raw.get("policy_lag_bound_s")
         missing = raw.get("missing_stages")
         return cls(
             total_s=float(total) if isinstance(total, int | float) else None,
             provision_s=provision_s,
+            policy_bound_s=float(bound) if isinstance(bound, int | float) else None,
             bounded=bool(raw.get("t_total_bounded", False)),
             trigger=str(raw.get("trigger", "")),
             config_slug=str(raw.get("config_slug", "")),
@@ -218,15 +195,15 @@ class TTotalStages:
 
 
 def assert_pairable(
-    measured: CMaxReport | Measured,
+    measured: QMaxReport | Measured,
     stages: TTotalStages,
     *,
     allow_mismatch: bool = False,
 ) -> None:
-    """Refuse to pair a ``C_max`` curve with a ``T_total`` lag from another configuration.
+    """Refuse to pair a ``Q_max`` ladder with a ``T_total`` lag from another configuration.
 
-    The whole point of the fingerprint. Pairing a g5 curve with a g6 lag produces a
-    plan for a fleet that exists nowhere: the curve sizes instances of one type while
+    The whole point of the fingerprint. Pairing a g5 ladder with a g6 lag produces a
+    plan for a fleet that exists nowhere: the ladder sizes instances of one type while
     the lag describes how fast a different type boots, and nothing about the resulting
     numbers looks wrong.
 
@@ -236,7 +213,7 @@ def assert_pairable(
     on the old artifacts.
 
     Args:
-        measured: The ``C_max`` side, either report shape.
+        measured: The ``Q_max`` side, either report shape.
         stages: The ``T_total`` side.
         allow_mismatch: Downgrade to a warning, for an operator who knows the
             difference is irrelevant to what they are planning.
@@ -244,21 +221,21 @@ def assert_pairable(
     Raises:
         PlannerError: If the two slugs differ and ``allow_mismatch`` is false.
     """
-    cmax_slug = _slug_of(measured)
+    qmax_slug = _slug_of(measured)
     ttotal_slug = stages.config_slug
 
-    if cmax_slug and ttotal_slug and cmax_slug == ttotal_slug:
+    if qmax_slug and ttotal_slug and qmax_slug == ttotal_slug:
         return
 
-    if not cmax_slug or not ttotal_slug:
+    if not qmax_slug or not ttotal_slug:
         detail = (
-            f"one artifact carries no configuration fingerprint (C_max {cmax_slug or 'none'!r}, "
+            f"one artifact carries no configuration fingerprint (Q_max {qmax_slug or 'none'!r}, "
             f"T_total {ttotal_slug or 'none'!r}); it predates fingerprinting, so there is "
             "nothing to check it against"
         )
     else:
         detail = (
-            f"C_max was measured on {cmax_slug!r} but T_total on {ttotal_slug!r}; the curve "
+            f"Q_max was measured on {qmax_slug!r} but T_total on {ttotal_slug!r}; the ladder "
             "sizes instances of one configuration while the lag describes how fast another "
             "one boots"
         )
@@ -277,7 +254,7 @@ def assert_pairable(
     )
 
 
-def _slug_of(measured: CMaxReport | Measured) -> str:
+def _slug_of(measured: QMaxReport | Measured) -> str:
     """Configuration slug of either report shape.
 
     ``Measured`` has no ``config_slug`` property — it is the joined planner input
@@ -299,56 +276,69 @@ def plan_one(
     scenario: Scenario,
     *,
     provision_s: float | None = None,
+    policy_bound_s: float | None = None,
     ceiling_s: float = SAGEMAKER_INVOCATION_CEILING_S,
 ) -> ScalingPlan:
-    """One scaling configuration, for one scenario at one assumed provision time.
+    """The scaling configuration for one measurement and one scenario.
 
     Composes :mod:`shared.capacity` in the order the numbers depend on each other: the
-    binding ``C_max`` at the chosen budget, the queueing budget the SLO leaves over, the
-    binding target, the fleet that target implies at peak and trough, the queue depth
-    that target's rate can drain, then the findings that say whether any of it holds.
+    two thresholds from ``Q_max`` and the surge ratio, the queueing budget the SLO
+    leaves over, the fleet those thresholds imply at peak and trough, the CloudWatch
+    conversion the alarm needs, then the findings that say whether any of it holds.
 
     ``W_max`` is computed here rather than read off the scenario — ``SLO - S_p95``,
-    which is the only value consistent with an end-to-end promise. ``C_max`` is the
-    lower of the latency knee and the throughput ceiling, since an instance is bound by
-    whichever it reaches first.
+    which is the only value consistent with an end-to-end promise.
 
     Args:
-        measured: Joined ``C_max`` + ``T_total`` input. ``t_total_s`` here is the lag
-            to plan against, already substituted — see :func:`plan_sweep`.
-        scenario: The stated load and policy choices. Every field is an assumption.
-        provision_s: Recorded in the findings when the lag was built by substitution,
-            so a swept row is identifiable as such. Does not change the arithmetic.
+        measured: Joined ``Q_max`` + ``T_total`` input. Its ``t_total_s`` is the lag to
+            plan against, policy bound already included by
+            :func:`measured_from_artifacts`.
+        scenario: The stated load and the two chosen variables. Every field is an
+            assumption.
+        provision_s: The measured EC2 provision stage, for the ``provision_stage``
+            finding. Does not change the arithmetic — it is a *label* on which part of
+            the lag belongs to this account rather than to the configuration.
+        policy_bound_s: The bounded policy-detection term inside ``t_total_s``, for the
+            same finding. ``None`` when the lag was stated whole.
         ceiling_s: The invocation ceiling to judge against. Overridable for testing
             and for a stricter internal SLO, never for making an infeasible plan pass.
 
     Raises:
-        PlannerError: If the chosen TTFAB budget is below every measured budget, so
-            there is no knee to plan against.
+        PlannerError: If the scenario's SLO is not the one ``Q_max`` was measured
+            against, or if the surge ratio admits no usable thresholds.
     """
-    budget_ms = scenario.ttfab_budget_ms
+    if measured.slo_ms != scenario.ttfab_slo_ms:
+        raise PlannerError(
+            f"Q_max was measured against a {measured.slo_ms}ms SLO but this scenario asks "
+            f"for {scenario.ttfab_slo_ms}ms. Q_max is *defined* by the SLO — it is the "
+            "highest concurrency whose p95 stayed inside that line — so the ladder says "
+            f"nothing about the other one. Plan at --ttfab-slo-ms {measured.slo_ms}, or "
+            f"re-run `tts-bench qmax --slo-ms {scenario.ttfab_slo_ms}`."
+        )
+
+    q_max = measured.q_max
+    surge = scenario.max_scaling_per_t_total
     try:
-        c_max, c_max_source = measured.binding_c_max(budget_ms)
+        thresholds = scale_thresholds(q_max, surge)
     except ValueError as exc:
         raise PlannerError(
-            f"no C_max measured at or below the {budget_ms}ms budget "
-            f"(measured: {sorted(measured.c_max_curve)}). Re-run `tts-bench cmax` with "
-            f"--ttfab-budgets including {budget_ms}, or plan against a measured budget."
+            f"cannot derive thresholds from Q_max {q_max} at a {surge:g}x surge ratio: {exc}"
         ) from exc
 
-    k = scenario.growth_factor_k
-    derate = scenario.derate
-    s_mean = measured.s_mean_s
     slo_s = scenario.ttfab_slo_ms / 1000.0
     # Derived, not read: the SLO is queue plus service, so the queue gets what service
     # leaves. Clamps at 0 when the model's own tail already misses the promise, which
     # `_slo_finding` reports as INFEASIBLE rather than as "no queue configured".
     w_max = w_max_for_slo(slo_s, measured.s_p95_s)
 
-    target, binding = effective_c_target(c_max, k, s_mean, w_max, derate)
-
-    peak_n = _fleet_for(scenario.peak_rps, scenario.peak_streams, s_mean, target)
-    trough_n = _fleet_for(scenario.trough_rps, scenario.trough_streams, s_mean, target)
+    # The fleet is sized on the scale-out threshold, not on Q_max: Q_max is where the
+    # SLO breaks, and sizing a fleet to sit there is sizing it to sit at the edge.
+    peak_n = _fleet_for(
+        scenario.peak_rps, scenario.peak_streams, measured.s_mean_s, thresholds.c_scale_max
+    )
+    trough_n = _fleet_for(
+        scenario.trough_rps, scenario.trough_streams, measured.s_mean_s, thresholds.c_scale_max
+    )
 
     # min is the floor a reserved-capacity account pays for whatever the traffic does,
     # so it is the trough fleet -- not 1 -- once a trough is stated. max is the peak
@@ -357,33 +347,33 @@ def plan_one(
     min_instances = max(scenario.min_instances_floor, trough_n)
     max_instances = max(min_instances, peak_n)
 
-    queue_depth = q_per_instance(c_max, s_mean, w_max)
-    absorbed = w_absorbed(w_max, k)
-    headroom_lag, floored = effective_headroom_lag_s(w_max, k, measured.t_total_s)
+    cw = _cw_units(measured, thresholds.c_scale_max)
+    utilization = utilization_for_occupancy(thresholds.c_scale_max)
+    shed = _shed_probability(measured, thresholds.c_scale_max, q_max)
 
-    # k=1 is the no-reserve baseline: same load, same knee, no headroom held back.
-    # Dividing fleets rather than costs keeps it an instance-count ratio, which is
-    # what the reader can check against the two rows.
-    baseline_target = c_target(c_max, 1.0, derate)
-    baseline_peak = _fleet_for(scenario.peak_rps, scenario.peak_streams, s_mean, baseline_target)
+    # A no-headroom fleet is the baseline: same load, same Q_max, scaling out only when
+    # the SLO is already at the line. Dividing fleets rather than costs keeps it an
+    # instance-count ratio, which is what the reader can check against the two numbers.
+    baseline_peak = _fleet_for(
+        scenario.peak_rps, scenario.peak_streams, measured.s_mean_s, float(q_max)
+    )
     relative_cost = peak_n / baseline_peak if baseline_peak else 1.0
 
-    plan_cost = _peak_cost(measured, scenario, peak_n, target)
+    plan_cost = _peak_cost(measured, scenario, peak_n, thresholds.c_scale_max)
 
     findings = _findings(
         measured=measured,
         scenario=scenario,
-        c_max=c_max,
-        c_max_source=c_max_source,
-        target=target,
-        binding=binding,
+        thresholds=thresholds,
         peak_n=peak_n,
-        queue_depth=queue_depth,
+        min_instances=min_instances,
         w_max=w_max,
-        headroom_lag=headroom_lag,
-        floored=floored,
+        cw=cw,
+        utilization=utilization,
+        shed=shed,
         relative_cost=relative_cost,
         provision_s=provision_s,
+        policy_bound_s=policy_bound_s,
         ceiling_s=ceiling_s,
     )
 
@@ -391,29 +381,84 @@ def plan_one(
         model_name=measured.model_name,
         endpoint=measured.endpoint,
         instance_type=measured.instance_type,
-        c_max=c_max,
-        c_max_source=c_max_source,
-        c_max_is_lower_bound=measured.binding_is_lower_bound(budget_ms),
-        c_target=target,
-        binding_constraint=binding,
+        q_max=q_max,
+        q_max_is_lower_bound=not measured.q_max_bracketed,
+        c_scale_max=thresholds.c_scale_max,
+        c_scale_min=thresholds.c_scale_min,
+        c_scale_max_in_cw_units=cw[0],
+        cw_units_ratio=cw[1],
+        min_safe_instances=thresholds.min_safe_instances,
         w_max_s=w_max,
+        # The same `ceiling_s` the finding above was judged against, so the renderer can
+        # name it instead of interpolating the constant. One source for the number: a
+        # plan whose config block claimed 60s while the finding checked something else
+        # would contradict itself in the block that gets pasted into config.py.
+        ceiling_s=ceiling_s,
         min_instances=min_instances,
         max_instances=max_instances,
         peak_instances=peak_n,
         trough_instances=trough_n,
-        queue_max_depth=queue_depth,
+        # The admission bound *is* Q_max: past it a request cannot reach first byte
+        # inside the SLO, so admitting it buys a late success instead of an honest 503.
+        queue_max_depth=q_max,
         scale_out_cooldown_s=_scale_out_cooldown_s(measured.t_total_s),
         scale_in_cooldown_s=_scale_in_cooldown_s(measured.t_total_s),
-        utilization_at_target=utilization_at_k(k, derate),
-        w_absorbed_s=absorbed,
-        headroom_lag_s=headroom_lag,
+        utilization_at_c_scale_max=utilization,
+        shed_probability_at_c_scale_max=shed,
         peak_cost_per_hour=plan_cost[0],
         peak_cost_per_m_chars=plan_cost[1],
-        relative_fleet_cost_vs_k1=relative_cost,
         findings=findings,
         measured=measured,
         scenario=scenario,
     )
+
+
+def _cw_units(measured: Measured, c_scale_max: float) -> tuple[float | None, float | None]:
+    """``c_scale_max`` in CloudWatch ``Maximum`` units, and the ratio that converted it.
+
+    The threshold that ships is the converted number. ``ConcurrentRequestsPerModel`` /
+    *Maximum* over a 10s period and a client's mean in-flight are different quantities:
+    the first is a peak over a window, the second an average over a run, and across one
+    kokoro ladder they ran from 9.8x apart to 1.35x apart. So the ratio is measured per
+    configuration, at the rung nearest the threshold being converted, rather than fitted
+    once and reused.
+
+    Returns ``(None, None)`` when the ladder recorded no server-side statistic — the
+    plan then says the conversion is unavailable instead of assuming it is 1:1, which
+    is the assumption that put 0.713 on the endpoint.
+    """
+    table = measured.cw_units_ratio_by_rung
+    if not table:
+        return None, None
+    # Nearest rung, ties to the *higher* one: the ratio shrinks as load rises, so at a
+    # tie the higher rung gives the smaller multiplier and the tighter threshold.
+    rung = min(table, key=lambda r: (abs(r - c_scale_max), -r))
+    ratio = table[rung]
+    if ratio <= 0:
+        return None, None
+    return c_scale_max * ratio, ratio
+
+
+def _shed_probability(measured: Measured, c_scale_max: float, q_max: int) -> float | None:
+    """P(the queue reaches ``Q_max``) while one ``T_total`` elapses from ``C_scale_max``.
+
+    ``s_mean_s`` is the service rate the simulation drains at. It includes the client
+    round trip, so it over-states service slightly and the result is conservative in
+    the safe direction — a real instance drains a little faster than this says.
+
+    ``None`` rather than a number when the simulation's own preconditions do not hold,
+    since a fabricated probability is worse than a missing one.
+    """
+    try:
+        return shed_probability(
+            c_scale_max,
+            float(q_max),
+            measured.t_total_s,
+            measured.s_mean_s,
+        )
+    except ValueError as exc:
+        logger.warning("Cannot simulate shedding at C_scale_max {}: {}", c_scale_max, exc)
+        return None
 
 
 def _fleet_for(
@@ -448,9 +493,9 @@ def _peak_cost(
     Reported that way rather than adjusted by a guessed discount.
 
     Characters per hour come from the planned throughput, not from a saturated
-    measurement: a fleet running at ``derate / k`` produces well below what one
-    saturated instance extrapolates to, and using the saturated figure would report
-    the unit cost of a fleet nobody is running.
+    measurement: a fleet held at ``C_scale_max`` produces below what one saturated
+    instance extrapolates to, and using the saturated figure would report the unit cost
+    of a fleet nobody is running.
     """
     from tts_bench.cost import cost_per_m_chars, hourly_rate
 
@@ -459,7 +504,7 @@ def _peak_cost(
     served_rps = _served_rps(scenario, measured.s_mean_s, target_concurrency, peak_n)
     chars_per_hour = served_rps * measured.chars_per_request * 3600.0
     if chars_per_hour <= 0:
-        # Either no load, or a curve that recorded no throughput. inf rather than 0:
+        # Either no load, or a ladder that recorded no throughput. inf rather than 0:
         # an endpoint producing nothing has no meaningful unit cost, and 0 would make
         # a plan for a broken measurement look free.
         return per_hour, float("inf")
@@ -476,7 +521,7 @@ def _served_rps(
 
     The stated peak when one was given. For a stream-shaped scenario there is no
     stated rate, so it is inferred from the concurrency the fleet is allowed to carry
-    — which is the honest reading: ``N x C_target`` streams each completing every
+    — which is the honest reading: ``N x C_scale_max`` streams each completing every
     ``S``.
     """
     if scenario.peak_rps is not None:
@@ -503,7 +548,8 @@ def _scale_in_cooldown_s(t_total_s: float) -> int:
     Deliberately asymmetric with scale-out and deliberately long: capacity removed
     takes a full ``T_total`` to get back, so scaling in early converts a saved
     dollar into a missed SLO. Several lags' worth, floored at 5 minutes so a fast
-    ``T_total`` does not produce a twitchy policy.
+    ``T_total`` does not produce a twitchy policy — and it is also what damps the
+    flap ``scale_in_safety`` warns about.
     """
     return int(max(300.0, 3 * t_total_s))
 
@@ -512,354 +558,403 @@ def _findings(
     *,
     measured: Measured,
     scenario: Scenario,
-    c_max: float,
-    c_max_source: str,
-    target: float,
-    binding: str,
+    thresholds: Any,
     peak_n: int,
-    queue_depth: int,
+    min_instances: int,
     w_max: float,
-    headroom_lag: float,
-    floored: bool,
+    cw: tuple[float | None, float | None],
+    utilization: float,
+    shed: float | None,
     relative_cost: float,
     provision_s: float | None,
+    policy_bound_s: float | None,
     ceiling_s: float,
 ) -> list[Finding]:
     """Every feasibility statement, in the order a reader needs them.
 
     Ordered by what invalidates what: an untrustworthy measurement makes the rest
-    moot, an infeasible SLO makes the fleet size irrelevant, and cost only matters
-    once the plan holds.
+    moot, an infeasible SLO makes the fleet size irrelevant, a threshold in the wrong
+    units makes the policy wrong whatever the numbers say, and cost only matters once
+    the plan holds.
 
-    ``w_max`` is passed in rather than read off the scenario: it is *derived* from the
-    SLO in :func:`plan_one`, and re-deriving it here would be a second place for the
-    arithmetic to live. The findings below quote it against the SLO it came from.
+    ``w_max`` and ``thresholds`` are passed in rather than recomputed: they are derived
+    in :func:`plan_one`, and re-deriving them here would be a second place for the
+    arithmetic to live.
     """
     out: list[Finding] = []
-    k = scenario.growth_factor_k
 
     out.append(_trust_finding(measured))
-    out.append(_repeatability_finding(measured, scenario.ttfab_budget_ms))
-    out.append(_c_max_source_finding(measured, scenario.ttfab_budget_ms, c_max, c_max_source))
+    out.append(_repeatability_finding(measured))
     out.append(_slo_finding(measured, scenario.ttfab_slo_ms, w_max))
-
-    fits, deadline = fits_invocation_ceiling(w_max, measured.s_p95_s, ceiling_s)
-    if fits:
-        out.append(
-            Finding(
-                name="invocation_ceiling",
-                verdict=Verdict.OK,
-                detail=(
-                    f"a queued request finishes in {deadline:.1f}s worst case "
-                    f"(W_max {w_max:.1f}s + p95 service {measured.s_p95_s:.2f}s), inside "
-                    f"the {ceiling_s:.0f}s SageMaker invocation ceiling"
-                ),
-            )
-        )
-    else:
-        largest = max_added_wait_under_ceiling(measured.s_p95_s, ceiling_s)
-        out.append(
-            Finding(
-                name="invocation_ceiling",
-                verdict=Verdict.INFEASIBLE,
-                detail=(
-                    f"a queued request would take {deadline:.1f}s worst case "
-                    f"(W_max {w_max:.1f}s + p95 service {measured.s_p95_s:.2f}s), past the "
-                    f"{ceiling_s:.0f}s SageMaker invocation ceiling. Those requests wait "
-                    "the full W_max and then fail anyway, which is worse than refusing "
-                    "them at admission."
-                ),
-                # W_max is SLO - S_p95, so the deadline *is* the stated SLO whenever the
-                # SLO is feasible — this branch is reached only by an SLO past the
-                # platform ceiling, and the fix is to state one inside it. Where S_p95
-                # alone busts the ceiling no SLO helps, because nothing under the model's
-                # own tail is reachable.
-                recommendation=(
-                    f"--ttfab-slo-ms {int(ceiling_s * 1000)} or less; a longer SLO cannot "
-                    "be served whatever the queue does"
-                    if largest > 0
-                    else (
-                        f"p95 service time ({measured.s_p95_s:.1f}s) alone exceeds the "
-                        "ceiling; no SLO or queue length fixes this. Shorten the request, "
-                        "or serve it off a real-time endpoint."
-                    )
-                ),
-            )
-        )
-
+    out.append(_ceiling_finding(measured, w_max, ceiling_s))
+    out.append(_queue_depth_finding(measured, w_max))
+    out.append(_threshold_units_finding(thresholds.c_scale_max, cw))
     out.append(
-        Finding(
-            name="binding_constraint",
-            verdict=Verdict.OK,
-            detail=(
-                f"C_target {target:.3f} is set by {binding}: surge headroom wants "
-                f"{c_target(c_max, k, scenario.derate):.3f} (derate {scenario.derate} x "
-                f"C_max {c_max:.2f} / k {k:g}), the wait budget wants "
-                f"{c_slo_cap(w_max, measured.s_mean_s):.3f} (W_max {w_max:.1f}s / S "
-                f"{measured.s_mean_s:.3f}s + 1)"
-            ),
-            recommendation=(
-                "a surge-bound target wants a smaller k or a shorter T_total"
-                if binding == "surge_headroom"
-                else "an SLO-bound target wants a faster model or a looser wait budget"
-            ),
+        _surge_finding(
+            measured=measured,
+            scenario=scenario,
+            c_scale_max=thresholds.c_scale_max,
+            utilization=utilization,
+            shed=shed,
         )
     )
-
-    covers = queue_covers_surge(w_max, k, measured.t_total_s)
-    if covers:
-        out.append(
-            Finding(
-                name="queue_covers_surge",
-                verdict=Verdict.OK,
-                detail=(
-                    # k=1 makes W_absorbed infinite, which is true but unreadable as a
-                    # duration. Say why it is infinite instead of printing "inf s".
-                    f"traffic is flat at k=1, so no backlog accumulates and the queue "
-                    f"covers the whole {measured.t_total_s:.0f}s T_total"
-                    if k == 1
-                    else (
-                        f"the queue absorbs {w_absorbed(w_max, k):.0f}s of lag at k={k:g}, past "
-                        f"the {measured.t_total_s:.0f}s T_total — a surge of this size is "
-                        "invisible to clients"
-                    )
-                ),
-            )
-        )
-    else:
-        out.append(
-            Finding(
-                name="queue_covers_surge",
-                verdict=Verdict.WARN,
-                detail=(
-                    f"the queue absorbs {w_absorbed(w_max, k):.0f}s of a {measured.t_total_s:.0f}s "
-                    f"T_total at k={k:g}, leaving {headroom_lag:.0f}s for standing headroom "
-                    f"to cover — which is what holds C_target down to {target:.3f}"
-                ),
-                recommendation=(
-                    "shorten T_total, loosen the SLO if the promise allows (W_max follows "
-                    "it), or accept the idle instances the reserve costs"
-                ),
-            )
-        )
-
-    out.append(_headroom_finding(k, headroom_lag, floored))
-
     out.append(
-        Finding(
-            name="queue_depth",
-            verdict=Verdict.OK if queue_depth > 0 else Verdict.WARN,
-            detail=(
-                f"Q_max {queue_depth} per instance = Lambda_cap "
-                f"{lambda_cap_per_instance(c_max, measured.s_mean_s):.2f} rps x W_max "
-                f"{w_max:.2f}s"
-                if queue_depth > 0
-                else (
-                    f"Q_max rounds to 0: at Lambda_cap "
-                    f"{lambda_cap_per_instance(c_max, measured.s_mean_s):.2f} rps the "
-                    f"{w_max:.2f}s W_max the SLO leaves does not cover one request, so no "
-                    "queue can help"
-                )
-            ),
-            recommendation=(
-                None
-                if queue_depth > 0
-                else "loosen --ttfab-slo-ms, use a faster model, or shed load"
-            ),
+        _scale_in_finding(
+            thresholds=thresholds,
+            scenario=scenario,
+            min_instances=min_instances,
         )
     )
-
-    if relative_cost >= FLEET_COST_WARN_MULTIPLE:
-        out.append(
-            Finding(
-                name="fleet_cost",
-                verdict=Verdict.WARN,
-                detail=(
-                    f"the k={k:g} reserve costs {relative_cost:.1f}x the k=1 fleet "
-                    f"({peak_n} instances against "
-                    f"{max(1, round(peak_n / relative_cost))}) at "
-                    f"{utilization_at_k(k, scenario.derate):.0%} utilization"
-                ),
-                recommendation=(
-                    "at this multiple, shortening T_total or pre-warming is cheaper than "
-                    "buying headroom"
-                ),
-            )
+    out.append(_fleet_cost_finding(scenario, thresholds.c_scale_max, peak_n, relative_cost))
+    out.append(
+        _provision_finding(
+            provision_s=provision_s,
+            policy_bound_s=policy_bound_s,
+            total_s=measured.t_total_s,
+            lag_measured=measured.t_total_measured,
         )
-    else:
-        out.append(
-            Finding(
-                name="fleet_cost",
-                verdict=Verdict.OK,
-                detail=(
-                    f"the k={k:g} reserve costs {relative_cost:.1f}x the k=1 fleet at "
-                    f"{utilization_at_k(k, scenario.derate):.0%} utilization; on-demand "
-                    "rates, so an upper bound"
-                ),
-            )
-        )
-
-    out.append(_provision_finding(provision_s, lag_measured=measured.t_total_measured))
+    )
     return out
 
 
-def _repeatability_finding(measured: Measured, budget_ms: int) -> Finding:
-    """Whether ``C_max`` at the planned budget is repeatable or a single sample.
+def _ceiling_finding(measured: Measured, w_max: float, ceiling_s: float) -> Finding:
+    """Whether a request that waits the full ``W_max`` still returns before SageMaker cuts it.
+
+    A separate question from the SLO. The SLO is a promise we chose; the ceiling is a
+    platform limit, and a queue sized past it admits requests that wait their whole
+    allowance and then fail anyway — worse than refusing them at admission, because the
+    client paid the wait for nothing.
+    """
+    fits, deadline = fits_invocation_ceiling(w_max, measured.s_p95_s, ceiling_s)
+    if fits:
+        return Finding(
+            name="invocation_ceiling",
+            verdict=Verdict.OK,
+            detail=(
+                f"a queued request finishes in {deadline:.1f}s worst case "
+                f"(W_max {w_max:.1f}s + p95 service {measured.s_p95_s:.2f}s), inside "
+                f"the {ceiling_s:.0f}s SageMaker invocation ceiling"
+            ),
+        )
+
+    largest = max_added_wait_under_ceiling(measured.s_p95_s, ceiling_s)
+    return Finding(
+        name="invocation_ceiling",
+        verdict=Verdict.INFEASIBLE,
+        detail=(
+            f"a queued request would take {deadline:.1f}s worst case "
+            f"(W_max {w_max:.1f}s + p95 service {measured.s_p95_s:.2f}s), past the "
+            f"{ceiling_s:.0f}s SageMaker invocation ceiling. Those requests wait "
+            "the full W_max and then fail anyway, which is worse than refusing "
+            "them at admission."
+        ),
+        # W_max is SLO - S_p95, so the deadline *is* the stated SLO whenever the
+        # SLO is feasible — this branch is reached only by an SLO past the
+        # platform ceiling, and the fix is to state one inside it. Where S_p95
+        # alone busts the ceiling no SLO helps, because nothing under the model's
+        # own tail is reachable.
+        recommendation=(
+            f"--ttfab-slo-ms {int(ceiling_s * 1000)} or less; a longer SLO cannot "
+            "be served whatever the queue does"
+            if largest > 0
+            else (
+                f"p95 service time ({measured.s_p95_s:.1f}s) alone exceeds the "
+                "ceiling; no SLO or queue length fixes this. Shorten the request, "
+                "or serve it off a real-time endpoint."
+            )
+        ),
+    )
+
+
+def _queue_depth_finding(measured: Measured, w_max: float) -> Finding:
+    """Whether the admission bound the plan ships is the one that was measured.
+
+    ``queue_max_depth`` is ``Q_max`` itself, so there is no arithmetic to check here —
+    the finding exists to say *that*, and to compare it against the wait the SLO
+    affords. Those two agree by construction when the ladder bracketed its answer, and
+    the size of any disagreement is the size of the extrapolation.
+    """
+    q_max = measured.q_max
+    # What the SLO's own wait budget says the depth should be, at the measured service
+    # rate. A cross-check on the ladder, not an input: if the ladder stopped early this
+    # is larger, which is exactly the lower-bound case.
+    implied = w_max / measured.s_mean_s if measured.s_mean_s > 0 else 0.0
+
+    if not measured.q_max_bracketed:
+        return Finding(
+            name="queue_depth",
+            verdict=Verdict.WARN,
+            detail=(
+                f"queue_max_depth {q_max} is Q_max, but the ladder never measured a rung "
+                f"above it missing the SLO — so it is a LOWER bound. The SLO's own wait "
+                f"budget implies room for about {implied:.0f} "
+                f"(W_max {w_max:.2f}s / S {measured.s_mean_s:.3f}s), and admitting fewer "
+                "than that sheds requests that would have been served in time"
+            ),
+            recommendation=(
+                f"re-run `tts-bench qmax` with --concurrency rungs above {q_max} so the "
+                "crossing is bracketed"
+            ),
+        )
+    return Finding(
+        name="queue_depth",
+        verdict=Verdict.OK,
+        detail=(
+            f"queue_max_depth {q_max} is the measured Q_max, bracketed from above. The "
+            f"SLO's wait budget independently implies about {implied:.0f} "
+            f"(W_max {w_max:.2f}s / S {measured.s_mean_s:.3f}s); past the bound a request "
+            "cannot reach first byte in time, so it is refused rather than served late"
+        ),
+    )
+
+
+def _threshold_units_finding(
+    c_scale_max: float,
+    cw: tuple[float | None, float | None],
+) -> Finding:
+    """Whether the scale-out threshold can be stated in the units the alarm reads.
+
+    The one finding that exists because of a shipped defect rather than a limit of the
+    model. ``C_scale_max`` is a client-side occupancy; the deployed alarm compares
+    ``ConcurrentRequestsPerModel`` / *Maximum* over 10s against its threshold. Those are
+    different quantities, and deploying the unconverted figure is how 0.713 reached the
+    endpoint — a threshold that inverts to a negative arrival rate, so no traffic
+    satisfies it and target tracking asks for the whole fleet on one request.
+
+    ``SUPPRESSED``, never ``OK``, when the ladder recorded no server statistic: the
+    conversion did not happen, which is not the same as not needing one. The high-res
+    datapoints retain 3 hours, so it also cannot be backfilled — the fix is another run.
+    """
+    converted, ratio = cw
+    if converted is None or ratio is None:
+        return Finding(
+            name="threshold_units",
+            verdict=Verdict.SUPPRESSED,
+            detail=(
+                f"C_scale_max {c_scale_max:.2f} is a client-measured occupancy and the "
+                "ladder recorded no ConcurrentRequestsPerModel / Maximum beside it, so "
+                "there is no measured conversion into the units the alarm reads. "
+                "Deploying the raw number is the defect that produced the 0.713 threshold"
+            ),
+            recommendation=(
+                "re-run `tts-bench qmax --cloudwatch`; 10s datapoints retain 3 hours, so "
+                "this cannot be recovered from the earlier run"
+            ),
+        )
+    return Finding(
+        name="threshold_units",
+        verdict=Verdict.OK,
+        detail=(
+            f"scaling_target_value {converted:.2f} = C_scale_max {c_scale_max:.2f} x "
+            f"{ratio:.2f}, the measured ratio of ConcurrentRequestsPerModel / Maximum to "
+            "client mean in-flight at the nearest rung. The converted figure is what "
+            "deploys; the occupancy is what was measured"
+        ),
+    )
+
+
+def _surge_finding(
+    *,
+    measured: Measured,
+    scenario: Scenario,
+    c_scale_max: float,
+    utilization: float,
+    shed: float | None,
+) -> Finding:
+    """Whether ``C_scale_max`` fires early enough to survive one ``T_total``.
+
+    The falsifiable form of the first known limit of the simple rule. ``C_scale_max``
+    reserves headroom in queue *slots*, a finite stock, while surviving a surge is a
+    question about drain *rate*, a flow — and occupancy converts to utilization
+    steeply, so three quarters of ``Q_max`` is 97% utilized rather than three quarters
+    of the way to trouble. Simulated rather than argued, because the simulation has a
+    number and the argument does not.
+
+    ``SUPPRESSED`` when the simulation could not run: an unsimulated risk is not a
+    cleared one.
+    """
+    surge = scenario.max_scaling_per_t_total
+    basis = (
+        f"holding C_scale_max {c_scale_max:.2f} of Q_max {measured.q_max} is "
+        f"{utilization:.1%} utilization on a single-server queue, and a replacement takes "
+        f"{measured.t_total_s:.0f}s to arrive"
+    )
+    if shed is None:
+        return Finding(
+            name="surge_survival",
+            verdict=Verdict.SUPPRESSED,
+            detail=f"{basis}, but P(shedding before it lands) could not be simulated",
+            recommendation="check t_total_s and S on the measurement; both must be positive",
+        )
+    if shed > SHED_PROBABILITY_WARN:
+        return Finding(
+            name="surge_survival",
+            verdict=Verdict.WARN,
+            detail=(
+                f"{basis} — so P(the queue reaches Q_max before then) is {shed:.0%}, past "
+                f"the {SHED_PROBABILITY_WARN:.0%} line. The {surge:g}x surge ratio reserves "
+                "queue slots, which is a stock; surviving a surge is about drain rate, "
+                "which is a flow, and at this utilization there is very little of it left"
+            ),
+            recommendation=(
+                "scale out earlier than the simple rule (a smaller share of Q_max), "
+                "shorten T_total, or hold standing headroom in instances"
+            ),
+        )
+    return Finding(
+        name="surge_survival",
+        verdict=Verdict.OK,
+        detail=(
+            f"{basis} — P(the queue reaches Q_max before then) is {shed:.0%}, inside the "
+            f"{SHED_PROBABILITY_WARN:.0%} line"
+        ),
+    )
+
+
+def _scale_in_finding(
+    *,
+    thresholds: Any,
+    scenario: Scenario,
+    min_instances: int,
+) -> Finding:
+    """Whether removing one instance at ``C_scale_min`` lands back under ``C_scale_max``.
+
+    The second known limit of the simple rule. Scale-in redistributes rather than
+    removes load: dropping one of ``N`` multiplies each survivor's concurrency by
+    ``N/(N-1)``, so at ``N=2`` the survivor inherits *double*. At a 1.25 surge ratio
+    the thresholds are 0.75 and 0.5 of ``Q_max``, so 2->1 lands exactly on ``Q_max``
+    and breaches the SLO on the way down — and kokoro runs ``min_instances=1``, which
+    makes 2->1 the common case rather than the corner one.
+    """
+    safe = thresholds.min_safe_instances
+    ratio = thresholds.c_scale_max / thresholds.c_scale_min if thresholds.c_scale_min else None
+    surge = scenario.max_scaling_per_t_total
+
+    if safe is None:
+        return Finding(
+            name="scale_in_safety",
+            verdict=Verdict.WARN,
+            detail=(
+                f"at a {surge:g}x surge ratio the two thresholds are "
+                f"{thresholds.c_scale_max:.2f} and {thresholds.c_scale_min:.2f}, which "
+                "leaves no fleet size where removing an instance keeps the survivors under "
+                "the scale-out point — every scale-in scales straight back out"
+            ),
+            recommendation=(
+                "widen the gap between the thresholds with a smaller "
+                "--max-scaling-per-t-total, or disable scale-in and manage the floor"
+            ),
+        )
+    if min_instances < safe:
+        return Finding(
+            name="scale_in_safety",
+            verdict=Verdict.WARN,
+            detail=(
+                f"scale-in is only stable from {safe} instances up: removing one of N "
+                f"multiplies each survivor's concurrency by N/(N-1), which must stay "
+                f"under {ratio:.2f} (= C_scale_max {thresholds.c_scale_max:.2f} / "
+                f"C_scale_min {thresholds.c_scale_min:.2f}). This plan's floor is "
+                f"{min_instances}, so a {min_instances + 1}->{min_instances} scale-in "
+                f"leaves the survivors at {thresholds.c_scale_min * (min_instances + 1) / min_instances:.2f}"  # noqa: E501
+            ),
+            recommendation=(
+                f"raise --min-floor to {safe}, or accept the flap that the "
+                "scale-in cooldown damps but does not remove"
+            ),
+        )
+    return Finding(
+        name="scale_in_safety",
+        verdict=Verdict.OK,
+        detail=(
+            f"scale-in is stable from {safe} instances up and this plan's floor is "
+            f"{min_instances}: removing one leaves the survivors at "
+            f"{thresholds.c_scale_min * min_instances / max(1, min_instances - 1):.2f}, "
+            f"under the {thresholds.c_scale_max:.2f} scale-out point"
+        ),
+    )
+
+
+def _fleet_cost_finding(
+    scenario: Scenario,
+    c_scale_max: float,
+    peak_n: int,
+    relative_cost: float,
+) -> Finding:
+    """What the surge headroom costs, against a fleet that reserves none.
+
+    The baseline is scaling out at ``Q_max`` itself — the cheapest possible policy and
+    also the one that misses the SLO the moment anything arrives. Stated as an instance
+    ratio so the reader can check it against the two fleet sizes rather than trusting a
+    dollar figure derived from on-demand rates.
+
+    Always ``OK``, and that is a property of the model rather than a missing check. Both
+    fleets are the same demand over a different divisor, so the ratio cannot exceed
+    ``Q_max / C_scale_max``, which is ``1 / (1 - h)``; :func:`scale_thresholds` refuses
+    ``h >= 0.5``, so the continuous ceiling is under 2x and integer rounding reaches
+    exactly 2x (one instance against two) and no further. There is no reachable multiple
+    at which "shorten T_total instead of buying headroom" becomes the cheaper advice, so
+    the finding reports the cost and does not warn about it. The old ``C_max`` model could
+    reach 4x, because there the divisor moved with ``k`` without a bound.
+    """
+    surge = scenario.max_scaling_per_t_total
+    return Finding(
+        name="fleet_cost",
+        verdict=Verdict.OK,
+        detail=(
+            f"reserving headroom for a {surge:g}x surge costs {relative_cost:.1f}x a fleet "
+            f"scaled at Q_max ({peak_n} instances at C_scale_max {c_scale_max:.2f} against "
+            f"{max(1, round(peak_n / relative_cost)) if relative_cost else peak_n} at Q_max); "
+            "on-demand rates, so an upper bound"
+        ),
+    )
+
+
+def _repeatability_finding(measured: Measured) -> Finding:
+    """Whether ``Q_max`` is repeatable or a single sample.
 
     Separate from :func:`_trust_finding`, which asks whether the number is
     *per-instance*. This asks whether it is *stable*, and the two fail independently:
-    a properly frozen run pinned to one instance can still produce a knee that only
-    one ladder pass out of three found, and every fleet size below divides by it.
+    a properly frozen run pinned to one instance can still land on a rung only one
+    ladder pass out of three agreed with, and both thresholds are fractions of it.
 
-    ``SUPPRESSED`` rather than ``OK`` when the curve carries no spread: an artifact
-    from before this was recorded has not passed the check, and marking it ``OK``
-    would claim a repeatability nobody measured.
+    ``SUPPRESSED`` rather than ``OK`` when only one pass contributed: a single sample
+    has nothing to disagree with, so its 0% spread is not an agreement.
     """
-    budget = budget_ms if budget_ms in measured.c_max_curve else None
-    if budget is None:
-        below = [b for b in measured.c_max_curve if b <= budget_ms]
-        budget = max(below) if below else None
+    spread = measured.q_max_spread
+    contributing = measured.runs_contributing
 
-    spread = measured.curve_spread.get(budget) if budget is not None else None
-    contributing = measured.runs_contributing.get(budget) if budget is not None else None
-    total = measured.runs_total
-
-    if spread is None:
+    if contributing < 2:
         return Finding(
             name="curve_repeatability",
             verdict=Verdict.SUPPRESSED,
             detail=(
-                "the curve carries no run-to-run spread, so whether C_max is repeatable "
-                "was never established — the artifact predates the check, or the run was "
-                "a single pass"
+                f"Q_max {measured.q_max} came from a single ladder pass, so whether it is "
+                "repeatable was never established — a 0% spread across one run is not an "
+                "agreement"
             ),
-            recommendation="re-run `tts-bench cmax --runs 3` to get a spread",
+            recommendation="re-run `tts-bench qmax --runs 2` or more to get a spread",
         )
 
-    if contributing is not None and total > 1 and contributing < 2:
+    if spread > Q_MAX_SPREAD_WARN:
         return Finding(
             name="curve_repeatability",
             verdict=Verdict.WARN,
             detail=(
-                f"C_max at {budget}ms came from {contributing} of {total} ladder runs, so "
-                f"its {spread:.0%} spread is not a run-to-run agreement — it is one sample "
-                "with nothing to disagree with. Every fleet size below divides by it."
+                f"Q_max varied {spread:.0%} across {contributing} ladder passes, past the "
+                f"{Q_MAX_SPREAD_WARN:.0%} threshold — the ladder is resolving noise, and "
+                "both thresholds are fractions of the value it settled on"
             ),
-            recommendation=(
-                "re-run `tts-bench cmax`; the other runs' steps at this budget were "
-                "unusable or unsettled, which usually means the ladder needs more "
-                "workers or a longer hold"
-            ),
-        )
-
-    if spread > CURVE_SPREAD_WARN:
-        return Finding(
-            name="curve_repeatability",
-            verdict=Verdict.WARN,
-            detail=(
-                f"C_max at {budget}ms varied {spread:.0%} across "
-                f"{contributing if contributing is not None else total} runs, past the "
-                f"{CURVE_SPREAD_WARN:.0%} threshold — the ladder is resolving noise, and "
-                f"the {measured.model_name} derate is not sized to absorb it"
-            ),
-            recommendation="hold each step longer, or space the ladder more widely",
+            recommendation="hold each rung longer, or space the ladder more widely",
         )
 
     return Finding(
         name="curve_repeatability",
         verdict=Verdict.OK,
         detail=(
-            f"C_max at {budget}ms varied {spread:.0%} across "
-            f"{contributing if contributing is not None else total} runs, inside the "
-            f"{CURVE_SPREAD_WARN:.0%} threshold"
+            f"Q_max varied {spread:.0%} across {contributing} ladder passes, inside the "
+            f"{Q_MAX_SPREAD_WARN:.0%} threshold; the plan uses the minimum, which is a rung "
+            "that was actually measured"
         ),
-    )
-
-
-def _c_max_source_finding(
-    measured: Measured,
-    budget_ms: int,
-    c_max: float,
-    source: str,
-) -> Finding:
-    """Which of the two measured limits the fleet size was divided by, and how firmly.
-
-    Three distinctions that the report used to collapse into one number, and each wants
-    a different follow-up run:
-
-    * **latency knee, bracketed** — a step above it failed the budget. The knee is the
-      knee, and nothing more is owed.
-    * **latency knee, lower bound** — the ladder ran out while still passing. Every
-      fleet size here is an over-estimate; a longer ladder resolves it.
-    * **throughput ceiling** — the server stopped keeping up *before* latency crossed
-      the budget, so the knee's higher concurrency was accumulated backlog. This is
-      kokoro's regime on bidi and it is invisible to a latency-only reading, which is
-      the whole reason the ceiling is measured.
-
-    A fourth state, ``latency_knee_only``, is never ``OK``: no ceiling was measured, so
-    the comparison did not happen. That is not the same claim as a knee that won it.
-    """
-    knee = measured.c_max_for(budget_ms)
-    ceiling = measured.c_max_throughput
-    lower_bound = measured.binding_is_lower_bound(budget_ms)
-
-    if source == "throughput_ceiling":
-        what = (
-            f"C_max {c_max:.2f} is the throughput ceiling, under the {knee:.2f} latency "
-            f"knee at {budget_ms}ms: the server stopped keeping up before latency crossed "
-            "the budget, so the knee's extra concurrency was queue backlog, not capacity"
-        )
-        bracketed_clause = ", and a saturated step above it confirms the ceiling"
-        extend = (
-            "re-run `tts-bench cmax` with a higher --target-concurrency, and "
-            "--max-workers above the in-flight count the backlog reaches, so the client "
-            "pool is not what capped the rate"
-        )
-    elif source == "latency_knee":
-        what = (
-            f"C_max {c_max:.2f} is the latency knee at {budget_ms}ms, at or under the "
-            f"{ceiling:.2f} throughput ceiling: latency degrades before throughput does"
-        )
-        bracketed_clause = ", and a step above it failed the budget, so it is the knee"
-        extend = (
-            "re-run `tts-bench cmax` with a higher --target-concurrency so a step above "
-            "the knee actually fails the budget"
-        )
-    else:
-        what = (
-            f"C_max {c_max:.2f} is the latency knee at {budget_ms}ms and nothing else — no "
-            "throughput ceiling was measured, so whether the server was still keeping up "
-            "at that concurrency was never checked. A model holding its inference lock "
-            "for a whole session is usually bound by the ceiling first"
-        )
-        bracketed_clause = "; the knee itself was bracketed"
-        extend = "re-run `tts-bench cmax`, which measures the ceiling alongside the knee"
-
-    if lower_bound is None:
-        return Finding(
-            name="c_max_source",
-            verdict=Verdict.SUPPRESSED,
-            detail=(
-                f"{what}. Whether it was bracketed is unrecorded — the artifact predates "
-                "the check, which is not the same as passing it"
-            ),
-            recommendation=extend,
-        )
-    if lower_bound:
-        return Finding(
-            name="c_max_source",
-            verdict=Verdict.WARN,
-            detail=(
-                f"{what}, and it is a LOWER BOUND: nothing above it was observed to give "
-                "way, so the real limit is higher and every fleet size here over-estimates"
-            ),
-            recommendation=extend,
-        )
-    return Finding(
-        name="c_max_source",
-        verdict=Verdict.SUPPRESSED if source == "latency_knee_only" else Verdict.OK,
-        detail=f"{what}{bracketed_clause}",
-        recommendation=extend if source == "latency_knee_only" else None,
     )
 
 
@@ -914,277 +1009,151 @@ def _slo_finding(measured: Measured, slo_ms: int, w_max: float) -> Finding:
     return Finding(name="slo_budget", verdict=Verdict.OK, detail=detail)
 
 
-def _headroom_finding(k: float, headroom_lag: float, floored: bool) -> Finding:
-    """Whether the standing headroom in this plan was sized from anything observable.
-
-    ``effective_headroom_lag_s`` floors the uncovered lag at the CloudWatch metric
-    period, and reports ``floored`` for two very different reasons that must not share
-    a verdict:
-
-    * At ``k=1`` traffic is flat, there is no backlog to cover, and the floor is a
-      formality — warning about it would tell the operator to fix a plan that has
-      nothing wrong with it.
-    * Above ``k=1`` the floor means real uncovered lag was rounded *up* to the metric
-      period, so the plan is sized for growth faster than CloudWatch can report and
-      the headroom is a guess.
-    """
-    if not floored:
-        return Finding(
-            name="headroom_lag",
-            verdict=Verdict.OK,
-            detail=(
-                f"standing headroom covers {headroom_lag:.0f}s of lag the queue cannot, "
-                "which is longer than the metric period — so the policy has data to act on"
-            ),
-        )
-    if k == 1:
-        return Finding(
-            name="headroom_lag",
-            verdict=Verdict.OK,
-            detail=(
-                "flat traffic at k=1 needs no standing headroom, so the uncovered lag is "
-                f"the {CLOUDWATCH_HIGH_RES_PERIOD_S:.0f}s metric period by formality, not "
-                "by rounding"
-            ),
-        )
-    return Finding(
-        name="headroom_lag",
-        verdict=Verdict.WARN,
-        detail=(
-            f"the uncovered lag floored at the {CLOUDWATCH_HIGH_RES_PERIOD_S:.0f}s "
-            f"CloudWatch metric period at k={k:g}, so this plan is sized for growth faster "
-            "than we can observe in time to act on it — the headroom is a guess, not a "
-            "measurement"
-        ),
-        recommendation="treat k as the real input here and sweep it (--sweep-k)",
-    )
-
-
 def _trust_finding(measured: Measured) -> Finding:
-    """Whether the curve underneath this plan is safe to read as per-instance.
+    """Whether ``Q_max`` is safe to read as per-instance, and against an unbounded queue.
 
-    First because it invalidates everything after it: a ``C_max`` measured while the
-    fleet was resizing is some multiple of the per-instance number, and every fleet
-    size here divides by it.
+    First because it invalidates everything after it. Two independent ways it can fail:
+    a ladder run while the fleet was resizing measures some multiple of the per-instance
+    number, and a ladder run against a container that sheds measures that container's
+    admission bound rather than the depth at which the SLO breaks.
     """
-    if measured.trustworthy:
-        return Finding(
-            name="measurement_trust",
-            verdict=Verdict.OK,
-            detail=(
-                "C_max was measured with autoscaling suspended and capacity pinned to "
-                f"{measured.instance_counts_observed or (1,)}, so it reads as per-instance"
-            ),
-        )
     reasons = []
     if not measured.frozen:
         reasons.append("autoscaling was not suspended")
     counts = set(measured.instance_counts_observed)
     if len(counts) > 1:
         reasons.append(f"the fleet resized mid-run ({sorted(counts)})")
+    if measured.unbounded_queue is False:
+        reasons.append("the container bounds its admission queue, so it sheds before the SLO does")
+    elif measured.unbounded_queue is None:
+        reasons.append("the container's queue bound was never checked, which is not a pass")
+
+    if not reasons:
+        return Finding(
+            name="measurement_trust",
+            verdict=Verdict.OK,
+            detail=(
+                "Q_max was measured with autoscaling suspended, capacity pinned to "
+                f"{measured.instance_counts_observed or (1,)}, and no container queue "
+                "bound, so it reads as one instance's own limit"
+            ),
+        )
     return Finding(
         name="measurement_trust",
         verdict=Verdict.WARN,
         detail=(
-            f"C_max may not be per-instance: {', and '.join(reasons)}. Every fleet size "
-            "below divides by it, so an N-instance C_max understates the fleet N-fold."
+            f"Q_max may not be this instance's own limit: {', and '.join(reasons)}. Both "
+            "thresholds are fractions of it and every fleet size below divides by it."
         ),
-        recommendation="re-run `tts-bench cmax --require-frozen`",
+        recommendation="re-run `tts-bench qmax --require-frozen --require-unbounded-queue`",
     )
 
 
-def _provision_finding(provision_s: float | None, lag_measured: bool = True) -> Finding:
-    """What part of ``T_total`` is measured and what part is stated.
+def _provision_finding(
+    *,
+    provision_s: float | None,
+    policy_bound_s: float | None,
+    total_s: float,
+    lag_measured: bool = True,
+) -> Finding:
+    """Which parts of ``T_total`` are measured and which are stated.
 
     Never suppressed: the deliverable is a plan for an account whose placement latency
-    is not ours to measure, so which half is which is the single most important caveat
-    on the whole output.
+    is not ours to measure, so which part is which is the single most important caveat
+    on the whole output. Two parts can be non-measurements, and they are separate
+    claims — an EC2 provision stage that is measured *here* but contractual *there*,
+    and a policy detection lag this trigger bypasses by design and so bounds instead.
 
     Args:
-        provision_s: Provision time substituted into the lag, or ``None`` when the
-            lag was used whole.
+        provision_s: The measured ``desired_set`` -> ``instance_logging`` stage, or
+            ``None`` when that boundary was never observed.
+        policy_bound_s: The bounded policy term included in ``total_s``, or ``None``
+            when the lag carries no such term.
+        total_s: The lag the plan is built on, both terms included.
         lag_measured: Whether the lag came from a ``ttotal`` run at all. A whole lag
             from ``--assume-t-total`` is not "used exactly as measured" — nothing about
             it was measured — and saying so would launder a command-line argument into
             an observation, which is the one thing this finding exists to prevent.
     """
-    if provision_s is None and not lag_measured:
+    if not lag_measured:
         return Finding(
             name="provision_stage",
             verdict=Verdict.WARN,
             detail=(
-                "T_total was stated whole, not measured — there is no observed stage "
-                "breakdown, so nothing here distinguishes the transferable container "
-                "stages from this account's EC2 provisioning."
+                f"T_total {total_s:.0f}s was stated whole, not measured — there is no "
+                "observed stage breakdown, so nothing here distinguishes the transferable "
+                "container stages from this account's EC2 provisioning."
             ),
             recommendation=(
-                "run `tts-bench ttotal` and pass --ttotal, so the provision stage can be "
-                "swept instead of buried in one number"
+                "run `tts-bench ttotal` and pass --ttotal, so the provision stage is "
+                "labelled instead of buried in one number"
             ),
         )
+
+    bound_clause = (
+        ""
+        if not policy_bound_s
+        else (
+            f" Of that, {policy_bound_s:.0f}s is the policy's detection lag, which the "
+            "force-desired trigger bypasses and so is BOUNDED from the deployed alarm's "
+            "periods and cooldown rather than measured."
+        )
+    )
     if provision_s is None:
         return Finding(
             name="provision_stage",
             verdict=Verdict.OK,
             detail=(
-                "T_total is used exactly as measured, provision stage included. That "
-                "stage is a property of this account's spare EC2 capacity; a "
-                "reserved-capacity account will differ."
+                f"T_total {total_s:.0f}s: the run never observed the boundary between EC2 "
+                "provisioning and the container starting, so the plan cannot say which "
+                "part is a property of this account's spare capacity and which of the "
+                f"image.{bound_clause}"
             ),
-            recommendation="sweep it with --provision-s to see the plan's sensitivity",
+            recommendation=(
+                "check the ttotal artifact's missing_stages; the instance's log stream is "
+                "what marks that boundary"
+            ),
         )
+    share = provision_s / total_s if total_s > 0 else 0.0
     return Finding(
         name="provision_stage",
         verdict=Verdict.OK,
         detail=(
-            f"T_total assumes a {provision_s:.0f}s EC2 provision stage, substituted for the "
-            "measured one. The container stages are measured and transfer between "
-            "accounts; this one is stated."
+            f"T_total {total_s:.0f}s, of which {provision_s:.0f}s ({share:.0%}) is EC2 "
+            "provisioning and image pull — a property of this account's spare capacity, "
+            "not of the configuration. A reserved-capacity account, where placement is "
+            f"guaranteed, will differ on that part and only that part.{bound_clause}"
         ),
     )
 
 
-@dataclass(frozen=True, slots=True)
-class SweepRow:
-    """One plan in a sweep, with the assumptions that produced it.
-
-    Carried alongside the plan rather than dug back out of it, because
-    ``provision_s`` is not a ``ScalingPlan`` field — the plan is what to deploy, and
-    this is why.
-    """
-
-    provision_s: float | None
-    k: float
-    t_total_s: float
-    plan: ScalingPlan
-
-    @property
-    def provision_assumed(self) -> bool:
-        return self.provision_s is not None
-
-
-def plan_sweep(
-    measured: Measured,
-    scenario: Scenario,
-    stages: TTotalStages | None = None,
-    *,
-    provision_sweep_s: Sequence[float] | None = None,
-    k_sweep: Sequence[float] | None = None,
-    ceiling_s: float = SAGEMAKER_INVOCATION_CEILING_S,
-) -> list[SweepRow]:
-    """A plan per (provision time, k) pair — the deliverable.
-
-    Two sweeps because there are two inputs we cannot measure for the account being
-    configured: the EC2 provision stage (a property of a capacity contract) and the
-    growth factor ``k`` (a property of production traffic we do not have). Everything
-    else is measured, and holding those fixed while these vary is what makes the
-    output honest.
-
-    Args:
-        measured: Joined planner input. Its ``t_total_s`` is used directly when no
-            provision sweep is requested.
-        scenario: Stated load and policy. Its ``growth_factor_k`` is used when no
-            ``k_sweep`` is given.
-        stages: The measured stage breakdown, needed to substitute a provision time.
-            Without it, ``provision_sweep_s`` cannot be honoured.
-        provision_sweep_s: Provision times to assume, seconds. ``None`` or empty means
-            plan once against the measured ``T_total`` as-is.
-        k_sweep: Growth factors to plan for. ``None`` or empty means the scenario's own.
-        ceiling_s: Invocation ceiling to judge against.
-
-    Raises:
-        PlannerError: If a provision sweep was requested but ``stages`` cannot supply
-            a transferable lag to substitute into.
-    """
-    provisions: list[float | None]
-    if provision_sweep_s:
-        if stages is None:
-            raise PlannerError(
-                "a provision sweep needs the measured stage breakdown; pass the ttotal "
-                "artifact so the measured provision stage can be substituted out."
-            )
-        provisions = [float(p) for p in provision_sweep_s]
-    else:
-        provisions = [None]
-
-    ks = [float(k) for k in k_sweep] if k_sweep else [scenario.growth_factor_k]
-
-    rows: list[SweepRow] = []
-    for provision in provisions:
-        if provision is None:
-            t_total = measured.t_total_s
-            row_measured = measured
-        else:
-            assert stages is not None  # guarded above
-            t_total = stages.with_provision_s(provision)
-            # Amend on "a provision time was substituted", not on "the total changed".
-            # Sweeping the value that was actually measured produces an identical
-            # number from a different claim -- the row is labelled `provision_assumed`
-            # and its finding says "assumes a Ns provision stage", so leaving the
-            # provenance saying "measured" would have the same plan describe its own
-            # input two ways.
-            row_measured = _with_t_total(measured, t_total)
-        for k in ks:
-            row_scenario = scenario.model_copy(update={"growth_factor_k": k})
-            rows.append(
-                SweepRow(
-                    provision_s=provision,
-                    k=k,
-                    t_total_s=t_total,
-                    plan=plan_one(
-                        row_measured,
-                        row_scenario,
-                        provision_s=provision,
-                        ceiling_s=ceiling_s,
-                    ),
-                )
-            )
-    return rows
-
-
-def _with_t_total(measured: Measured, t_total_s: float) -> Measured:
-    """``measured`` with a substituted lag, and a provenance note saying so.
-
-    The note is the point. ``Measured`` is tagged ``MEASURED``, and a substituted lag
-    is partly an assumption; without amending the note a swept row would claim to
-    have measured a provision time nobody observed. Callers decide *whether* a
-    substitution happened — an unchanged total is not evidence that none did, since
-    sweeping the measured provision time reproduces it exactly.
-    """
-    note = measured.provenance.note
-    amended = "T_total provision stage substituted, not measured"
-    return measured.model_copy(
-        update={
-            "t_total_s": t_total_s,
-            "provenance": measured.provenance.model_copy(
-                update={"note": f"{note}; {amended}" if note else amended},
-            ),
-        }
-    )
-
-
 def measured_from_artifacts(
-    cmax_report: CMaxReport,
+    qmax_report: QMaxReport,
     stages: TTotalStages,
     *,
     allow_config_mismatch: bool = False,
     assume_t_total_s: float | None = None,
     require_pairing: bool = True,
 ) -> Measured:
-    """Join a ``C_max`` curve and a ``T_total`` lag into one planner input.
+    """Join a ``Q_max`` ladder and a ``T_total`` lag into one planner input.
 
-    Thin on purpose: ``CMaxReport.to_measured`` already owns the join, and this adds
+    Thin on purpose: ``QMaxReport.to_measured`` already owns the join, and this adds
     the pairing refusal and the "no total measured" path around it.
 
+    The lag it carries through is :attr:`TTotalStages.plan_total_s` — the measured span
+    *plus* the bounded policy term — because production scales out through the policy
+    rather than through a capacity call. The provenance note names both terms, so the
+    sum stays decomposable by anyone reading the artifact later.
+
     Args:
-        cmax_report: The curve.
+        qmax_report: The ladder.
         stages: The lag, from :meth:`TTotalStages.from_artifact`.
         allow_config_mismatch: Pair artifacts from different configurations anyway.
         assume_t_total_s: Lag to use when the ``ttotal`` run never spanned a total.
             Tagged as an assumption in the provenance, since it is one.
         require_pairing: Whether there are two artifacts to pair at all. False when
             the lag was stated rather than read from a ``ttotal`` run: a stated number
-            carries no fingerprint, so checking one against the curve's would report a
+            carries no fingerprint, so checking one against the ladder's would report a
             mismatch where there is nothing to mismatch. The lag is still labelled an
             assumption in the provenance, which is the honest complaint to make about
             it.
@@ -1194,9 +1163,9 @@ def measured_from_artifacts(
             either the measurement or an assumption.
     """
     if require_pairing:
-        assert_pairable(cmax_report, stages, allow_mismatch=allow_config_mismatch)
+        assert_pairable(qmax_report, stages, allow_mismatch=allow_config_mismatch)
 
-    total = stages.total_s
+    total = stages.plan_total_s
     if total is None:
         if assume_t_total_s is None:
             raise PlannerError(
@@ -1213,13 +1182,23 @@ def measured_from_artifacts(
             ),
         )
     else:
+        bits = [f"T_total measured, trigger={stages.trigger}"]
+        if stages.policy_bound_s:
+            bits.append(
+                f"{stages.total_s:.0f}s measured + {stages.policy_bound_s:.0f}s policy lag "
+                "bounded from the deployed alarm, not measured"
+            )
+        if stages.bounded:
+            # "floor" is the operative word: the span stops at in_service, strictly earlier
+            # than the instance serving traffic, so it under-reports — and under-reporting a
+            # lag the plan has to absorb a surge across is the dangerous direction.
+            bits.append(
+                "recovery never bounded, so the measured half stops at in_service and is a floor"
+            )
         provenance = Provenance(
             origin=Origin.MEASURED,
             run_id=stages.run_id or None,
-            note=(
-                f"T_total measured, trigger={stages.trigger}"
-                + (", recovery inferred so this is a floor" if stages.bounded else "")
-            ),
+            note="; ".join(bits),
         )
 
-    return cmax_report.to_measured(t_total_s=total, t_total_provenance=provenance)
+    return qmax_report.to_measured(t_total_s=total, t_total_provenance=provenance)

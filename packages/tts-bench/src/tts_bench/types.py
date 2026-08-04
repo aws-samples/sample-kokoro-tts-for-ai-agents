@@ -11,10 +11,11 @@ traffic study.
 
 from __future__ import annotations
 
+import statistics
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from tts_inference.types import TTSModelName
 
@@ -56,7 +57,7 @@ class Origin(StrEnum):
     """Where a number came from."""
 
     MEASURED = "measured"
-    """Observed against a live endpoint by ``cmax`` or ``ttotal``."""
+    """Observed against a live endpoint by ``qmax`` or ``ttotal``."""
 
     ASSUMPTION = "assumption"
     """Supplied as a scenario argument. Reported as such, never as a finding."""
@@ -84,10 +85,14 @@ class Provenance(BaseModel):
 
 
 class Measured(BaseModel):
-    """Inputs measured against a live endpoint.
+    """The two measured variables, joined. Produced by ``qmax`` + ``ttotal``.
 
-    Produced by ``cmax`` and ``ttotal``, consumed by ``planner``. Serialized to
-    an artifact JSON so a plan can be regenerated without re-running load.
+    Consumed by ``planner``. Serialized to an artifact JSON so a plan can be
+    regenerated without re-running load.
+
+    Only ``Q_max`` and ``T_total`` are measurements the model needs; ``S`` and
+    ``chars_per_request`` come along because the SLO arithmetic and the cost arithmetic
+    respectively need them, not because anything divides capacity by them.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -96,41 +101,55 @@ class Measured(BaseModel):
     endpoint: str
     instance_type: str
 
-    c_max_curve: dict[int, float] = Field(
-        description=(
-            "TTFAB budget in ms -> per-instance concurrency at the knee. A curve "
-            "rather than a scalar because the knee moves with the SLO, and "
-            "emitting all budgets from one run makes the SLO decision a table "
-            "lookup instead of a re-run."
-        )
-    )
-    c_max_throughput: float | None = Field(
-        default=None,
+    q_max: int = Field(
         gt=0,
         description=(
-            "Per-instance concurrency at the throughput ceiling, independent of any "
-            "latency budget. None means no cmax run measured it — older artifacts, and "
-            "ladders that never saturated. Distinct from the curve because the two can "
-            "disagree: a model may hold latency inside a generous budget while already "
-            "failing to keep up, and then this is the number that binds."
+            "Highest per-instance concurrency (queued + executing) whose p95 first-byte "
+            "time met slo_ms. Both scaling thresholds are fractions of this, so it is "
+            "the one measured number the deployed policy is built on."
         ),
     )
-    c_max_throughput_bracketed: bool = Field(
+    q_max_bracketed: bool = Field(
         default=True,
         description=(
-            "Whether a saturated step was seen above the ceiling. False makes the "
-            "ceiling a lower bound, which matters because the planner takes the "
-            "*minimum* of the two C_max kinds: a lower-bound minimum understates the "
-            "fleet, and the report has to say so rather than print a bare number."
+            "Whether a rung above q_max was measured and missed the SLO. False makes "
+            "q_max a lower bound: the thresholds derived from it then fire earlier than "
+            "necessary, which is the safe direction but still costs instances."
+        ),
+    )
+    slo_ms: int = Field(
+        gt=0,
+        description=(
+            "The SLO q_max was measured against. Carried so `plan` can refuse a "
+            "scenario asking for a different one: Q_max is defined by the SLO, and "
+            "re-reading one ladder against another line is exactly the mistake that "
+            "two independent latency fields used to permit."
+        ),
+    )
+    ttfab_p95_at_c1_ms: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "p95 first-byte time at one outstanding request: service time with no queue "
+            "in it. Not a capacity input — it is the FirstChunkLatencyP95 alarm's "
+            "threshold, which watches an instance already serving and so cannot use the "
+            "queue-inclusive SLO. None when the ladder had no N=1 rung."
         ),
     )
     s_mean_s: float = Field(gt=0, description="Mean service time, seconds")
-    s_p95_s: float = Field(gt=0, description="p95 service time, seconds")
+    s_p95_s: float = Field(
+        gt=0,
+        description=(
+            "p95 service time, seconds. Feeds W_max = SLO - S_p95, the queueing budget, "
+            "and the 60s invocation-ceiling check. A tail, not a mean, because a "
+            "mean-sized deadline is missed by half the requests that reach it."
+        ),
+    )
     t_total_s: float = Field(
         gt=0,
         description=(
-            "Scaling lag: metric publication through to an instance serving good "
-            "traffic. The single number the whole plan is most sensitive to."
+            "Scaling lag: trigger through to an instance serving good traffic. The "
+            "single number the whole plan is most sensitive to."
         ),
     )
     t_total_measured: bool = Field(
@@ -138,7 +157,7 @@ class Measured(BaseModel):
         description=(
             "Whether t_total_s came from a ttotal run or from --assume-t-total. "
             "Separate from `provenance.origin`, which describes this object as a "
-            "whole: C_max and S are measured even when the lag was stated, so the "
+            "whole: Q_max and S are measured even when the lag was stated, so the "
             "origin stays MEASURED and cannot answer this. Without the distinction "
             "the planner reports a command-line argument as 'used exactly as "
             "measured', which is the one claim the provenance machinery exists to "
@@ -161,19 +180,26 @@ class Measured(BaseModel):
         default=False,
         description=(
             "Whether autoscaling was suspended and capacity pinned during the "
-            "C_max run. False means the number may be N x C_max — see fixture.py."
+            "Q_max run. False means the number may be N x Q_max — see fixture.py."
+        ),
+    )
+    unbounded_queue: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the container was verified to have no queue depth bound during "
+            "the Q_max run. None means unchecked, which is not a pass."
         ),
     )
     instance_counts_observed: tuple[int, ...] = Field(
         default=(),
-        description="Distinct instance counts seen across steps. More than one invalidates C_max.",
+        description="Distinct instance counts seen across rungs. More than one invalidates Q_max.",
     )
     transport: str = Field(
         default="response-stream",
         description=(
-            "Wire protocol c_max_curve was measured on. Carried this far because "
-            "the plan derived from it configures a real fleet: a C_max measured "
-            "on response-stream does not describe capacity for bidi traffic."
+            "Wire protocol q_max was measured on. Carried this far because the plan "
+            "derived from it configures a real fleet: a Q_max measured on "
+            "response-stream does not describe capacity for bidi traffic."
         ),
     )
     deployed_config: dict[str, Any] = Field(
@@ -186,56 +212,66 @@ class Measured(BaseModel):
             "artifact predates fingerprinting, which counts as a mismatch."
         ),
     )
-    curve_spread: dict[int, float] = Field(
-        default_factory=dict,
+    q_max_spread: float = Field(
+        default=0.0,
+        ge=0,
         description=(
-            "Per-budget run-to-run spread of the curve, carried from CMaxReport. "
-            "The planner reads it to say whether C_max is repeatable: every fleet "
-            "size divides by C_max, so a curve that resolved noise produces a "
-            "confidently wrong instance count."
+            "(max - min) / min of the per-run Q_max, carried from QMaxReport. The "
+            "planner reports it because both thresholds are fractions of Q_max: a "
+            "ladder that resolved noise produces confidently wrong thresholds."
         ),
     )
-    runs_contributing: dict[int, int] = Field(
-        default_factory=dict,
-        description=(
-            "Per budget, how many ladder runs found a knee, out of runs_total. "
-            "Carried alongside curve_spread because a spread of 0% means agreement "
-            "only when more than one run contributed."
-        ),
-    )
-    c_max_bracketed: dict[int, bool] = Field(
-        default_factory=dict,
-        description=(
-            "Per budget, whether the ladder observed a step above the knee that "
-            "actually failed. False makes that budget's C_max a lower bound, which the "
-            "planner has to say out loud: it takes the *minimum* of the knee and the "
-            "throughput ceiling, and a lower-bound minimum understates the fleet. "
-            "A budget absent from this dict is unknown rather than bracketed — an "
-            "artifact predating the field has not passed the check."
-        ),
-    )
-    runs_total: int = Field(
+    runs_contributing: int = Field(
         default=1,
         ge=1,
-        description="Ladder passes the curve was measured over.",
+        description=(
+            "Ladder passes that produced a Q_max. The denominator for q_max_spread: a "
+            "spread of 0% means agreement only when more than one run contributed."
+        ),
+    )
+    ladder_p95_ms: dict[int, float] = Field(
+        default_factory=dict,
+        description=(
+            "Concurrency -> median p95 first-byte time, the whole ladder. Carried past "
+            "the two named scalars because ttotal's recovery test needs a *pair* of "
+            "rungs — it declares a scale-out complete when a probe held at one "
+            "concurrency drops to the p95 of another — and a plan artifact read back "
+            "later should not have to re-run a 40-minute ladder to answer that."
+        ),
+    )
+    cw_units_ratio_by_rung: dict[int, float] = Field(
+        default_factory=dict,
+        description=(
+            "Concurrency -> CloudWatch ConcurrentRequestsPerModel/Maximum divided by the "
+            "client's mean in-flight at that rung. What converts a measured occupancy "
+            "into the units the deployed alarm compares against. Empty when the ladder "
+            "ran without --cloudwatch, in which case the plan reports the conversion as "
+            "unavailable rather than assuming 1:1 — see QMaxReport.cw_units_ratio_by_rung."
+        ),
     )
     provenance: Provenance = Field(
         default_factory=lambda: Provenance(origin=Origin.MEASURED),
     )
 
     @model_validator(mode="after")
-    def _check_curve(self) -> Measured:
-        if not self.c_max_curve:
-            raise ValueError("c_max_curve must not be empty")
-        for budget, concurrency in self.c_max_curve.items():
-            if budget <= 0:
-                raise ValueError(f"TTFAB budget must be positive, got {budget}")
-            if concurrency <= 0:
-                raise ValueError(f"concurrency at budget {budget} must be positive")
+    def _check_measured(self) -> Measured:
         if self.s_p95_s < self.s_mean_s:
             raise ValueError(
                 f"s_p95_s ({self.s_p95_s}) < s_mean_s ({self.s_mean_s}); percentiles disagree"
             )
+        for rung, p95 in self.ladder_p95_ms.items():
+            if rung <= 0:
+                raise ValueError(f"ladder rung must be positive, got {rung}")
+            if p95 < 0:
+                raise ValueError(f"p95 at rung {rung} must be non-negative, got {p95}")
+        for rung, ratio in self.cw_units_ratio_by_rung.items():
+            if rung <= 0:
+                raise ValueError(f"ratio rung must be positive, got {rung}")
+            if ratio <= 0:
+                raise ValueError(
+                    f"cw units ratio at rung {rung} must be positive, got {ratio}; a "
+                    "non-positive conversion would deploy a threshold no traffic satisfies"
+                )
         return self
 
     @property
@@ -243,260 +279,46 @@ class Measured(BaseModel):
         """Whether this measurement is safe to build a per-instance plan on."""
         return self.frozen and len(set(self.instance_counts_observed)) <= 1
 
-    def budget_at_or_below(self, ttfab_budget_ms: int) -> int | None:
-        """The measured budget this request resolves to, or ``None``.
-
-        Extracted because three callers need the resolved key rather than the value —
-        :meth:`c_max_for` for the concurrency, and the spread and bracketing lookups for
-        their own dicts keyed the same way. Each doing its own ``max(b for b <= ...)``
-        was how a knee at 500ms came to be reported beside a spread from 300ms.
-        """
-        if ttfab_budget_ms in self.c_max_curve:
-            return ttfab_budget_ms
-        below = [b for b in self.c_max_curve if b <= ttfab_budget_ms]
-        return max(below) if below else None
-
-    def c_max_for(self, ttfab_budget_ms: int) -> float:
-        """Concurrency at the knee for a budget.
-
-        Falls back to the nearest measured budget **below** the request, since
-        interpolating upward would claim a knee we did not observe.
-
-        Raises:
-            ValueError: If no measured budget is at or below the request.
-        """
-        budget = self.budget_at_or_below(ttfab_budget_ms)
-        if budget is None:
-            raise ValueError(
-                f"no measured budget at or below {ttfab_budget_ms}ms; "
-                f"measured: {sorted(self.c_max_curve)}"
-            )
-        return self.c_max_curve[budget]
-
-    def knee_bracketed(self, ttfab_budget_ms: int) -> bool | None:
-        """Whether the knee at this budget was bracketed, or ``None`` if unrecorded.
-
-        Three-valued on purpose. ``False`` is a measured lower bound — the ladder ran
-        out while still passing — and ``None`` is an artifact that never recorded the
-        question. Collapsing them to a boolean would either warn about old artifacts as
-        though they had failed the check, or silently pass a genuine lower bound.
-        """
-        budget = self.budget_at_or_below(ttfab_budget_ms)
-        if budget is None:
-            return None
-        return self.c_max_bracketed.get(budget)
-
-    def binding_c_max(self, ttfab_budget_ms: int) -> tuple[float, str]:
-        """The C_max to plan on, and which measurement produced it.
-
-        Takes the **lower** of the latency knee and the throughput ceiling. Both are
-        real per-instance limits and an instance is bound by whichever it reaches first,
-        so planning on the higher one sizes a fleet for capacity that does not exist.
-
-        Returns:
-            ``(c_max, source)`` where ``source`` is ``"latency_knee"``,
-            ``"throughput_ceiling"``, or ``"latency_knee_only"`` when no ceiling was
-            measured. The third value is not the same claim as the first: it says the
-            comparison never happened, which for a model like kokoro — throughput-bound
-            well below its 3s latency knee — is the difference between a checked answer
-            and an unchecked one.
-
-        Raises:
-            ValueError: Via :meth:`c_max_for`, if no budget is at or below the request.
-        """
-        knee = self.c_max_for(ttfab_budget_ms)
-        if self.c_max_throughput is None:
-            return knee, "latency_knee_only"
-        if self.c_max_throughput < knee:
-            return self.c_max_throughput, "throughput_ceiling"
-        return knee, "latency_knee"
-
-    def binding_is_lower_bound(self, ttfab_budget_ms: int) -> bool | None:
-        """Whether the C_max the plan will use understates the instance's capacity.
-
-        Asked of whichever measurement :meth:`binding_c_max` selected, because that is
-        the only one the fleet size divides by. A bracketed ceiling sitting under an
-        unbracketed knee is a *bounded* answer, and warning about the knee there would
-        send the operator to extend a ladder that would not change the plan.
-
-        ``None`` means the selected measurement did not record the question — an older
-        artifact for the knee, which is not the same as a pass.
-
-        Raises:
-            ValueError: Via :meth:`binding_c_max`, if no budget is at or below the request.
-        """
-        _, source = self.binding_c_max(ttfab_budget_ms)
-        if source == "throughput_ceiling":
-            return not self.c_max_throughput_bracketed
-        bracketed = self.knee_bracketed(ttfab_budget_ms)
-        return None if bracketed is None else not bracketed
-
-
-class KneePoint(BaseModel):
-    """Where the latency SLO was crossed, for one TTFAB budget.
-
-    ``concurrency`` is the *measured* mean in-flight count at that step, not the
-    offered rate: at the knee the two differ, and the scaling policy will see the
-    measured quantity.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    ttfab_budget_ms: int = Field(gt=0)
-    concurrency: float = Field(gt=0, description="Measured mean concurrency at the knee step")
-    offered_rps: float = Field(gt=0)
-    p95_ttfab_ms: float = Field(ge=0)
-    step_index: int = Field(ge=0)
-    bracketed: bool = Field(
-        description=(
-            "Whether the next step up actually failed the budget. False means the "
-            "ladder ran out while still passing, so this is a lower bound on the "
-            "knee rather than the knee."
-        )
-    )
-
-    @property
-    def is_lower_bound(self) -> bool:
-        """A knee we never bracketed. Planning on it understates required capacity."""
-        return not self.bracketed
-
-
-class ThroughputCeiling(BaseModel):
-    """The highest rate an instance sustained, and the concurrency it implies.
-
-    A second, independent kind of ``C_max``. :class:`KneePoint` answers "where does
-    latency degrade"; this answers "where does the server stop keeping up", and they are
-    not the same question. A model can hold p95 TTFAB well inside a generous budget
-    while already refusing to drain its queue — kokoro on bidi does exactly that, since
-    it holds the inference lock for a whole session, so its throughput ceiling binds long
-    before any 3s latency knee.
-
-    Reading only the latency knee in that regime is actively misleading: the ladder's
-    high steps show *rising* measured concurrency, but that concurrency is accumulated
-    backlog rather than useful work, and planning on it would size a fleet for capacity
-    the instance does not have.
-
-    ``concurrency`` is ``max_sustained_rps x S_uncontended`` — Little's Law on the highest
-    rate that did not saturate. That is *useful* concurrency: the in-flight count the work
-    itself accounts for, with no queueing in it. Defining it this way makes
-    ``lambda_cap_per_instance(concurrency, S)`` return ``max_sustained_rps`` exactly, so the
-    rate the plan permits is the rate that was measured rather than one inferred from it.
-
-    **It is not the same unit as a knee's concurrency**, and that is worth stating plainly
-    because :meth:`Measured.binding_c_max` compares the two. :class:`KneePoint` reports the
-    *observed* mean in-flight count, which includes queue residence; at kokoro's ceiling step
-    observed was 2.93 against a useful 1.382, so the two derivations diverge by 2x exactly
-    where it matters. Observed is never below useful, so taking the lower of the two errs
-    toward a larger fleet, and ``observed_concurrency`` is recorded here so a reader can see
-    the gap instead of assuming there is none.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    max_sustained_rps: float = Field(
-        gt=0, description="Highest achieved rate at which the server kept up with the offer"
-    )
-    concurrency: float = Field(
-        gt=0, description="max_sustained_rps x S: the ceiling as *useful* concurrency"
-    )
-    observed_concurrency: float | None = Field(
-        default=None,
-        gt=0,
-        description=(
-            "Measured mean in-flight count at the ceiling step — what a "
-            "scaling_target_value policy would actually see. Divided by concurrency it "
-            "gives the queueing multiple at the ceiling (2.1x for kokoro on bidi), which "
-            "is how much of the instance's residence time is already wait rather than "
-            "work. None when the 1Hz monitor produced no samples."
-        ),
-    )
-    offered_rps: float = Field(gt=0, description="What was offered at that step")
-    p95_ttfab_ms: float = Field(
-        ge=0,
-        description=(
-            "Latency at the ceiling step. Recorded because a ceiling reached with "
-            "latency still inside the budget is the whole point: it proves the limit "
-            "was throughput and not the SLO."
-        ),
-    )
-    step_index: int = Field(ge=0)
-    bracketed: bool = Field(
-        description=(
-            "Whether a saturated step was observed above this one. False means the "
-            "ladder ran out while the server was still keeping up, so this is a lower "
-            "bound on the ceiling rather than the ceiling."
-        )
-    )
-    dispatch_skipped: int = Field(
-        default=0,
-        ge=0,
-        description=(
-            "Dispatches the client could not issue at the ceiling step. Nonzero makes "
-            "max_sustained_rps a lower bound for a second reason: the server was never "
-            "handed the full offered rate, so it may sustain more. Not grounds to discard "
-            "the step — the rate it did deliver is still a rate it delivered — and heavy "
-            "skipping tends to exclude itself, since it drags achieved below "
-            "SATURATION_RATIO x offered and the step reads as saturated."
-        ),
-    )
-    runs_contributing: int = Field(
-        default=1,
-        ge=1,
-        description=(
-            "Ladder runs that produced a ceiling. Attached here rather than keyed on the "
-            "report because a ceiling has no budget to key it by. 1 means the number "
-            "below is a single sample, whatever the spread says."
-        ),
-    )
-    spread: float = Field(
-        default=0.0,
-        ge=0,
-        description=(
-            "(max - min) / median of max_sustained_rps across runs. 0.0 with "
-            "runs_contributing of 1 means there was nothing to disagree with, not agreement."
-        ),
-    )
-
-    @property
-    def is_lower_bound(self) -> bool:
-        """A ceiling we never bracketed, or one the client throttled.
-
-        Either way, planning on it understates capacity. The two causes want different
-        fixes — extend the ladder, or raise ``--max-workers`` — so the report says which.
-        """
-        return not self.bracketed or self.dispatch_skipped > 0
-
-    @property
-    def queueing_multiple(self) -> float | None:
-        """Observed residence over useful residence at the ceiling, or None.
-
-        Above ~1.5 the instance is spending more time queueing than working at the very
-        rate the plan is about to treat as its capacity — a signal that the deployed
-        ``scaling_target_value`` (which tracks the observed figure) and this ``C_max``
-        describe the same instance in different units.
-        """
-        if self.observed_concurrency is None or self.concurrency <= 0:
-            return None
-        return self.observed_concurrency / self.concurrency
-
 
 class StepSummary(BaseModel):
-    """One ladder step, flattened for the artifact.
+    """One ladder rung, flattened for the artifact.
 
     The in-process path uses dataclasses (``loadgen.WindowStats``); this is the
     serializable projection, carrying only what a later reader needs to judge
-    whether the step was a valid measurement.
+    whether the rung was a valid measurement.
+
+    ``concurrency`` is the rung's ``N`` — set exactly by the closed-loop driver, not
+    approached via an arrival rate. ``concurrency_mean`` is what the client *observed*
+    in flight, and it should equal ``N``; the gap between them is
+    :attr:`concurrency_shortfall`, and a large one means the client was the limit.
     """
 
     model_config = ConfigDict(frozen=True)
 
     run_index: int = Field(ge=0)
     step_index: int = Field(ge=0)
-    target_concurrency: float = Field(gt=0)
-    offered_rps: float = Field(gt=0)
-    achieved_rps: float = Field(ge=0)
+    concurrency: int = Field(gt=0, description="N: outstanding requests held for this rung")
+    achieved_rps: float = Field(ge=0, description="Completions per second. An output, not a target")
     completed: int = Field(ge=0)
     ok: int = Field(ge=0)
+    rejected: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Completions the server refused (503/408/429). Counted separately from ok "
+            "because a fast rejection is not a fast success: it lowers p95 while the "
+            "endpoint is failing, which is what made a saturated step read as healthy."
+        ),
+    )
+    chars: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Characters synthesized by the completions in the window. A raw count, not "
+            "a rate: the planner needs chars-per-request to price a fleet in $/M chars, "
+            "and dividing a count by a count needs no units conversion."
+        ),
+    )
     outcome_counts: dict[str, int] = Field(default_factory=dict)
 
     ttfab_p50_ms: float | None = None
@@ -505,44 +327,95 @@ class StepSummary(BaseModel):
     latency_p95_ms: float | None = None
     s_mean_s: float | None = None
     s_p95_s: float | None = None
-    concurrency_mean: float | None = None
-    concurrency_p95: float | None = None
-    concurrency_slope_per_s: float | None = None
-    chars_per_hour: float = 0.0
+    concurrency_mean: float | None = Field(
+        default=None, description="Client-observed mean in-flight. Should equal `concurrency`"
+    )
+    concurrency_peak: int | None = Field(
+        default=None,
+        description=(
+            "Client-observed peak in-flight. Recorded beside the mean because the "
+            "deployed alarm reads CloudWatch's *Maximum* statistic, and the two "
+            "diverge by up to 9.8x — see server_concurrency_peak."
+        ),
+    )
+    ttfab_drift_ms: float | None = Field(
+        default=None,
+        description=(
+            "Fitted change in TTFAB across the window. The closed-loop replacement for "
+            "an in-flight trend, which is pinned at N here and would always read settled."
+        ),
+    )
 
+    meets_slo: bool = Field(
+        description=(
+            "Whether p95 TTFAB was inside the SLO on a rung that was a valid "
+            "measurement. Q_max is the highest rung where this is true."
+        )
+    )
     saturated: bool
     settled: bool
+    client_bound: bool = Field(
+        default=False,
+        description=(
+            "Whether mean in-flight fell far enough below N that the client, not the "
+            "server, was the limit. The closed-loop replacement for dispatch_skipped."
+        ),
+    )
     usable: bool = Field(
         description=(
-            "Whether this step may inform the knee. False when the fleet resized, "
-            "or when the client skipped dispatches and so was itself the limit."
+            "Whether this rung may inform Q_max. False when the fleet resized, nothing "
+            "completed, or the client was the limit."
         )
     )
     unusable_reason: str | None = None
-    dispatch_skipped: int = Field(default=0, ge=0)
     capacity_changed: bool = False
     instance_counts: tuple[int, ...] = ()
 
     # Joined from CloudWatch after a settle delay; absent when --no-cloudwatch.
     server_concurrency_mean: float | None = None
+    server_concurrency_peak: float | None = Field(
+        default=None,
+        description=(
+            "ConcurrentRequestsPerModel / *Maximum* over the window — the exact "
+            "statistic the deployed target-tracking alarm reads. Carried because a "
+            "threshold derived from client occupancy and compared against this one is "
+            "the defect that shipped 0.713: Maximum divided by client mean ran from "
+            "9.8x at low load to 1.35x at high load, so the ratio is not a constant "
+            "the plan can correct for after the fact. High-resolution datapoints "
+            "retain 3 hours, so this cannot be backfilled — hence --cloudwatch."
+        ),
+    )
     server_model_latency_p95_ms: float | None = None
     server_5xx_total: float | None = None
     gpu_utilization_mean: float | None = None
     cpu_utilization_mean: float | None = None
     concurrency_agreement: str | None = None
 
+    @property
+    def concurrency_shortfall(self) -> float | None:
+        """How far observed mean in-flight fell below ``N``, as a fraction of ``N``."""
+        if self.concurrency_mean is None or self.concurrency <= 0:
+            return None
+        return max(0.0, (self.concurrency - self.concurrency_mean) / self.concurrency)
 
-class CMaxReport(BaseModel):
-    """What one ``cmax`` invocation measured. The Phase 2 artifact.
 
-    Deliberately *not* a :class:`Measured`: that requires ``t_total_s``, which
-    only ``ttotal`` can supply. Keeping them separate means neither artifact
-    claims a number it did not measure; :meth:`to_measured` is the single place
-    the two are joined.
+class QMaxReport(BaseModel):
+    """What one ``qmax`` invocation measured. The ``Q_max`` artifact.
 
-    The curve here is **raw**. ``derate`` is carried for the record but not
-    applied — :func:`shared.capacity.c_target` applies it once, and applying it
-    here as well would quietly shrink every planned fleet by a second 0.875.
+    Deliberately *not* a :class:`Measured`: that requires ``t_total_s``, which only
+    ``ttotal`` can supply. Keeping them separate means neither artifact claims a number
+    it did not measure.
+
+    ``q_max`` is a **rung**, not a fit: the highest ``N`` whose p95 first-byte time stayed
+    inside :attr:`slo_ms`. That is the whole reason the ladder is closed-loop — ``N`` is
+    the independent variable and is held exactly, so the answer is a concurrency that was
+    actually run rather than one inferred through ``lambda = C/S``.
+
+    The ladder's other rungs are not scaffolding to be discarded. Two downstream consumers
+    read them, and neither can use the 3 s SLO: the ``FirstChunkLatencyP95`` alarm needs
+    service time on a healthy instance (:attr:`ttfab_p95_at_c1_ms`), and ``ttotal``'s
+    recovery test needs the p95 at two concurrencies to watch one halve into the other
+    (:meth:`ttfab_p95_at`).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -552,114 +425,137 @@ class CMaxReport(BaseModel):
     instance_type: str
     run_id: str
 
-    c_max_curve: dict[int, float] = Field(
-        description="TTFAB budget in ms -> per-instance concurrency at the knee, median of runs"
-    )
-    knees: list[KneePoint] = Field(
-        default_factory=list, description="Per-budget knee detail from the last run"
-    )
-    throughput_ceiling: ThroughputCeiling | None = Field(
-        default=None,
+    slo_ms: int = Field(
+        gt=0,
         description=(
-            "Highest sustained rate, independent of any latency budget. Optional "
-            "because artifacts written before it existed have no value to report, and "
-            "absent must read as 'not measured' rather than as 'no ceiling found' — "
-            "the planner falls back to the latency knee alone and says so."
+            "The p95 first-byte SLO this ladder was judged against, queue time included. "
+            "Recorded on the artifact because Q_max is *defined by* it: a Q_max measured "
+            "at 3000ms says nothing about a 1000ms promise, and `plan` refuses a mismatch "
+            "rather than silently re-reading the ladder against a different line."
         ),
     )
-    curve_spread: dict[int, float] = Field(
-        default_factory=dict,
+    q_max: int = Field(
+        gt=0,
         description=(
-            "Per budget, (max - min) / median across runs. Above ~0.2 the ladder "
-            "is measuring noise and the derate will not cover it."
+            "Highest concurrency whose p95 TTFAB met the SLO. Per-instance, because the "
+            "ladder runs pinned at one instance — see `frozen`."
         ),
     )
-    runs_contributing: dict[int, int] = Field(
-        default_factory=dict,
+    q_max_per_run: tuple[int, ...] = Field(
+        default=(),
         description=(
-            "Per budget, how many runs found a knee. The denominator for "
-            "curve_spread: a spread of 0% across three runs is agreement, but a "
-            "spread of 0% from one contributing run is a single sample with nothing "
-            "to disagree with, and the two must not read the same."
+            "Each run's own answer, in run order. `q_max` is the minimum of these rather "
+            "than a median: the median of two rungs is a concurrency no run tested, while "
+            "the minimum is both a real rung and the conservative one. Carried so the "
+            "disagreement is visible instead of averaged away."
+        ),
+    )
+    q_max_bracketed: bool = Field(
+        description=(
+            "Whether a rung above `q_max` was measured and actually missed the SLO. False "
+            "means the ladder ran out while still passing, so `q_max` is a lower bound: "
+            "both scaling thresholds derive from it, so an unbracketed value makes the "
+            "policy scale out earlier than necessary rather than later."
+        )
+    )
+    ttfab_p95_at_q_max_ms: float = Field(
+        ge=0,
+        description=(
+            "p95 first-byte time at `q_max`. How much of the SLO was actually left over: "
+            "a q_max that passed at 2900ms against a 3000ms SLO is on the edge, and one "
+            "that passed at 400ms means the ladder stopped short."
         ),
     )
 
     s_mean_s: float = Field(
         gt=0,
         description=(
-            "Uncontended mean service time, from the lowest usable step. Not from "
-            "the knee step: service time there already includes queueing, and "
-            "C_slo_cap = W_max / S would then double-count the wait it is bounding."
+            "Mean service time from the *lowest* rung, seconds. The closed loop at N=1 is "
+            "an uncontended probe by construction, which is what replaced the separate "
+            "probe phase. Includes client-to-endpoint round trip (~34ms measured against "
+            "kokoro), so it is service time as a client experiences it — which is the "
+            "right quantity for an SLO derived from client-observed first byte, and a "
+            "slight over-estimate anywhere it stands in for server-side work."
         ),
     )
-    s_p95_s: float = Field(gt=0, description="Uncontended p95 service time, seconds")
+    s_p95_s: float = Field(gt=0, description="p95 service time from the lowest rung, seconds")
 
-    derate: float = Field(
-        default=0.875,
-        gt=0,
-        le=1.0,
-        description="Carried for the record. Applied downstream, never here.",
-    )
     frozen: bool = Field(
         default=False,
-        description="Whether autoscaling was suspended and capacity pinned for the run",
+        description=(
+            "Whether autoscaling was suspended and capacity pinned for the run. False "
+            "means `q_max` may be N x Q_max, with nothing else in the number saying so."
+        ),
+    )
+    unbounded_queue: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the container was verified to have no queue depth bound. Q_max is "
+            "the depth at which the SLO breaks, so a container that sheds first measures "
+            "its own MAX_QUEUE_DEPTH instead. None means the check did not run, which is "
+            "not the same as a pass."
+        ),
     )
     instance_counts_observed: tuple[int, ...] = ()
     ladder_truncated_at: int | None = Field(
         default=None,
         description=(
             "Step index where the ladder stopped early after repeated saturation. "
-            "Recorded so a curve is never read as covering rates that were skipped."
+            "Recorded so the ladder is never read as covering rungs that were skipped."
         ),
     )
 
     transport: str = Field(
         default="response-stream",
         description=(
-            "Wire protocol the ladder ran on. Not decoration: the containers hold "
-            "their inference lock differently per transport - kokoro holds it "
-            "across an entire bidi session but per-generator on response-stream - "
-            "so a C_max from one does not transfer to the other."
+            "Wire protocol the ladder ran on. Not decoration: the containers hold their "
+            "inference lock differently per transport — kokoro holds it across an entire "
+            "bidi session but per-generator on response-stream — so a Q_max from one does "
+            "not transfer to the other."
         ),
     )
     deployed_config: dict[str, Any] = Field(
         default_factory=dict,
         description=(
             "Fingerprint of the configuration the ladder ran against, read from the "
-            "endpoint rather than from a registry. See fixture.DeployedConfig."
+            "endpoint rather than from a registry. See fixture.DeployedConfig. This is "
+            "what makes a rerun on a different instance type a new measurement rather "
+            "than an overwrite of the old one."
         ),
     )
 
     runs: int = Field(default=1, ge=1)
     hold_s: float = Field(gt=0)
     measure_window_s: float = Field(gt=0)
-    arrival_process: str = "poisson"
-    seed: int | None = None
     steps: list[StepSummary] = Field(default_factory=list)
     provenance: Provenance = Field(default_factory=lambda: Provenance(origin=Origin.MEASURED))
 
     @model_validator(mode="after")
-    def _check_report(self) -> CMaxReport:
-        if not self.c_max_curve:
-            raise ValueError(
-                "c_max_curve is empty: no step met any TTFAB budget without saturating. "
-                "Either the endpoint is unhealthy or the lowest ladder rate is already "
-                "past capacity — lower --target-concurrency and re-run."
-            )
-        for budget, concurrency in self.c_max_curve.items():
-            if budget <= 0:
-                raise ValueError(f"TTFAB budget must be positive, got {budget}")
-            if concurrency <= 0:
-                raise ValueError(f"concurrency at budget {budget} must be positive")
+    def _check_report(self) -> QMaxReport:
         if self.s_p95_s < self.s_mean_s:
             raise ValueError(
                 f"s_p95_s ({self.s_p95_s}) < s_mean_s ({self.s_mean_s}); percentiles disagree"
+            )
+        for value in self.q_max_per_run:
+            if value <= 0:
+                raise ValueError(f"per-run q_max must be positive, got {value}")
+        if self.q_max_per_run and self.q_max != min(self.q_max_per_run):
+            raise ValueError(
+                f"q_max ({self.q_max}) must be the minimum of q_max_per_run "
+                f"({list(self.q_max_per_run)}): the cross-run answer is the conservative "
+                "rung, and a q_max that is not one of the per-run answers is not a rung "
+                "that was measured"
             )
         return self
 
     @property
     def trustworthy(self) -> bool:
-        """Whether this curve is safe to read as *per-instance*."""
+        """Whether ``q_max`` is safe to read as *per-instance*.
+
+        The freeze and a stable instance count are both required. ``unbounded_queue`` is
+        not folded in: an unchecked queue bound is a separate warning with a separate fix,
+        and collapsing them would make one re-run look like the other's.
+        """
         return self.frozen and len(set(self.instance_counts_observed)) <= 1
 
     @property
@@ -677,89 +573,141 @@ class CMaxReport(BaseModel):
         return DeployedConfig(instance_type=self.instance_type, image_digest=None).slug
 
     @property
-    def chars_per_request(self) -> float:
-        """Mean characters per request across the usable steps.
+    def q_max_spread(self) -> float:
+        """``(max - min) / min`` of the per-run answers.
 
-        Derived from ``chars_per_hour / achieved_rps`` per step rather than stored,
-        so it cannot drift from the steps it summarizes. Only the planner needs it —
-        to price a fleet in $/M chars, which requires knowing what a request *is* —
-        and hard-coding a corpus average there would misprice any run against a
-        different sample set.
-
-        Returns 0.0 when no step recorded both figures, which the planner surfaces as
-        an infinite unit cost: visibly absent rather than plausibly wrong.
+        Relative to the *minimum* because that is the value the plan uses, so this reads
+        directly as "how much capacity the other runs claimed on top of what we planned
+        for". 0.0 from a single run means there was nothing to disagree with rather than
+        agreement — check :attr:`runs_contributing` before reading it as repeatability.
         """
-        per_step = [
-            s.chars_per_hour / (s.achieved_rps * 3600.0)
-            for s in self.steps
-            if s.chars_per_hour > 0 and s.achieved_rps > 0
-        ]
-        if not per_step:
+        if len(self.q_max_per_run) < 2:
             return 0.0
-        return sum(per_step) / len(per_step)
+        low = min(self.q_max_per_run)
+        return (max(self.q_max_per_run) - low) / low if low > 0 else 0.0
 
     @property
-    def unbracketed_budgets(self) -> list[int]:
-        """Budgets whose knee is only a lower bound, in ascending order."""
-        return sorted(k.ttfab_budget_ms for k in self.knees if k.is_lower_bound)
+    def runs_contributing(self) -> int:
+        """How many runs produced a ``Q_max``. The denominator for :attr:`q_max_spread`."""
+        return len(self.q_max_per_run)
 
     @property
-    def _top_step_index(self) -> int:
-        """Highest step index the run that produced :attr:`knees` actually reached.
+    def rungs(self) -> list[int]:
+        """Concurrencies the ladder measured, ascending and deduplicated.
 
-        Scoped to that one run because ``steps`` holds every run and they can
-        truncate at different points: a global maximum would call a knee
-        "inconclusive" on the strength of a step a *different* run ran.
+        Includes rungs that failed the SLO: what was *offered* is the question a caller
+        asking "is c=10 on this ladder" needs answered, and truncation is reported
+        separately by :attr:`ladder_truncated_at`.
         """
-        if not self.steps:
-            return -1
-        last_run = max(s.run_index for s in self.steps)
-        return max(s.step_index for s in self.steps if s.run_index == last_run)
+        return sorted({step.concurrency for step in self.steps})
 
     @property
-    def exhausted_budgets(self) -> list[int]:
-        """Unbracketed budgets whose knee sits at the very top of the ladder.
+    def ladder_p95_ms(self) -> dict[int, float]:
+        """Concurrency -> median p95 TTFAB across runs, for rungs that measured one.
 
-        These are the ones a longer ladder would actually resolve. Split from
-        :attr:`inconclusive_budgets` because the two need opposite responses and
-        a single "extend --target-concurrency" note sent operators to re-run a
-        45-minute ladder in the case where extending it changes nothing.
+        The table ``ttotal`` reads to turn "the p95 halved" into a number. Median across
+        runs, since with ``--runs 2`` one noisy pass should not move a threshold that
+        decides when a scale-out is declared complete.
         """
-        top = self._top_step_index
-        return sorted(
-            k.ttfab_budget_ms for k in self.knees if k.is_lower_bound and k.step_index >= top
-        )
+        by_rung: dict[int, list[float]] = {}
+        for step in self.steps:
+            if step.ttfab_p95_ms is None or not step.usable:
+                continue
+            by_rung.setdefault(step.concurrency, []).append(step.ttfab_p95_ms)
+        return {rung: statistics.median(values) for rung, values in sorted(by_rung.items())}
 
     @property
-    def inconclusive_budgets(self) -> list[int]:
-        """Unbracketed budgets where higher rates ran but measured nothing usable.
+    def cw_units_ratio_by_rung(self) -> dict[int, float]:
+        """Concurrency -> CloudWatch ``Maximum`` divided by the client's own mean in-flight.
 
-        The ladder did reach past this knee; those steps just produced no p95 to
-        judge — every request failed, or none completed inside the window. A
-        longer ladder cannot help, so the fix is upstream of the rate schedule.
+        The conversion factor between what this tool measures and what the deployed alarm
+        reads. ``ConcurrentRequestsPerModel`` / *Maximum* is a peak over a 10s period; the
+        client's ``concurrency_mean`` is an average over a whole rung. Different
+        quantities, and the ratio is **not** a constant — across one kokoro ladder it ran
+        from 9.8x at the bottom to 1.35x at the top, because a lightly loaded endpoint's
+        peak is many multiples of its average while a saturated one's is barely above it.
+
+        So the planner interpolates on this table rather than on a single fitted number,
+        and a threshold deployed without it is the 0.713 defect: a client occupancy
+        compared against a server peak, satisfiable by no positive arrival rate.
+
+        Only rungs where both figures are present and positive. Median across runs, and
+        the ratio is taken per step before the median so a run whose server metrics went
+        missing drops out of that rung rather than skewing it.
         """
-        top = self._top_step_index
-        return sorted(
-            k.ttfab_budget_ms for k in self.knees if k.is_lower_bound and k.step_index < top
-        )
+        by_rung: dict[int, list[float]] = {}
+        for step in self.steps:
+            if not step.usable:
+                continue
+            client = step.concurrency_mean
+            server = step.server_concurrency_peak
+            if client is None or server is None or client <= 0 or server <= 0:
+                continue
+            by_rung.setdefault(step.concurrency, []).append(server / client)
+        return {rung: statistics.median(values) for rung, values in sorted(by_rung.items())}
+
+    def ttfab_p95_at(self, concurrency: int) -> float | None:
+        """Median p95 TTFAB at exactly this concurrency, or ``None`` if not measured.
+
+        Exact rather than nearest: ``ttotal`` compares a probe held at ``N`` against this
+        table, and a nearest-rung fallback would silently compare a probe at 10 against a
+        rung at 20. Callers wanting the comparison must ask for a rung that exists, and
+        refuse when it does not.
+        """
+        return self.ladder_p95_ms.get(concurrency)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ttfab_p95_at_c1_ms(self) -> float | None:
+        """p95 first-byte time with one request outstanding.
+
+        Service time on an unqueued instance, which is what the ``FirstChunkLatencyP95``
+        alarm watches: that alarm fires on an instance already serving, where the request
+        has spent none of its queue allowance, so an SLO-sized threshold there would only
+        trip once the endpoint was ~10x past keeping up.
+
+        ``None`` when the ladder had no ``N=1`` rung — an alarm threshold has to come from
+        somewhere real, so the absence is reported rather than substituted for.
+
+        A :func:`computed_field` rather than a bare property because the CDK stack reads it
+        off the artifact JSON at synth time, and ``speech-infra`` cannot import this module
+        (``tts-bench`` depends on it, not the other way round). Derived on the way out and
+        ignored on the way in, so it cannot disagree with the ladder it summarizes.
+        """
+        return self.ttfab_p95_at(1)
 
     @property
-    def throughput_bound_budgets(self) -> list[int]:
-        """Budgets whose latency knee sits above the measured throughput ceiling.
+    def chars_per_request(self) -> float:
+        """Mean characters per request over the usable rungs.
 
-        For these, the reported knee is not this instance's capacity: the server had
-        already stopped keeping up with the offered rate before latency crossed the budget,
-        so the extra concurrency is queue backlog. Nothing *failed* at those steps, which
-        is exactly why a latency-only reading passes them silently.
+        Derived from the raw counts rather than stored, so it cannot drift from the steps
+        it summarizes. Only the planner needs it — to price a fleet in $/M chars, which
+        requires knowing what a request *is* — and hard-coding a corpus average there
+        would misprice any run against a different sample set.
 
-        Empty when no ceiling was measured — absent must read as "not checked" rather than
-        as "checked and clean", so callers should test :attr:`throughput_ceiling` for
-        ``None`` separately rather than treat an empty list as reassurance.
+        Returns 0.0 when no rung recorded both figures, which the planner surfaces as an
+        infinite unit cost: visibly absent rather than plausibly wrong.
         """
-        if self.throughput_ceiling is None:
-            return []
-        limit = self.throughput_ceiling.concurrency
-        return sorted(b for b, value in self.c_max_curve.items() if value > limit)
+        chars = sum(s.chars for s in self.steps if s.usable)
+        completed = sum(s.completed for s in self.steps if s.usable)
+        if chars <= 0 or completed <= 0:
+            return 0.0
+        return chars / completed
+
+    @property
+    def saturated_rungs(self) -> list[int]:
+        """Rungs where the server refused work, ascending.
+
+        Non-empty against a queue that was supposed to be unbounded means the run's
+        preconditions were violated: something shed load, so the ladder measured that
+        thing's threshold and not the concurrency at which the SLO breaks.
+        """
+        return sorted({s.concurrency for s in self.steps if s.saturated})
+
+    @property
+    def client_bound_rungs(self) -> list[int]:
+        """Rungs where the client, not the server, was the limit, ascending."""
+        return sorted({s.concurrency for s in self.steps if s.client_bound})
 
     def to_measured(
         self,
@@ -767,17 +715,17 @@ class CMaxReport(BaseModel):
         t_total_s: float,
         t_total_provenance: Provenance | None = None,
     ) -> Measured:
-        """Join this curve with a measured ``T_total`` into a planner input.
+        """Join this ``Q_max`` with a measured ``T_total`` into a planner input.
 
-        The one place the two phases meet. ``frozen`` and
-        ``instance_counts_observed`` are carried through rather than defaulted,
-        so a curve measured without the freeze stays identifiable as such after
-        the join.
+        The one place the two measured variables meet. ``frozen``,
+        ``unbounded_queue`` and ``instance_counts_observed`` are carried through
+        rather than defaulted, so a ladder run without a precondition stays
+        identifiable as such after the join.
 
         Args:
             t_total_s: Scaling lag from ``ttotal``, seconds.
             t_total_provenance: Provenance of ``t_total_s``. Its ``note`` is
-                appended to this curve's, and its ``origin`` sets
+                appended to this run's, and its ``origin`` sets
                 ``t_total_measured``, so an assumed lag cannot be mistaken for a
                 measured one. Omitting it means the caller is supplying a measured
                 lag — the default, and what every existing caller does.
@@ -801,35 +749,23 @@ class CMaxReport(BaseModel):
             endpoint=self.endpoint,
             instance_type=self.instance_type,
             deployed_config=dict(self.deployed_config),
-            c_max_curve=dict(self.c_max_curve),
-            # Flattened to two scalars rather than carried as the whole object: `Measured`
-            # is the planner's input and needs the number plus whether to trust it. The
-            # full ceiling stays on the CMaxReport for anyone asking how it was reached.
-            c_max_throughput=(
-                self.throughput_ceiling.concurrency if self.throughput_ceiling else None
-            ),
-            c_max_throughput_bracketed=(
-                # `is_lower_bound`, not `bracketed`: a client-throttled ceiling understates
-                # capacity just as much as an unbracketed one, and the planner's question is
-                # only "may I trust this as the ceiling", not which cause spoiled it.
-                not self.throughput_ceiling.is_lower_bound if self.throughput_ceiling else True
-            ),
+            q_max=self.q_max,
+            q_max_bracketed=self.q_max_bracketed,
+            slo_ms=self.slo_ms,
+            ttfab_p95_at_c1_ms=self.ttfab_p95_at_c1_ms,
             s_mean_s=self.s_mean_s,
             s_p95_s=self.s_p95_s,
             t_total_s=t_total_s,
             t_total_measured=t_total_provenance is None or t_total_provenance.is_measured,
             chars_per_request=self.chars_per_request,
-            curve_spread=dict(self.curve_spread),
-            runs_contributing=dict(self.runs_contributing),
-            # From `knees` rather than a second stored dict, so the planner's warning and
-            # the knee the CLI prints for that budget can never disagree. `knees` is one
-            # representative per budget (`cmax._representative_knees`), so this is that
-            # run's answer, not a vote: where runs disagree the newest wins, and a
-            # spurious lower-bound warning costs a re-run while a missed one costs an
-            # undersized fleet.
-            c_max_bracketed={k.ttfab_budget_ms: k.bracketed for k in self.knees},
-            runs_total=self.runs,
+            q_max_spread=self.q_max_spread,
+            # `max(1, ...)`: the field is the denominator for the spread and must be a
+            # count of passes, and a report with no per-run detail still had one run.
+            runs_contributing=max(1, self.runs_contributing),
+            ladder_p95_ms=dict(self.ladder_p95_ms),
+            cw_units_ratio_by_rung=dict(self.cw_units_ratio_by_rung),
             frozen=self.frozen,
+            unbounded_queue=self.unbounded_queue,
             instance_counts_observed=self.instance_counts_observed,
             transport=self.transport,
             provenance=Provenance(
@@ -843,19 +779,24 @@ class CMaxReport(BaseModel):
 
 
 class Scenario(BaseModel):
-    """Expected load and policy choices. Supplied as CLI arguments.
+    """The two chosen variables plus the expected load. Supplied as CLI arguments.
 
-    Everything here is an assumption. ``k`` in particular is *not* measured: it
-    is the factor by which traffic might grow within one ``T_total``, and with no
-    production history there is nothing to measure it from.
+    Everything here is an assumption. ``max_scaling_per_t_total`` in particular is *not*
+    measured: it is the factor by which traffic might grow within one ``T_total``, and
+    with no production history there is nothing to measure it from.
 
-    **``W_max`` is deliberately absent.** It used to sit here beside
-    ``ttfab_budget_ms`` as an independent field, and the two could disagree without
-    anything noticing — which is how kokoro shipped a 20 s queue allowance under a
-    300 ms budget, a request taking 20.2 s to first byte while the config claimed
-    0.3 s. The SLO is the whole promise, queue included, so ``W_max`` is derived from
-    :attr:`ttfab_slo_ms` by ``shared.capacity.w_max_for_slo`` at plan time. One derived
-    field cannot contradict the promise; two independent ones always can.
+    **``W_max`` is deliberately absent.** It used to sit here beside a second latency
+    field, and the two could disagree without anything noticing — which is how kokoro
+    shipped a 20 s queue allowance under a 300 ms budget, a request taking 20.2 s to
+    first byte while the config claimed 0.3 s. The SLO is the whole promise, queue
+    included, so ``W_max`` is derived from :attr:`ttfab_slo_ms` by
+    ``shared.capacity.w_max_for_slo`` at plan time. One derived field cannot contradict
+    the promise; two independent ones always can.
+
+    **So is any second latency field.** ``ttfab_slo_ms`` is the only one: it is the
+    pass/fail line the ``Q_max`` ladder was judged against, and the planner refuses an
+    artifact measured against a different value rather than re-reading that ladder
+    against this one.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -873,32 +814,29 @@ class Scenario(BaseModel):
     )
     trough_streams: float | None = Field(default=None, ge=0)
 
-    growth_factor_k: float = Field(
-        default=2.0,
+    max_scaling_per_t_total: float = Field(
+        default=1.25,
         ge=1.0,
-        description="Traffic growth within one T_total. k=1 means flat.",
+        lt=1.5,
+        description=(
+            "Surge ratio to survive within one T_total. 1.25 means traffic may grow 25% "
+            "while a replacement instance is arriving. Both thresholds derive from it: "
+            "with h = ratio - 1, C_scale_max = (1-h) x Q_max and C_scale_min = "
+            "(1-2h) x Q_max. Capped below 1.5 because C_scale_min reaches zero there, "
+            "and a non-positive scale-in threshold deploys as 'never scale in' — see "
+            "shared.capacity.scale_thresholds."
+        ),
     )
     ttfab_slo_ms: int = Field(
         default=3000,
         gt=0,
         description=(
             "End-to-end p95 first-byte SLO: queue wait plus service, the whole promise "
-            "to the client. W_max = SLO - S_p95 follows from it, so this is the single "
-            "field that decides the queueing budget and the queue depth."
+            "to the client. The one latency input. Q_max is measured against it, W_max = "
+            "SLO - S_p95 follows from it, and `plan` refuses a Q_max artifact measured "
+            "against a different value."
         ),
     )
-    ttfab_budget_ms: int = Field(
-        default=300,
-        gt=0,
-        description=(
-            "Which measured budget to read the latency knee at. A *measurement* "
-            "selector, not the SLO: `cmax` sweeps 300/500/1000/3000 in one ladder and "
-            "this picks the column. Distinct from ttfab_slo_ms because the knee at a "
-            "tight budget is the conservative number to size a fleet from even when "
-            "the promise to the client is looser."
-        ),
-    )
-    derate: float = Field(default=0.875, gt=0, le=1.0)
     min_instances_floor: int = Field(
         default=1,
         ge=1,
@@ -954,6 +892,10 @@ class ScalingPlan(BaseModel):
 
     Field names mirror the ``ModelEndpointConfig`` fields they map to, so the
     report can print a paste-ready block.
+
+    The six variables appear here in one place: ``slo_ms`` and
+    ``max_scaling_per_t_total`` chosen (on the scenario), ``q_max`` and ``t_total_s``
+    measured (on the measurement), ``c_scale_max`` and ``c_scale_min`` derived.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -962,41 +904,63 @@ class ScalingPlan(BaseModel):
     endpoint: str
     instance_type: str
 
-    c_max: float = Field(
+    q_max: int = Field(
+        gt=0,
         description=(
-            "Per-instance concurrency the plan is built on: the lower of the latency "
-            "knee at the chosen budget and the measured throughput ceiling."
-        )
-    )
-    c_max_source: str = Field(
-        default="latency_knee_only",
-        description=(
-            "Which measurement produced c_max: 'latency_knee', 'throughput_ceiling', or "
-            "'latency_knee_only' when no ceiling was measured to compare against. Kept "
-            "separate from binding_constraint rather than folded into it, because the "
-            "two answer orthogonal questions and are both true at once: this one says "
-            "what limits an instance, that one says what limits the target we track "
-            "against that limit."
+            "Measured per-instance concurrency the plan is built on: the highest that held the SLO."
         ),
     )
-    c_max_is_lower_bound: bool | None = Field(
+    q_max_is_lower_bound: bool = Field(
+        default=False,
+        description=(
+            "Whether the ladder ran out while still passing, so real capacity is at "
+            "least this. True means both thresholds are conservative — the policy adds "
+            "instances sooner than it needs to, which costs money rather than SLO."
+        ),
+    )
+    c_scale_max: float = Field(
+        gt=0,
+        description=(
+            "Scale out at or above this concurrency. (1-h) x Q_max, h = "
+            "max_scaling_per_t_total - 1. Float because Q_max x 0.75 usually is."
+        ),
+    )
+    c_scale_min: float = Field(
+        ge=0,
+        description=(
+            "Scale in at or below this concurrency. (1-2h) x Q_max — the point where "
+            "there is a full surge of excess headroom."
+        ),
+    )
+    c_scale_max_in_cw_units: float | None = Field(
         default=None,
         description=(
-            "Whether the measurement c_max came from understates the instance's real "
-            "capacity — the ladder never bracketed it, or the client throttled it. True "
-            "means every fleet size here is an over-estimate, which is the safe "
-            "direction but still wrong. None means the artifact did not record the "
-            "question, which is not a pass."
+            "c_scale_max converted to ConcurrentRequestsPerModel / *Maximum*, the "
+            "statistic the deployed alarm actually reads, using the ratio measured on "
+            "the same ladder. The threshold that ships is this number, not the client "
+            "occupancy beside it: deploying the client figure is the defect that put "
+            "0.713 on the endpoint, a value no positive arrival rate satisfies. None "
+            "when the ladder ran without --cloudwatch, in which case the plan says the "
+            "conversion is unavailable rather than assuming it is 1:1."
         ),
     )
-    c_target: float = Field(
+    cw_units_ratio: float | None = Field(
+        default=None,
+        gt=0,
         description=(
-            "Per-instance concurrency for the scaling policy. Float, not int: "
-            "Kokoro's C_max of 1 at k=2 gives 0.44, which an int cannot express."
-        )
+            "server Maximum / client mean at the rung nearest c_scale_max. Recorded "
+            "beside the converted threshold so a reader can see the size of the "
+            "correction — it ran 1.35x to 9.8x across one kokoro ladder, so it is a "
+            "measurement per configuration and not a constant."
+        ),
     )
-    binding_constraint: str = Field(
-        description="'surge_headroom' or 'slo_wait_budget' — the fix differs by which binds"
+    min_safe_instances: int | None = Field(
+        default=None,
+        description=(
+            "Smallest fleet where removing one instance does not push the survivors "
+            "back over c_scale_max. Below it scale-in flaps; None means no fleet size "
+            "is safe at this surge ratio. See the scale_in_safety finding."
+        ),
     )
     w_max_s: float = Field(
         default=0.0,
@@ -1004,8 +968,22 @@ class ScalingPlan(BaseModel):
         description=(
             "Queueing budget, derived as SLO - S_p95 rather than stated. Recorded on the "
             "plan because it is an output here, not an input: the report shows the "
-            "arithmetic, and queue_max_depth below is this number times Lambda_cap. 0 "
-            "means the model's own tail already misses the SLO — see the findings."
+            "arithmetic. 0 means the model's own tail already misses the SLO — see the "
+            "findings."
+        ),
+    )
+    ceiling_s: float = Field(
+        gt=0,
+        description=(
+            "The invocation ceiling W_max + S_p95 was judged against, seconds. Stored "
+            "rather than re-read from SAGEMAKER_INVOCATION_CEILING_S because that "
+            "constant is only the default: `--ceiling-s` moves it, and the config block "
+            "is pasted into config.py verbatim, so its ttfab_slo_ms comment has to name "
+            "the ceiling this plan was actually judged against. Naming 60s on a plan "
+            "checked against something else contradicts the invocation_ceiling finding "
+            "printed directly above it, which is how a policy gets deployed against a "
+            "limit nobody tested. Required, not defaulted to the constant, so a plan "
+            "that failed to record its ceiling cannot render as one judged at 60s."
         ),
     )
 
@@ -1014,21 +992,40 @@ class ScalingPlan(BaseModel):
     peak_instances: int = Field(ge=0)
     trough_instances: int = Field(ge=0)
 
-    queue_max_depth: int = Field(ge=0, description="Q_max per instance = Lambda_cap x W_max")
+    queue_max_depth: int = Field(
+        ge=0,
+        description=(
+            "Per-instance admission bound, set to Q_max: past it a request cannot reach "
+            "first byte inside the SLO, so admitting it produces a late success instead "
+            "of an honest rejection."
+        ),
+    )
     scale_out_cooldown_s: int = Field(ge=0)
     scale_in_cooldown_s: int = Field(ge=0)
 
-    utilization_at_target: float = Field(
-        description="derate / k — the standing price of the surge reserve"
+    utilization_at_c_scale_max: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "Single-server utilization implied by holding c_scale_max in the queue, "
+            "L/(1+L). Recorded because the relationship is steeply non-linear and that "
+            "is not visible from the threshold itself: 0.75 x Q_max is not three "
+            "quarters of the way to trouble but 97% utilized. Feeds surge_survival."
+        ),
     )
-    w_absorbed_s: float = Field(description="Scaling lag the queue hides from clients")
-    headroom_lag_s: float = Field(description="Lag standing headroom must cover after the queue")
+    shed_probability_at_c_scale_max: float | None = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description=(
+            "Simulated P(queue reaches Q_max) while waiting out one T_total from "
+            "c_scale_max. The falsifiable form of 'is this threshold early enough'. None "
+            "when it could not be simulated."
+        ),
+    )
 
     peak_cost_per_hour: float
     peak_cost_per_m_chars: float
-    relative_fleet_cost_vs_k1: float = Field(
-        description="Fleet size at this k divided by fleet size at k=1"
-    )
 
     findings: list[Finding] = Field(default_factory=list)
     measured: Measured

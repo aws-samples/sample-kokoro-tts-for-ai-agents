@@ -2,14 +2,14 @@
 
 All five self-hosted models are configured ``streaming_mode=BIDIRECTIONAL``
 (``config.py:100-149``), so this is the transport production actually uses — but
-every number ``cmax`` produced before this module came from
+the ladder's first measurements came from
 ``invoke_endpoint_with_response_stream``. The two are not interchangeable, and
 the difference is not a detail of the wire format:
 
 * **The containers hold their inference lock differently per transport.**
   ``kokoro/serve.py:323`` holds ``_inference_lock`` across an entire bidi
   session — every request on that socket, not just one — while the
-  response-stream path takes it per generator (``:229``). A ``C_max`` measured
+  response-stream path takes it per generator (``:229``). A ``Q_max`` measured
   on one transport therefore does not transfer to the other, and for kokoro the
   bidi number should be *lower*.
 * **Saturation looks completely different.** On the response-stream path a full
@@ -65,7 +65,7 @@ _BYTES_PER_SAMPLE = 2
 class Transport(StrEnum):
     """Which wire protocol a measurement was taken over.
 
-    Recorded on the artifact because a ``C_max`` is only meaningful alongside
+    Recorded on the artifact because a ``Q_max`` is only meaningful alongside
     its transport — see the module docstring on kokoro's per-session lock.
     """
 

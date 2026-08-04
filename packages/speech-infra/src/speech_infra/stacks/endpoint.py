@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import aws_cdk as cdk
 import aws_cdk.aws_ecr_assets as ecr_assets
 import aws_cdk.aws_iam as iam
 from constructs import Construct
 
+from speech_infra import measurements
 from speech_infra.config import ModelEndpointConfig
 from speech_infra.constructs.observability import EndpointObservability
 from speech_infra.constructs.scaling import EndpointAutoscaling
@@ -26,6 +29,7 @@ class SpeechEndpointStack(cdk.Stack):
         container_dir: str,
         image_uri_override: str | None = None,
         model_bucket_name: str | None = None,
+        artifact_dir: Path | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -63,7 +67,18 @@ class SpeechEndpointStack(cdk.Stack):
             env_overrides=env_overrides,
         )
 
-        if model_config.scaling_enabled:
+        # scaling_enabled alone is a static config property (max_instances >
+        # min_instances) — it says nothing about whether the thresholds inside are
+        # measured. scaling_target_value is a plain float, so a hand-set number and a
+        # `plan`-computed one are indistinguishable by type; that indistinguishability
+        # is how 0.713 -- a client occupancy deployed against a server statistic,
+        # satisfiable by no positive arrival rate -- reached this endpoint without
+        # anything refusing to synth it. scaling_thresholds_measured reads the actual
+        # `plan` artifact, mirroring the "no measurement, no alarm" rule
+        # EndpointObservability's own ttfab_alarm already applies.
+        if model_config.scaling_enabled and measurements.scaling_thresholds_measured(
+            model_config.model_name, artifact_dir=artifact_dir
+        ):
             autoscaling = EndpointAutoscaling(
                 self,
                 "Autoscaling",
@@ -74,11 +89,13 @@ class SpeechEndpointStack(cdk.Stack):
 
             # Gated on the same condition as scaling, not added unconditionally: the
             # alarms are all about whether scaling is keeping up, and the dashboard
-            # annotates C_target, which a non-scaling model does not have.
+            # annotates the two scaling thresholds, which a non-scaling model has no
+            # measured values for.
             observability = EndpointObservability(
                 self,
                 "Observability",
                 model_config=model_config,
                 endpoint_name=model_config.endpoint_name,
+                artifact_dir=artifact_dir,
             )
             observability.node.add_dependency(endpoint)

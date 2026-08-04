@@ -12,10 +12,8 @@ from loguru import logger
 from tts_inference.types import TTSModelName
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from tts_bench.observe import ExpectedScaling
-    from tts_bench.planner import SweepRow
+    from tts_bench.types import ScalingPlan
 
 ALL_MODELS = [m.value for m in TTSModelName]
 
@@ -164,19 +162,6 @@ def cost(models: str, max_samples: int, region: str, output: str | None) -> None
         Path(output).write_text(json.dumps(results, indent=2))
 
 
-def _parse_floats(raw: str, *, flag: str) -> tuple[float, ...]:
-    """Parse a comma-separated numeric list, rejecting anything non-positive."""
-    try:
-        values = tuple(float(part) for part in raw.split(",") if part.strip())
-    except ValueError as exc:
-        raise click.BadParameter(f"{flag} must be comma-separated numbers: {raw}") from exc
-    if not values:
-        raise click.BadParameter(f"{flag} must not be empty")
-    if any(v <= 0 for v in values):
-        raise click.BadParameter(f"{flag} values must be positive: {raw}")
-    return values
-
-
 def _parse_ints(raw: str, *, flag: str) -> tuple[int, ...]:
     """Parse a comma-separated integer list, rejecting anything non-positive."""
     try:
@@ -206,17 +191,15 @@ def _load_texts(samples: str | None, max_samples: int) -> list[str]:
     return [s.text for s in dataset.samples[:max_samples]]
 
 
-# Literal defaults, mirroring `tts_bench.cmax`. Importing that module here would
+# Literal defaults, mirroring `tts_bench.qmax`. Importing that module here would
 # pull numpy and botocore into `--help`, and every other command in this file
-# imports lazily for the same reason. `test_cli_cmax.py` asserts these match the
+# imports lazily for the same reason. `test_cli_qmax.py` asserts these match the
 # module constants, so the duplication cannot drift silently.
-CMAX_LADDER_DEFAULT = "0.5,1,1.5,2,3,4,6,8,12,16"
-CMAX_BUDGETS_DEFAULT = "50,150,300,500"
+QMAX_LADDER_DEFAULT = "1,5,10,20,30,40,50,60"
 
 # Duplicated from `tts_bench.ttotal` for the same reason: a click.Choice is evaluated at
 # import time, so referencing the module here would defeat the lazy import.
 # `test_cli_ttotal.py` asserts these match the module constants.
-TTOTAL_TRIGGER_DRIVE_LOAD = "drive-load"
 TTOTAL_TRIGGER_FORCE_DESIRED = "force-desired"
 
 
@@ -226,53 +209,60 @@ TTOTAL_TRIGGER_FORCE_DESIRED = "force-desired"
     required=True,
     help=(
         "Model name, e.g. kokoro-82m. Singular and required: this measures one "
-        "configuration, and it freezes or scales that endpoint to do it."
+        "configuration, and it freezes that endpoint to do it."
     ),
 )
 @click.option("--region", default="us-east-1", help="AWS region every client is built in")
 @click.option("--variant", default="primary", help="Production variant on the endpoint")
 @click.option("--voice", default=None, help="Override the model's default voice")
 @click.option(
-    "--target-concurrency",
-    "target_concurrency",
-    default=CMAX_LADDER_DEFAULT,
-    help="Ladder in expected concurrency (lambda x S), comma-separated",
+    "--concurrency",
+    "concurrency",
+    default=QMAX_LADDER_DEFAULT,
+    help=(
+        "Ladder in concurrency (queued + executing), comma-separated. Held exactly at "
+        "each rung, so these are the values Q_max can come back as -- not rates to be "
+        "converted. Three rungs are consumed downstream: 1 gives the alarm its "
+        "service-time reference, 5 and 10 are the pair `ttotal` compares a halving "
+        "against."
+    ),
 )
 @click.option(
-    "--ttfab-budgets",
-    default=CMAX_BUDGETS_DEFAULT,
-    help="p95 TTFAB budgets in ms; the knee is reported for each",
+    "--slo-ms",
+    "slo_ms",
+    default=3000,
+    type=int,
+    help=(
+        "p95 first-byte SLO in ms, queue time included. The pass/fail line that "
+        "*defines* Q_max, so it is recorded on the artifact and `plan` refuses to read "
+        "this ladder against a different one."
+    ),
 )
-@click.option("--hold", "hold_s", default=240.0, type=float, help="Seconds held per step")
+@click.option("--hold", "hold_s", default=240.0, type=float, help="Seconds held per rung")
 @click.option(
     "--measure-window",
     "measure_window_s",
     default=60.0,
     type=float,
-    help="Trailing seconds of each step that are measured; the rest is warm-up",
+    help="Trailing seconds of each rung that are measured; the rest is warm-up",
 )
 @click.option(
     "--settle-between-steps",
     "settle_between_steps_s",
     default=30.0,
     type=float,
-    help="Idle seconds between steps so the previous queue drains",
+    help="Idle seconds between rungs so the previous queue drains",
 )
-@click.option("--runs", default=1, type=int, help="Ladder passes; 3 to see run-to-run spread")
-@click.option("--derate", default=0.875, type=float, help="Recorded in the artifact, not applied")
+@click.option("--runs", default=1, type=int, help="Ladder passes; 2+ to see run-to-run spread")
 @click.option(
     "--transport",
     default="response-stream",
     type=click.Choice(["response-stream", "bidi"]),
-    help="Wire protocol to measure. C_max does not transfer between the two.",
+    help="Wire protocol to measure. Q_max does not transfer between the two.",
 )
 @click.option(
-    "--arrival",
-    default="poisson",
-    type=click.Choice(["poisson", "fixed"]),
-    help="Arrival process. Poisson is the realistic one; fixed isolates the harness.",
+    "--seed", default=1234, type=int, help="Text-pool shuffle seed; keeps runs comparable"
 )
-@click.option("--seed", default=1234, type=int, help="Arrival-schedule seed; keeps runs comparable")
 @click.option("--max-samples", default=50, type=int, help="Texts drawn into the pool")
 @click.option("--samples", default=None, type=click.Path(), help="Override the sample JSON path")
 @click.option(
@@ -280,22 +270,25 @@ TTOTAL_TRIGGER_FORCE_DESIRED = "force-desired"
     default=True,
     help="Refuse to run unless scale-out is suspended and capacity is pinned",
 )
-@click.option("--pin-to", default=1, type=int, help="Instances to pin for the run")
 @click.option(
-    "--max-workers",
-    default=None,
-    type=int,
+    "--require-unbounded-queue/--no-require-unbounded-queue",
+    default=True,
     help=(
-        "Raise the client thread/connection pool above the derived size. Only raises. "
-        "Needed when a transport holds its lock per session (bidi), where in-flight "
-        "overshoots the target by the server's backlog and the derived pool runs out."
+        "Refuse to run when the container bounds its admission queue. A bounded "
+        "container sheds before the SLO breaks, so the ladder would measure "
+        "MAX_QUEUE_DEPTH rather than Q_max."
     ),
 )
+@click.option("--pin-to", default=1, type=int, help="Instances to pin for the run")
 @click.option(
     "--cloudwatch/--no-cloudwatch",
     "cloudwatch_join",
     default=True,
-    help="Join server-side metrics after a settle delay (~2 min)",
+    help=(
+        "Join server-side metrics after a settle delay (~2 min). This is where the "
+        "deployed threshold's units come from; 10s datapoints retain 3 hours, so "
+        "skipping it cannot be undone later."
+    ),
 )
 @click.option(
     "--output",
@@ -321,26 +314,24 @@ TTOTAL_TRIGGER_FORCE_DESIRED = "force-desired"
     type=float,
     help="Service time assumed by --dry-run, in seconds",
 )
-def cmax(
+def qmax(
     model: str,
     region: str,
     variant: str,
     voice: str | None,
-    target_concurrency: str,
-    ttfab_budgets: str,
+    concurrency: str,
+    slo_ms: int,
     hold_s: float,
     measure_window_s: float,
     settle_between_steps_s: float,
     runs: int,
-    derate: float,
     transport: str,
-    arrival: str,
     seed: int,
     max_samples: int,
     samples: str | None,
     require_frozen: bool,
+    require_unbounded_queue: bool,
     pin_to: int,
-    max_workers: int | None,
     cloudwatch_join: bool,
     output: str | None,
     no_save: bool,
@@ -348,33 +339,36 @@ def cmax(
     dry_run: bool,
     dry_run_s: float,
 ) -> None:
-    """Measure per-instance concurrency at the latency knee (C_max).
+    """Measure Q_max: the highest concurrency that still meets the SLO.
 
-    Holds a fixed arrival rate per step and measures only the trailing window, so
-    warm-up and queue drain are excluded. The knee is reported for every TTFAB
-    budget from one ladder, which turns choosing an SLO into a table lookup
-    rather than another 45-minute run.
+    Walks a closed-loop ladder, holding queued-plus-executing at exactly N per rung
+    -- each of N workers issues its next request only when its previous one returns.
+    Q_max is the highest rung whose p95 first-byte time stayed inside ``--slo-ms``,
+    so the answer is a concurrency that was actually run rather than one inferred
+    from a rate. Only the trailing window of each rung is measured, which excludes
+    warm-up and the drain behind it.
 
     Autoscaling is frozen and capacity pinned for the whole run, restored on exit
-    including on Ctrl-C. C_max is a *per-instance* number: if the fleet grows
-    mid-run, throughput rises for a reason unrelated to the knee and the result
-    is silently N x C_max.
+    including on Ctrl-C. Q_max is a *per-instance* number: if the fleet grows mid-run
+    the result is silently N x Q_max.
 
-    ``--transport bidi`` measures the protocol production is configured for. It
-    is a separate measurement, not a refinement: the containers serialize
-    differently on it, so expect a lower C_max on kokoro, which holds its
-    inference lock across a whole bidi session.
+    The ladder must also bracket its answer from above -- one rung past the crossing
+    -- or Q_max is only a lower bound, and both derived thresholds inherit that.
+
+    ``--transport bidi`` measures the protocol production is configured for. It is a
+    separate measurement, not a refinement: the containers serialize differently on
+    it, so expect a lower Q_max on kokoro, which holds its inference lock across a
+    whole bidi session.
     """
-    from tts_bench import cmax as cmax_mod
+    from tts_bench import qmax as qmax_mod
     from tts_bench.invoke import resolve_endpoint
 
-    targets = _parse_floats(target_concurrency, flag="--target-concurrency")
-    budgets = _parse_ints(ttfab_budgets, flag="--ttfab-budgets")
+    rungs = _parse_ints(concurrency, flag="--concurrency")
 
     # Resolve the endpoint before anything else. A typo or a managed model then
     # fails as a usage error rather than a traceback out of `measure`, and it
     # fails on --dry-run too — which is the run people use to check a command
-    # before committing 45 minutes and an endpoint freeze to it.
+    # before committing 40 minutes and an endpoint freeze to it.
     try:
         endpoint = resolve_endpoint(model)
     except ValueError as exc:
@@ -383,49 +377,76 @@ def cmax(
     if measure_window_s > hold_s:
         raise click.BadParameter(
             f"--measure-window ({measure_window_s}) cannot exceed --hold ({hold_s}); it is the "
-            "trailing part of a step, not an addition to it"
+            "trailing part of a rung, not an addition to it"
         )
     if runs < 1:
         raise click.BadParameter("--runs must be at least 1")
+    if slo_ms <= 0:
+        raise click.BadParameter("--slo-ms must be positive; it is the line Q_max is defined by")
+    if any(rung <= 0 for rung in rungs):
+        raise click.BadParameter(
+            "--concurrency rungs must be positive; N is a count of outstanding requests",
+            param_hint="--concurrency",
+        )
 
-    estimate_s = cmax_mod.total_duration_s(
-        target_concurrencies=targets,
+    estimate_s = qmax_mod.total_duration_s(
+        concurrencies=rungs,
         hold_s=hold_s,
         settle_between_steps_s=settle_between_steps_s,
         runs=runs,
     )
 
+    # Warned here rather than only at report time: a missing rung cannot be recovered
+    # without re-running the ladder, and by then the 40 minutes are already spent.
+    missing = [rung for rung in (1, *qmax_mod.RECOVERY_RUNGS) if rung not in set(rungs)]
+    if missing:
+        click.echo(
+            f"WARNING: --concurrency omits {missing}. Rung 1 is the FirstChunkLatencyP95 "
+            f"alarm's service-time reference; rungs {list(qmax_mod.RECOVERY_RUNGS)} are the "
+            "pair `ttotal` watches a p95 halve between. Whichever is missing, that consumer "
+            "has to refuse the artifact."
+        )
+
     if dry_run:
         click.echo(
-            f"{model} ({endpoint}): {len(targets)} step(s) x {runs} run(s), "
-            f"assuming S={dry_run_s:.3f}s (not measured)"
+            f"{model} ({endpoint}): {len(set(rungs))} rung(s) x {runs} run(s), "
+            f"SLO p95 {slo_ms}ms, assuming S={dry_run_s:.3f}s (not measured)"
         )
-        click.echo(f"{'run':>4} {'step':>5} {'target':>8} {'rps':>9} {'hold_s':>8} {'requests':>9}")
-        for row in cmax_mod.dry_run_plan(
-            s_mean_s=dry_run_s, target_concurrencies=targets, hold_s=hold_s, runs=runs
+        click.echo(f"{'run':>4} {'step':>5} {'conc':>6} {'hold_s':>8} {'requests':>9}")
+        for row in qmax_mod.dry_run_plan(
+            concurrencies=rungs, hold_s=hold_s, s_mean_s=dry_run_s, runs=runs
         ):
             click.echo(
                 f"{int(row['run_index']):>4} {int(row['step_index']):>5} "
-                f"{row['target_concurrency']:>8.2f} {row['offered_rps']:>9.2f} "
-                f"{row['hold_s']:>8.0f} {row['expected_requests']:>9.0f}"
+                f"{int(row['concurrency']):>6} {row['hold_s']:>8.0f} "
+                f"{row.get('expected_requests', 0.0):>9.0f}"
             )
         click.echo(
             f"\nEstimated wall clock: {estimate_s / 60:.0f} min "
-            f"(+~2 min CloudWatch settle). Budgets: {list(budgets)}"
+            f"(+~2 min CloudWatch settle). `requests` is a forecast from the assumed S, "
+            "not a schedule: a closed loop completes N/S per second, so a wrong S "
+            "mis-predicts the count without moving a single rung."
         )
         click.echo("Dry run: no AWS calls made, nothing frozen.")
         return
 
     texts = _load_texts(samples, max_samples)
     click.echo(
-        f"{model} ({endpoint}): {len(targets)} step(s) x {runs} run(s), "
-        f"~{estimate_s / 60:.0f} min, {len(texts)} texts, transport={transport}, "
-        f"frozen={require_frozen}"
+        f"{model} ({endpoint}): {len(set(rungs))} rung(s) x {runs} run(s), "
+        f"~{estimate_s / 60:.0f} min, SLO p95 {slo_ms}ms, {len(texts)} texts, "
+        f"transport={transport}, frozen={require_frozen}"
     )
     if not require_frozen:
         click.echo(
-            "WARNING: --no-require-frozen. If the fleet grows mid-run this measures N x C_max; "
+            "WARNING: --no-require-frozen. If the fleet grows mid-run this measures N x Q_max; "
             "the artifact will record frozen=false."
+        )
+    if not cloudwatch_join:
+        click.echo(
+            "WARNING: --no-cloudwatch. No rung will record ConcurrentRequestsPerModel / "
+            "Maximum, which is the statistic the deployed threshold is compared against, so "
+            "`plan` will have no unit conversion. 10s datapoints retain 3 hours — this "
+            "cannot be backfilled after the run."
         )
 
     from contextlib import nullcontext
@@ -437,29 +458,27 @@ def cmax(
         # JsonlWriter opens on enter and flushes every event, so a run killed at
         # the interesting moment has still written the interesting moment.
         with JsonlWriter(events) if events else nullcontext() as writer:
-            report = cmax_mod.measure(
+            report = qmax_mod.measure(
                 model=model,
                 texts=texts,
+                slo_ms=slo_ms,
                 region=region,
                 variant=variant,
                 voice=voice,
-                target_concurrencies=targets,
-                budgets=budgets,
+                concurrencies=rungs,
                 hold_s=hold_s,
                 measure_window_s=measure_window_s,
                 settle_between_steps_s=settle_between_steps_s,
                 runs=runs,
-                derate=derate,
-                arrival=arrival,
                 seed=seed,
                 transport=transport,
                 require_frozen=require_frozen,
+                require_unbounded_queue=require_unbounded_queue,
                 pin_to=pin_to,
-                max_workers=max_workers,
                 cloudwatch_join=cloudwatch_join,
                 event_sink=writer,
             )
-    except (cmax_mod.CMaxError, FixtureError) as exc:
+    except (qmax_mod.QMaxError, FixtureError) as exc:
         # Both are the tool refusing to produce a number it cannot stand behind,
         # so they exit cleanly with the reason. A traceback would read as a bug
         # rather than as the guard doing its job.
@@ -468,104 +487,98 @@ def cmax(
         click.echo(f"Events: {events}")
 
     click.echo(
-        f"\nC_max curve for {report.model_name} on {report.instance_type} via {report.transport}:"
+        f"\nQ_max ladder for {report.model_name} on {report.instance_type} "
+        f"via {report.transport}, against p95 first byte <= {report.slo_ms}ms:"
     )
+    # `cw_max` is CloudWatch's Maximum statistic and `cl_mean` the client's own mean
+    # in-flight. Both columns, side by side, because they are different quantities that
+    # ran from 9.8x apart to 1.35x apart over one ladder — printing only one is how a
+    # client-measured occupancy came to be deployed as a server-side threshold.
     click.echo(
-        f"{'budget_ms':>10} {'C_max':>8} {'rps':>8} {'p95_ttfab':>10} {'spread':>8} {'runs':>6}"
+        f"{'run':>4} {'conc':>6} {'p95_ms':>8} {'slo':>5} {'rps':>7} "
+        f"{'cl_mean':>8} {'cw_max':>7}  note"
     )
-    knees = {k.ttfab_budget_ms: k for k in report.knees}
-    for budget in sorted(report.c_max_curve):
-        knee = knees.get(budget)
-        spread = report.curve_spread.get(budget)
-        contributing = report.runs_contributing.get(budget)
-        # A missing knee prints as "n/a", never as 0.00. Zeros in a rate and a latency
-        # column read as a measurement that came back empty, when what happened is that
-        # the detail for this budget is absent while the concurrency beside it is real.
+    for step in report.steps:
+        if step.usable:
+            note = "" if step.meets_slo else "over SLO"
+        else:
+            note = step.unusable_reason or "unusable"
+        # "n/a" rather than 0 in every derived column: a zero p95 reads as an
+        # instantaneous response, when what happened is that the rung measured nothing.
         click.echo(
-            f"{budget:>10} {report.c_max_curve[budget]:>8.2f} "
-            f"{f'{knee.offered_rps:.2f}' if knee else 'n/a':>8} "
-            f"{f'{knee.p95_ttfab_ms:.0f}' if knee else 'n/a':>10} "
-            f"{f'{spread:.0%}' if spread is not None else 'n/a':>8} "
-            f"{f'{contributing}/{report.runs}' if contributing is not None else 'n/a':>6}"
+            f"{step.run_index:>4} {step.concurrency:>6} "
+            f"{f'{step.ttfab_p95_ms:.0f}' if step.ttfab_p95_ms is not None else 'n/a':>8} "
+            f"{('ok' if step.meets_slo else 'OVER') if step.usable else '-':>5} "
+            f"{step.achieved_rps:>7.2f} "
+            f"{f'{step.concurrency_mean:.2f}' if step.concurrency_mean is not None else 'n/a':>8} "
+            f"{f'{step.server_concurrency_peak:.1f}' if step.server_concurrency_peak is not None else 'n/a':>7}"  # noqa: E501
+            f"  {note}"
         )
 
-    # A curve built from one pass of a --runs 3 ladder is a single sample. Saying so
-    # here matters because `spread` is 0% in exactly that case, which otherwise reads
-    # as three runs agreeing.
-    thin = sorted(b for b, n in report.runs_contributing.items() if n < report.runs)
-    if thin and report.runs > 1:
+    click.echo(
+        f"\nQ_max: {report.q_max} concurrent per instance "
+        f"(p95 {report.ttfab_p95_at_q_max_ms:.0f}ms there, "
+        f"{report.slo_ms - report.ttfab_p95_at_q_max_ms:.0f}ms of SLO left over)"
+    )
+    if not report.q_max_bracketed:
         click.echo(
-            f"NOTE: budgets {thin} had fewer than {report.runs} runs find a knee, so their "
-            "spread is not a run-to-run agreement. The other runs' steps were unusable or "
-            "unsettled at that budget — check the ladder above."
+            "  NOTE: LOWER BOUND — no rung above it was measured to actually miss the SLO. "
+            f"Extend --concurrency past {report.q_max} to bracket it. Both derived "
+            "thresholds are fractions of Q_max, so an unbracketed value scales out earlier "
+            "than necessary rather than later."
+        )
+    if report.runs_contributing < report.runs:
+        click.echo(
+            f"  NOTE: only {report.runs_contributing}/{report.runs} run(s) produced an "
+            "answer, so the spread below is not a run-to-run agreement — check the notes "
+            "in the ladder above."
+        )
+    if report.runs_contributing > 1:
+        # The minimum, not the median: the median of two rungs is a concurrency no run
+        # tested, while the minimum is both a real rung and the conservative one.
+        click.echo(
+            f"  per-run: {list(report.q_max_per_run)} (spread {report.q_max_spread:.0%}; "
+            "Q_max is the minimum, which is a rung that was actually measured)"
         )
 
-    # The second C_max, printed as its own block rather than a row in the curve: it has no
-    # budget to key it by, and the whole point is that it is not a latency measurement.
-    ceiling = report.throughput_ceiling
-    if ceiling is None:
+    c1 = report.ttfab_p95_at_c1_ms
+    if c1 is None:
         click.echo(
-            "\nThroughput ceiling: not measured — no step sustained its offered rate. "
-            "Every rate on this ladder was already past capacity, so C_max is below the "
-            "lowest step; re-run with a lower --target-concurrency."
+            "\np95 at c=1: not measured — the FirstChunkLatencyP95 alarm has no service-time "
+            "threshold to read, and an alarm threshold has to come from somewhere real."
+        )
+    else:
+        click.echo(f"\np95 at c=1: {c1:.0f}ms (FirstChunkLatencyP95 alarm threshold)")
+    pair = [(rung, report.ttfab_p95_at(rung)) for rung in qmax_mod.RECOVERY_RUNGS]
+    if all(value is not None for _, value in pair):
+        click.echo(
+            "Recovery pair for ttotal: "
+            + ", ".join(f"c={rung} -> {value:.0f}ms" for rung, value in pair)
+            + " (a probe held at the higher rung halves into the lower one when a second "
+            "instance takes traffic)"
         )
     else:
         click.echo(
-            f"\nThroughput ceiling: {ceiling.max_sustained_rps:.2f} rps sustained "
-            f"-> C_max {ceiling.concurrency:.2f} "
-            f"(useful concurrency; p95 TTFAB {ceiling.p95_ttfab_ms:.0f}ms at step "
-            f"{ceiling.step_index}, {ceiling.runs_contributing}/{report.runs} runs, "
-            f"spread {ceiling.spread:.0%})"
+            f"Recovery pair for ttotal: incomplete — "
+            f"{[rung for rung, value in pair if value is None]} produced no usable p95, so "
+            "`ttotal` will refuse this artifact."
         )
-        if ceiling.observed_concurrency is not None:
-            multiple = ceiling.queueing_multiple
-            click.echo(
-                f"  observed in-flight there was {ceiling.observed_concurrency:.2f}"
-                + (
-                    f" — {multiple:.1f}x the useful figure, i.e. that much of each "
-                    "request's residence is queueing. ConcurrentRequestsPerModel (what "
-                    "the scaling policy tracks) reports the observed number, so the two "
-                    "are not interchangeable."
-                    if multiple is not None and multiple > 1.5
-                    else f" ({multiple:.1f}x useful)"
-                    if multiple is not None
-                    else ""
-                )
-            )
-        if report.throughput_bound_budgets:
-            click.echo(
-                f"  WARNING: budgets {report.throughput_bound_budgets} report a knee ABOVE this "
-                "ceiling. Nothing failed at those steps — latency stayed inside budget — but "
-                "the server had stopped keeping up, so their concurrency is backlog, not "
-                "capacity. Plan on the ceiling."
-            )
-        if ceiling.is_lower_bound:
-            reason = (
-                f"{ceiling.dispatch_skipped} dispatch(es) were skipped at that step, so the "
-                "server never saw the full offered rate — raise --max-workers"
-                if ceiling.dispatch_skipped
-                else "no saturated step was observed above it — extend --target-concurrency"
-            )
-            click.echo(f"  NOTE: this is a LOWER bound ({reason}).")
-
     click.echo(
-        f"\nS (uncontended): mean {report.s_mean_s * 1000:.0f}ms p95 {report.s_p95_s * 1000:.0f}ms"
+        f"S (lowest rung): mean {report.s_mean_s * 1000:.0f}ms p95 {report.s_p95_s * 1000:.0f}ms "
+        "— includes the client round trip, so it over-states server-side work slightly"
     )
-    if report.exhausted_budgets:
-        click.echo(
-            f"NOTE: budgets {report.exhausted_budgets} still passed at the top of the ladder, "
-            "so those are lower bounds. Extend --target-concurrency to bracket them."
-        )
-    if report.inconclusive_budgets:
-        click.echo(
-            f"NOTE: budgets {report.inconclusive_budgets} are lower bounds, but higher rates "
-            "*were* offered and produced no usable latency — a longer ladder will not help. "
-            "Check the unusable_reason on the steps above the knee."
-        )
+
     if report.ladder_truncated_at is not None:
         click.echo(
             f"NOTE: ladder stopped at step {report.ladder_truncated_at} after repeated "
-            "saturation; higher rates were never offered."
+            "saturation; higher rungs were never offered."
+        )
+    if report.unbounded_queue is not True:
+        click.echo(
+            "WARNING: the container's queue bound was "
+            + ("not verified" if report.unbounded_queue is None else "found to be SET")
+            + ". Q_max is the depth at which the SLO breaks, so a container that sheds "
+            "first measures its own MAX_QUEUE_DEPTH instead."
         )
     if not report.trustworthy:
         click.echo(
@@ -575,16 +588,16 @@ def cmax(
 
     if no_save:
         click.echo(f"\n--no-save: nothing written. Configuration measured: {report.config_slug}")
-        click.echo(f"\nNext: tts-bench ttotal --model {model} --measured <cmax artifact>")
+        click.echo(f"\nNext: tts-bench ttotal --model {model} --qmax <qmax artifact>")
     else:
-        # Defaulted rather than optional: this run costs 45+ minutes and an endpoint
+        # Defaulted rather than optional: this run costs 40+ minutes and an endpoint
         # freeze, and printing a suggested filename after the fact does not bring the
         # measurement back. The slug in the name is what keeps two configurations'
-        # curves apart -- they are two different measurements, not two attempts at one.
+        # ladders apart -- they are two different measurements, not two attempts at one.
         destination = (
             Path(output)
             if output
-            else _default_artifact_path("cmax", model, transport, report.config_slug)
+            else _default_artifact_path("qmax", model, transport, report.config_slug)
         )
         _warn_if_replacing_another_config(destination, report.config_slug)
         _save_artifact(destination, report.model_dump_json(indent=2))
@@ -592,8 +605,8 @@ def cmax(
         click.echo(f"Configuration measured: {report.config_slug}")
         # Echo the path back rather than "<artifact>": the next command needs this exact
         # file, and the slug in it is not something to retype from memory.
-        click.echo(f"\nNext: tts-bench ttotal --model {model} --measured {destination}")
-        click.echo(f"Then: tts-bench plan --measured {destination} --ttotal <ttotal artifact>")
+        click.echo(f"\nNext: tts-bench ttotal --model {model} --qmax {destination}")
+        click.echo(f"Then: tts-bench plan --qmax {destination} --ttotal <ttotal artifact>")
 
 
 @main.command()
@@ -602,7 +615,18 @@ def cmax(
     required=True,
     help=(
         "Model name, e.g. kokoro-82m. Singular and required: this measures one "
-        "configuration, and it freezes or scales that endpoint to do it."
+        "configuration, and it freezes and then scales that endpoint to do it."
+    ),
+)
+@click.option(
+    "--qmax",
+    "qmax_path",
+    required=True,
+    type=click.Path(exists=True),
+    help=(
+        "A qmax artifact from THIS configuration. Required: recovery is judged by the "
+        "probe's p95 halving between two of its rungs, so without it there is no "
+        "measured level to compare against."
     ),
 )
 @click.option("--region", default="us-east-1", help="AWS region every client is built in")
@@ -610,49 +634,37 @@ def cmax(
 @click.option("--voice", default=None, help="Override the model's default voice")
 @click.option(
     "--trigger",
-    type=click.Choice([TTOTAL_TRIGGER_DRIVE_LOAD, TTOTAL_TRIGGER_FORCE_DESIRED]),
-    default=TTOTAL_TRIGGER_DRIVE_LOAD,
-    help="How to cause the scale-out. force-desired skips the policy entirely.",
-)
-@click.option(
-    "--scaling-target",
-    default=None,
-    type=float,
+    type=click.Choice([TTOTAL_TRIGGER_FORCE_DESIRED]),
+    default=TTOTAL_TRIGGER_FORCE_DESIRED,
     help=(
-        "C_target to drive past. Defaults to the deployed policy's TargetValue; with "
-        "--trigger drive-load and no policy deployed, this is an error rather than a guess."
+        "How to cause the scale-out. Only force-desired: driving load past the deployed "
+        "policy let the policy add instances mid-measurement."
     ),
 )
 @click.option(
-    "--load-multiple",
-    default=3.0,
-    type=float,
-    help="Offered concurrency as a multiple of C_target",
+    "--probe-concurrency",
+    default=None,
+    type=int,
+    help=(
+        "Concurrency the probe holds throughout. Must be an even rung on the ladder, and "
+        "so must its half. Defaults to 10."
+    ),
 )
 @click.option(
-    "--s-mean",
-    "s_mean_s",
+    "--warmup",
+    "warmup_s",
     default=None,
     type=float,
-    help="Mean service time in seconds, converting target concurrency to a rate",
-)
-@click.option(
-    "--measured",
-    default=None,
-    type=click.Path(exists=True),
-    help="A cmax artifact to read S and the TTFAB budget from",
-)
-@click.option(
-    "--ttfab-budget-ms",
-    default=None,
-    type=float,
-    help="Budget the recovery bound is judged against. Defaults from --measured or config.",
+    help=(
+        "Seconds the probe runs before the trigger, so p95 has settled. Not part of "
+        "T_total -- the clock starts when capacity is requested."
+    ),
 )
 @click.option(
     "--allow-config-mismatch",
     is_flag=True,
     default=False,
-    help="Proceed even if --measured was taken on a different deployed configuration",
+    help="Proceed even if --qmax was taken on a different deployed configuration",
 )
 @click.option("--max-wait", "max_wait_s", default=1500.0, type=float, help="Scale-out timeout")
 @click.option(
@@ -660,7 +672,7 @@ def cmax(
     "settle_s",
     default=180.0,
     type=float,
-    help="Seconds of load held past the event, so recovery can be bounded",
+    help="Seconds the probe is held past the event, so recovery can be bounded",
 )
 @click.option(
     "--poll-interval",
@@ -673,14 +685,10 @@ def cmax(
     "--transport",
     type=click.Choice(["response-stream", "bidi"]),
     default="bidi",
-    help="Wire protocol for the offered load. Match the --measured curve.",
+    help="Wire protocol the probe uses. Must match the --qmax ladder's.",
 )
 @click.option(
-    "--arrival-seed",
-    "seed",
-    default=1234,
-    type=int,
-    help="Arrival-schedule seed; keeps runs comparable",
+    "--seed", default=1234, type=int, help="Text-pool shuffle seed; keeps runs comparable"
 )
 @click.option("--max-samples", default=50, type=int, help="Texts drawn into the pool")
 @click.option("--samples", default=None, type=click.Path(), help="Override the sample JSON path")
@@ -699,15 +707,13 @@ def cmax(
 @click.option("--events", default=None, type=click.Path(), help="Write per-request JSONL here")
 def ttotal(
     model: str,
+    qmax_path: str,
     region: str,
     variant: str,
     voice: str | None,
     trigger: str,
-    scaling_target: float | None,
-    load_multiple: float,
-    s_mean_s: float | None,
-    measured: str | None,
-    ttfab_budget_ms: float | None,
+    probe_concurrency: int | None,
+    warmup_s: float | None,
     allow_config_mismatch: bool,
     max_wait_s: float,
     settle_s: float,
@@ -720,132 +726,120 @@ def ttotal(
     no_save: bool,
     events: str | None,
 ) -> None:
-    """Measure T_total: the lag from load arriving to new capacity serving it.
+    """Measure T_total: the lag from requesting capacity to that capacity serving traffic.
 
-    Drives load past C_target so the deployed policy fires, then attributes the lag
-    stage by stage — metric publication, alarm evaluation, scaling activity, instance
-    provisioning, container startup, and traffic recovery — each from the API that
-    timestamps it.
+    Freezes the endpoint at one instance, holds a saturating closed-loop probe, then raises
+    DesiredInstanceCount directly and attributes the lag stage by stage — provisioning,
+    container startup, in-service, and traffic recovery — each from the API that timestamps
+    it. The clock starts at our own capacity call, so the probe's warm-up is not counted.
 
-    T_total is the input the capacity plan is most sensitive to: it sets how much
-    standing headroom a surge needs and how much of one a queue can absorb. It is also
-    the number most often guessed.
+    T_total is the input the capacity plan is most sensitive to: it sets how much standing
+    headroom a surge needs. It is also the number most often guessed.
 
-    `--trigger force-desired` sets DesiredInstanceCount directly. That needs no policy
-    and measures only the container half, so its result is NOT a full T_total — it exists
-    for iterating quickly on the container stages.
+    Recovery is a halving, not a threshold crossing. The endpoint routes
+    LEAST_OUTSTANDING_REQUESTS, so a second instance splits the probe in half and its p95
+    drops toward the ladder's own half-concurrency value — that is what "the new instance
+    is serving" means from outside, since SageMaker never says which instance served a
+    request. Both rungs must be on the --qmax ladder or this refuses to run.
 
-    Restores the starting desired instance count on exit, Ctrl-C included.
+    The deployed policy is suspended throughout, so its detection lag is NOT measured: it
+    is bounded separately and reported as t_total_with_policy_bound_s. Autoscaling and the
+    starting instance count are both restored on exit, Ctrl-C included.
     """
-    import boto3
-
+    from tts_bench import qmax as qmax_mod
     from tts_bench import ttotal as ttotal_mod
     from tts_bench.fixture import FixtureError
     from tts_bench.invoke import resolve_endpoint, resolve_voice
+    from tts_bench.types import QMaxReport
 
     try:
         endpoint = resolve_endpoint(model)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--model") from exc
 
-    # S and the TTFAB budget both come from a cmax artifact when there is one: they are
-    # measured properties of this model on this transport, and re-deriving them here
-    # would let a T_total run silently disagree with the C_max it will be planned with.
-    artifact: dict[str, object] | None = None
-    if measured:
-        artifact = json.loads(Path(measured).read_text())
-        if s_mean_s is None and isinstance(artifact.get("s_mean_s"), int | float):
-            s_mean_s = float(artifact["s_mean_s"])  # type: ignore[arg-type]
-        if ttfab_budget_ms is None:
-            curve = artifact.get("c_max_curve")
-            if isinstance(curve, dict) and curve:
-                # The largest budget in the curve: the loosest SLO the C_max run
-                # measured, so recovery is judged against a bound the model can meet.
-                ttfab_budget_ms = float(max(int(k) for k in curve))
-        if artifact.get("transport") and artifact["transport"] != transport:
-            click.echo(
-                f"WARNING: --measured was taken on transport {artifact['transport']!r} but "
-                f"this run uses {transport!r}. S differs per transport, so the offered rate "
-                "may not reach C_target."
-            )
-        # A transport mismatch only mis-sizes the offered rate, so it warns. A
-        # configuration mismatch means S itself was measured on other hardware or other
-        # serving code, which makes the whole plan describe a fleet that does not exist —
-        # so it stops the run.
-        _require_matching_config(
-            artifact,
-            endpoint=endpoint,
-            region=region,
-            variant=variant,
-            artifact_path=measured,
-            allow_mismatch=allow_config_mismatch,
-        )
-
-    if s_mean_s is None:
-        if trigger == TTOTAL_TRIGGER_DRIVE_LOAD:
-            raise click.UsageError(
-                "--s-mean is required (or pass --measured <cmax artifact> to read it). It "
-                "converts a target concurrency into the arrival rate the open-loop driver "
-                "needs, and guessing it would offer the wrong load."
-            )
-        # force-desired starts no load driver, so there is no rate to convert. Requiring a
-        # service time here would make the cheapest probe available -- can this endpoint
-        # get another instance at all? -- depend on having already measured C_max.
-        s_mean_s = 0.0
-    elif s_mean_s <= 0:
-        raise click.BadParameter("--s-mean must be positive")
-    if load_multiple <= 1.0:
+    if probe_concurrency is None:
+        probe_concurrency = ttotal_mod.PROBE_CONCURRENCY
+    if warmup_s is None:
+        warmup_s = ttotal_mod.DEFAULT_WARMUP_S
+    if warmup_s < 0:
+        raise click.BadParameter("--warmup cannot be negative", param_hint="--warmup")
+    if settle_s <= 0:
         raise click.BadParameter(
-            "--load-multiple must exceed 1.0, or the offered load never crosses C_target "
-            "and no scale-out can occur"
+            "--settle must be positive: recovery is judged from traffic on the far side of "
+            "the scale event, and with none the run stops at in_service",
+            param_hint="--settle",
         )
 
-    appscaling = boto3.client("application-autoscaling", region_name=region)
-    if scaling_target is None:
-        scaling_target = ttotal_mod.deployed_target_value(
-            appscaling, endpoint=endpoint, variant=variant
-        )
-    if scaling_target is None:
-        if trigger == TTOTAL_TRIGGER_DRIVE_LOAD:
-            raise click.UsageError(
-                f"{endpoint} has no target-tracking policy to read a TargetValue from, so "
-                "there is nothing to drive load past. Deploy scaling first, or pass "
-                "--scaling-target explicitly."
-            )
-        # force-desired never reads the metric, so any value is inert here.
-        scaling_target = 0.0
+    try:
+        qmax_report = QMaxReport.model_validate_json(Path(qmax_path).read_text())
+    except ValueError as exc:
+        # A qmax artifact is a QMaxReport dump; anything else is almost always a ttotal or
+        # plan artifact passed by mistake, and the pydantic error names the missing fields.
+        raise click.BadParameter(
+            f"{qmax_path} is not a qmax artifact: {exc}", param_hint="--qmax"
+        ) from exc
 
-    # Deliberately the measured budget and not the end-to-end SLO, which is the one place
-    # in this package where those two come apart. Recovery is "p95 came back", and it is
-    # judged by *discrimination*: the threshold has to sit between the overloaded p95 and
-    # the recovered one. Kokoro overloaded at 3x C_target reaches a p95 TTFAB of 818ms,
-    # which is already inside a 3000ms SLO -- threshold it there and the run reports
-    # recovery at the instant the instance came into service, having measured nothing. The
-    # SLO is what the *plan* promises; this is what the *measurement* can resolve.
-    if ttfab_budget_ms is None:
-        ttfab_budget_ms = _config_ttfab_budget_ms(endpoint)
-    if ttfab_budget_ms is None:
+    ladder = qmax_report.ladder_p95_ms
+    if qmax_report.transport != transport:
+        # Not a warning: the containers hold their inference lock differently per transport,
+        # so a p95 measured on one is not the level a probe on the other should reach. The
+        # halving would be judged against the wrong number in both directions.
         raise click.UsageError(
-            "--ttfab-budget-ms is required (or pass --measured, or configure "
-            "ttfab_budget_ms for this model). Recovery is defined as p95 back inside a "
-            "budget, so there is no recovery without one."
+            f"--qmax was measured on transport {qmax_report.transport!r} but this run uses "
+            f"{transport!r}. The recovery levels come from that ladder, and p95 does not "
+            f"transfer between transports. Re-run with --transport {qmax_report.transport}."
+        )
+    # A configuration mismatch means the ladder describes other hardware or other serving
+    # code, so both recovery levels are wrong and nothing in the output would look it.
+    _require_matching_config(
+        json.loads(Path(qmax_path).read_text()),
+        endpoint=endpoint,
+        region=region,
+        variant=variant,
+        artifact_path=qmax_path,
+        flag="--qmax",
+        allow_mismatch=allow_config_mismatch,
+    )
+
+    # Checked here as well as inside measure(): this is the difference between a usage
+    # error now and a FixtureError after the freeze has already been established.
+    try:
+        expected_ms, recovered_ms = ttotal_mod.recovery_references(
+            ladder, probe_concurrency=probe_concurrency
+        )
+    except ttotal_mod.TTotalError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+    if qmax_report.q_max is not None and probe_concurrency >= qmax_report.q_max:
+        click.echo(
+            f"WARNING: --probe-concurrency {probe_concurrency} is at or above the measured "
+            f"Q_max of {qmax_report.q_max}, so the probe's own requests will breach the "
+            f"{qmax_report.slo_ms}ms SLO for the whole run. The probe only has to be "
+            "saturating, not overloaded."
         )
 
-    if trigger == TTOTAL_TRIGGER_FORCE_DESIRED:
-        click.echo(
-            f"{model} ({endpoint}): trigger={trigger}, budget={ttfab_budget_ms:.0f}ms. "
-            "No load is offered, so C_target and S do not apply."
-        )
-        click.echo(
-            "NOTE: --trigger force-desired measures the container half only. The result is "
-            "a lower bound on T_total, not T_total."
-        )
-    else:
-        click.echo(
-            f"{model} ({endpoint}): trigger={trigger}, C_target={scaling_target:.3f}, "
-            f"offering {scaling_target * load_multiple:.2f} concurrency, "
-            f"S={s_mean_s * 1000:.0f}ms, budget={ttfab_budget_ms:.0f}ms, transport={transport}"
-        )
+    click.echo(
+        f"{model} ({endpoint}): trigger={trigger}, probe N={probe_concurrency} "
+        f"({expected_ms:.0f}ms expected), recovered at <= {recovered_ms:.0f}ms "
+        f"(N={probe_concurrency // 2} rung x {ttotal_mod.RECOVERY_TOLERANCE:.2f}), "
+        f"transport={transport}"
+    )
+    click.echo(
+        f"Autoscaling is suspended for the run, so the policy's detection lag is bounded at "
+        f"{ttotal_mod.POLICY_LAG_BOUND_S:.0f}s rather than measured. `plan` reads the bounded "
+        "figure; t_total_s alone is the capacity half."
+    )
+    click.echo(
+        f"Ladder: {qmax_path} (Q_max {qmax_report.q_max}, {len(ladder)} usable rung(s), "
+        f"{qmax_report.config_slug})"
+    )
+    # The mutating call is one UpdateEndpointWeightsAndCapacities, and it is reversed in the
+    # same finally that thaws. Said out loud because this command changes production
+    # capacity, briefly, on purpose.
+    click.echo(
+        f"This will suspend autoscaling on {endpoint}, raise DesiredInstanceCount by 1, wait "
+        f"up to {max_wait_s / 60:.0f} min, then restore both."
+    )
 
     from contextlib import nullcontext
 
@@ -858,23 +852,21 @@ def ttotal(
                 endpoint=endpoint,
                 variant=variant,
                 region=region,
-                scaling_target=scaling_target,
-                ttfab_budget_ms=ttfab_budget_ms,
-                s_mean_s=s_mean_s,
+                ladder_p95_ms=ladder,
                 texts=_load_texts(samples, max_samples),
                 voice=resolve_voice(model, voice),
                 trigger=trigger,
-                load_multiple=load_multiple,
+                probe_concurrency=probe_concurrency,
+                warmup_s=warmup_s,
                 max_wait_s=max_wait_s,
                 settle_s=settle_s,
                 poll_interval_s=poll_interval_s,
                 transport=transport,
                 seed=seed,
                 event_sink=writer,
-                appscaling=appscaling,
             )
-    except (ttotal_mod.TTotalError, FixtureError) as exc:
-        # Both are the tool refusing to report a lag it did not observe. A traceback
+    except (ttotal_mod.TTotalError, qmax_mod.QMaxError, FixtureError) as exc:
+        # All three are the tool refusing to report a lag it did not observe. A traceback
         # would read as a bug rather than as the guard doing its job.
         raise click.ClickException(str(exc)) from exc
 
@@ -886,15 +878,11 @@ def ttotal(
 
     if no_save:
         click.echo(f"\n--no-save: nothing written. Configuration measured: {report.config_slug}")
-        click.echo(
-            "\nNext: tts-bench plan --measured <cmax artifact> --ttotal <ttotal artifact> "
-            "--peak-rps <N>"
-        )
+        click.echo(f"\nNext: tts-bench plan --qmax {qmax_path} --ttotal <ttotal artifact>")
     else:
-        # Defaulted for the same reason as cmax: this run costs a real scale-out and, on a
-        # timeout, most of max_wait_s of offered load. The trigger is in the name because
-        # force-desired measures only the container half -- the two are different
-        # measurements of the same configuration, not two attempts at one.
+        # Defaulted for the same reason as qmax: this run costs a real scale-out and, on a
+        # timeout, most of max_wait_s of offered load. The trigger is in the name so a
+        # future mode lands beside this one rather than overwriting it.
         destination = (
             Path(output)
             if output
@@ -904,18 +892,19 @@ def ttotal(
         _save_artifact(destination, json.dumps(report.to_dict(), indent=2))
         click.echo(f"\nArtifact: {destination}")
         click.echo(f"Configuration measured: {report.config_slug}")
-        click.echo(
-            f"\nNext: tts-bench plan --measured <cmax artifact> --ttotal {destination} "
-            "--peak-rps <N>"
-        )
+        click.echo(f"\nNext: tts-bench plan --qmax {qmax_path} --ttotal {destination}")
 
 
 @main.command()
 @click.option(
-    "--measured",
+    "--qmax",
+    "qmax_path",
     required=True,
     type=click.Path(exists=True),
-    help="A cmax artifact: the C_max curve and S this plan is built on",
+    help=(
+        "A qmax artifact: the measured Q_max, the SLO it was measured against, and S. "
+        "Both scaling thresholds are fractions of the Q_max in here."
+    ),
 )
 @click.option(
     "--ttotal",
@@ -924,7 +913,8 @@ def ttotal(
     type=click.Path(exists=True),
     help=(
         "A ttotal artifact: the scaling lag, by stage. Omit only with --assume-t-total, "
-        "since a plan with no lag has nothing to size headroom against."
+        "since a plan with no lag cannot say whether the scale-out threshold fires early "
+        "enough to survive one."
     ),
 )
 @click.option(
@@ -950,42 +940,25 @@ def ttotal(
 )
 @click.option("--trough-streams", default=None, type=float, help="Expected quiet-hours sessions")
 @click.option(
-    "--growth-factor-k",
-    default=2.0,
+    "--max-scaling-per-t-total",
+    default=1.25,
     type=float,
-    help="Traffic growth within one T_total. Not measurable without production traffic.",
-)
-@click.option(
-    "--sweep-k",
-    default=None,
     help=(
-        "Comma-separated growth factors to plan for, e.g. 1,2,3,5. Overrides "
-        "--growth-factor-k; the config's sensitivity to k is the point."
+        "Surge ratio to survive within one T_total: 1.25 means traffic may grow 25% while "
+        "a replacement instance arrives. Both thresholds derive from it — with h = ratio-1, "
+        "C_scale_max = (1-h) x Q_max and C_scale_min = (1-2h) x Q_max. Not measurable "
+        "without production history, so it is chosen."
     ),
 )
 @click.option(
     "--ttfab-slo-ms",
-    default=3000,
-    type=int,
-    help=(
-        "End-to-end first-byte SLO: queue wait plus service. W_max = SLO - p95 service "
-        "is derived from it, so this is the one field that sets the queueing budget."
-    ),
-)
-@click.option(
-    "--ttfab-budget-ms",
     default=None,
     type=int,
     help=(
-        "Which measured budget to read the knee at — a column selector, not the SLO. "
-        "Defaults to the tightest budget in the curve."
+        "End-to-end first-byte SLO: queue wait plus service. Defaults to whatever the "
+        "qmax ladder was measured against, which is the only value it can be read at — "
+        "Q_max is *defined* by the SLO, so a mismatch is refused rather than converted."
     ),
-)
-@click.option(
-    "--derate",
-    default=0.875,
-    type=float,
-    help="Fraction of the measured knee to target, for jitter margin",
 )
 @click.option(
     "--min-floor",
@@ -993,15 +966,6 @@ def ttotal(
     default=1,
     type=int,
     help="Never plan below this, whatever the trough says",
-)
-@click.option(
-    "--provision-s",
-    default=None,
-    help=(
-        "Comma-separated EC2 provision times to assume, e.g. 60,120,300,600. One plan "
-        "per value, holding the measured container stages fixed — this is the stage a "
-        "reserved-capacity account changes, so it is swept rather than trusted."
-    ),
 )
 @click.option(
     "--assume-t-total",
@@ -1017,7 +981,7 @@ def ttotal(
     "--allow-config-mismatch",
     is_flag=True,
     default=False,
-    help="Pair a C_max curve and a T_total lag measured on different configurations",
+    help="Pair a Q_max ladder and a T_total lag measured on different configurations",
 )
 @click.option(
     "--ceiling-s",
@@ -1030,48 +994,50 @@ def ttotal(
     default=None,
     type=click.Path(),
     help=(
-        "Write the sweep as JSON here. Nothing is written unless asked — unlike a "
+        "Write the plan as JSON here. Nothing is written unless asked — unlike a "
         "measurement, this run is cheap to repeat."
     ),
 )
 def plan(
-    measured: str,
+    qmax_path: str,
     ttotal_path: str | None,
     peak_rps: float | None,
     trough_rps: float | None,
     peak_streams: float | None,
     trough_streams: float | None,
-    growth_factor_k: float,
-    sweep_k: str | None,
-    ttfab_slo_ms: int,
-    ttfab_budget_ms: int | None,
-    derate: float,
+    max_scaling_per_t_total: float,
+    ttfab_slo_ms: int | None,
     min_instances_floor: int,
-    provision_s: str | None,
     assume_t_total_s: float | None,
     allow_config_mismatch: bool,
     ceiling_s: float | None,
     output: str | None,
 ) -> None:
-    """Turn measurements into a scaling configuration. Reads artifacts, touches no AWS.
+    """Turn Q_max and T_total into a scaling configuration. Reads artifacts, touches no AWS.
 
-    Composes the measured C_max curve, S, and T_total with a stated load into the four
-    numbers ModelEndpointConfig needs — scaling_target_value, queue_max_depth,
-    min_instances, max_instances — and prints them as a paste-ready block. That closes
-    the loop the tool chain exists for: before this, the path from a measurement to a
-    deployed policy ran through hand-arithmetic in a comment.
+    Composes the measured Q_max and T_total with a chosen SLO and surge ratio into the
+    numbers ModelEndpointConfig needs — scaling_target_value, scale_in_threshold,
+    queue_max_depth, min_instances, max_instances — and prints them as a paste-ready
+    block. That closes the loop the tool chain exists for: before this, the path from a
+    measurement to a deployed policy ran through hand-arithmetic in a comment.
 
-    Two inputs cannot be measured for the account being configured, so both are swept
-    rather than assumed. --provision-s replaces the EC2 provision stage, which is a
-    property of a capacity contract rather than of the image. --sweep-k varies the
-    growth factor, which needs production traffic to observe.
+    Six variables in total. SLO and --max-scaling-per-t-total are chosen; Q_max and
+    T_total are measured; C_scale_max and C_scale_min are arithmetic on those four. With
+    h = ratio - 1: C_scale_max = (1-h) x Q_max, C_scale_min = (1-2h) x Q_max.
 
-    The SLO is end-to-end: --ttfab-slo-ms is the whole promise, queue included, and
-    W_max and queue_max_depth are derived from it rather than set beside it. Two
-    independent fields could disagree with the promise; one derived field cannot.
+    The thresholds print twice — as the client occupancy that was measured, and in the
+    CloudWatch Maximum units the deployed alarm actually reads, with the measured ratio
+    between them. Those differed by 1.35x to 9.8x on one kokoro ladder, and deploying
+    the unconverted figure is how a threshold no traffic can satisfy reached the endpoint.
 
-    Refuses two things outright: pairing artifacts whose configuration fingerprints
-    differ, and an SLO that does not fit inside SageMaker's 60s invocation ceiling.
+    Two known limits of the simple rule are computed rather than argued: surge_survival
+    simulates P(the queue reaches Q_max) while one T_total elapses from C_scale_max, and
+    scale_in_safety says whether removing an instance at C_scale_min lands the survivors
+    back over C_scale_max.
+
+    Refuses three things outright: pairing artifacts whose configuration fingerprints
+    differ, reading a Q_max ladder against an SLO other than the one it was measured
+    against, and an SLO that does not fit inside SageMaker's 60s invocation ceiling.
     """
     from shared.capacity import SAGEMAKER_INVOCATION_CEILING_S
     from tts_bench import scale_report
@@ -1079,9 +1045,9 @@ def plan(
         PlannerError,
         TTotalStages,
         measured_from_artifacts,
-        plan_sweep,
+        plan_one,
     )
-    from tts_bench.types import CMaxReport, Scenario
+    from tts_bench.types import QMaxReport, Scenario
 
     if peak_rps is None and peak_streams is None:
         raise click.UsageError(
@@ -1090,11 +1056,11 @@ def plan(
         )
 
     try:
-        cmax_report = CMaxReport.model_validate_json(Path(measured).read_text())
+        qmax_report = QMaxReport.model_validate_json(Path(qmax_path).read_text())
     except (OSError, ValueError) as exc:
         raise click.ClickException(
-            f"could not read {measured} as a cmax artifact: {exc}. It must be the JSON "
-            "written by `tts-bench cmax`."
+            f"could not read {qmax_path} as a qmax artifact: {exc}. It must be the JSON "
+            "written by `tts-bench qmax`."
         ) from exc
 
     # A ttotal artifact is the normal path; --assume-t-total covers the case the plan
@@ -1109,18 +1075,18 @@ def plan(
     elif assume_t_total_s is None:
         raise click.UsageError(
             "--ttotal is required, or --assume-t-total to plan against a stated lag. "
-            "T_total sets how much standing headroom a surge needs and how much of one "
-            "the queue can absorb, so there is no plan without it."
+            "T_total is what decides whether the scale-out threshold fires early enough "
+            "to survive a surge, so there is no plan without it."
         )
     else:
-        # No artifact means no fingerprint to check and no stages to substitute into, so
-        # the assumed total is used whole. from_artifact({}) is the honest shape for
-        # that: every stage missing, nothing measured.
+        # No artifact means no fingerprint to check and no stages to read, so the assumed
+        # total is used whole. from_artifact({}) is the honest shape for that: every stage
+        # missing, nothing measured.
         stages = TTotalStages.from_artifact({})
 
     try:
         planner_input = measured_from_artifacts(
-            cmax_report,
+            qmax_report,
             stages,
             allow_config_mismatch=allow_config_mismatch,
             assume_t_total_s=assume_t_total_s,
@@ -1129,12 +1095,12 @@ def plan(
     except PlannerError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    if ttfab_budget_ms is None:
-        # The tightest measured budget, not the loosest: the knee at a tight SLO is the
-        # smaller number, so defaulting this way sizes the fleet conservatively. `ttotal`
-        # defaults the other way for a different reason -- recovery has to be judged
-        # against a bound the model can actually meet.
-        ttfab_budget_ms = min(planner_input.c_max_curve)
+    # Default to the ladder's own SLO rather than to 3000: the artifact records the line
+    # Q_max was judged against, and defaulting to a constant would refuse a perfectly
+    # good ladder measured at a different one. An explicit --ttfab-slo-ms that disagrees
+    # still hits plan_one's refusal, which is the point of passing it explicitly.
+    if ttfab_slo_ms is None:
+        ttfab_slo_ms = qmax_report.slo_ms
 
     try:
         scenario = Scenario(
@@ -1142,93 +1108,85 @@ def plan(
             trough_rps=trough_rps,
             peak_streams=peak_streams,
             trough_streams=trough_streams,
-            growth_factor_k=growth_factor_k,
-            ttfab_budget_ms=ttfab_budget_ms,
+            max_scaling_per_t_total=max_scaling_per_t_total,
             ttfab_slo_ms=ttfab_slo_ms,
-            derate=derate,
             min_instances_floor=min_instances_floor,
         )
     except ValueError as exc:
         raise click.BadParameter(str(exc)) from exc
 
-    provisions = _parse_floats(provision_s, flag="--provision-s") if provision_s else None
-    ks = _parse_floats(sweep_k, flag="--sweep-k") if sweep_k else None
-
     try:
-        rows = plan_sweep(
+        result = plan_one(
             planner_input,
             scenario,
-            stages,
-            provision_sweep_s=provisions,
-            k_sweep=ks,
+            provision_s=stages.provision_s,
+            policy_bound_s=stages.policy_bound_s,
             ceiling_s=ceiling_s if ceiling_s is not None else SAGEMAKER_INVOCATION_CEILING_S,
         )
     except PlannerError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(scale_report.render_plan(rows, stages))
-    _warn_if_config_queue_disagrees(rows)
+    click.echo(scale_report.render_plan(result, stages))
+    _warn_if_config_disagrees(result)
 
     if output:
-        _save_artifact(
-            Path(output),
-            json.dumps([scale_report.plan_to_dict(row) for row in rows], indent=2),
-        )
+        _save_artifact(Path(output), json.dumps(scale_report.plan_to_dict(result), indent=2))
         click.echo(f"Plan: {output}")
 
-    # Exit non-zero on an infeasible row so this can gate a deploy. Any row, not all:
-    # a sweep where one assumed provision time breaks the SLO is a plan that depends on
-    # an assumption nobody has verified, which is exactly what should stop a pipeline.
-    if any(row.plan.infeasible for row in rows):
+    # Exit non-zero on an infeasible plan so this can gate a deploy.
+    if result.infeasible:
         raise SystemExit(1)
 
 
-def _warn_if_config_queue_disagrees(rows: Sequence[SweepRow]) -> None:
-    """Say so when the deployed ``queue_max_depth`` is not what this SLO implies.
+def _warn_if_config_disagrees(plan: ScalingPlan) -> None:
+    """Say so when the deployed scaling fields are not what this plan derives.
 
-    ``queue_max_depth`` is the one derived number ``config.py`` stores rather than
-    computes, because it needs ``Lambda_cap`` and that is a measurement. So it can go
-    stale silently, and it did: 296 was carried from a 20s W_max no SLO justified, and
-    nothing compared it to anything until this check existed.
+    ``queue_max_depth`` and ``scaling_target_value`` are the two derived numbers
+    ``config.py`` stores rather than computes, because both need a measurement. So they
+    can go stale silently, and both did: 296 was carried from a 20s W_max no SLO
+    justified, and 0.713 was a client occupancy deployed against a server-peak statistic.
 
     A warning rather than a refusal, and printed after the plan. The plan *is* the
-    answer, and the whole point of running it is to find out that the deployed value is
+    answer, and the whole point of running it is to find out the deployed values are
     wrong; exiting non-zero here would fail the command that just told you what to fix.
-    The paste-ready config block above already carries the right number.
-
-    Reads whichever row's ``k`` matches the deployed target most closely — Q_max does
-    not vary with ``k`` or provision time at all (it is ``Lambda_cap x W_max``), so any
-    row's value is the same and the first is enough.
+    The paste-ready config block above already carries the right numbers.
     """
-    if not rows:
-        return
-    plan = rows[0].plan
     try:
         from speech_infra.config import TTS_MODEL_CONFIGS
     except ImportError:  # pragma: no cover - depends on install layout
         return
 
-    for config in TTS_MODEL_CONFIGS.values():
-        if config.endpoint_name != plan.endpoint:
-            continue
-        if config.queue_max_depth == plan.queue_max_depth:
-            return
+    config = next((c for c in TTS_MODEL_CONFIGS.values() if c.endpoint_name == plan.endpoint), None)
+    if config is None:
+        return
+
+    if config.queue_max_depth != plan.queue_max_depth:
         if config.queue_max_depth == 0:
             click.echo(
                 f"\nNOTE: {config.model_name} has queue_max_depth=0 (unbounded) deployed; "
-                f"this SLO implies {plan.queue_max_depth}. Paste the block above into "
+                f"the measured Q_max is {plan.queue_max_depth}. Paste the block above into "
                 "config.py to bound it."
             )
-            return
+        else:
+            click.echo(
+                f"\nWARNING: {config.model_name} has queue_max_depth="
+                f"{config.queue_max_depth} deployed, but Q_max measured against a "
+                f"{plan.measured.slo_ms}ms end-to-end SLO is {plan.queue_max_depth}. The "
+                "deployed value admits requests it can only serve late. Paste the block "
+                "above into config.py."
+            )
+
+    # Compared in CloudWatch units on both sides: the deployed value is what the alarm
+    # reads, so comparing it against the client occupancy would report a mismatch of
+    # exactly the size of the conversion and call it drift.
+    target = plan.c_scale_max_in_cw_units
+    if target is not None and abs(config.scaling_target_value - target) > 0.01:
         click.echo(
-            f"\nWARNING: {config.model_name} has queue_max_depth="
-            f"{config.queue_max_depth} deployed, but a {plan.scenario.ttfab_slo_ms}ms "
-            f"end-to-end SLO implies {plan.queue_max_depth} "
-            f"(Lambda_cap {plan.c_max / plan.measured.s_mean_s:.2f} rps x W_max "
-            f"{plan.w_max_s:.2f}s). The deployed value admits requests it can only serve "
-            "late. Paste the block above into config.py."
+            f"\nWARNING: {config.model_name} has scaling_target_value="
+            f"{config.scaling_target_value} deployed; this plan derives {target:.3f} "
+            f"(C_scale_max {plan.c_scale_max:.2f} x {plan.cw_units_ratio:.2f} into "
+            "ConcurrentRequestsPerModel/Maximum units). Paste the block above into config.py."
         )
-        return
 
 
 def _warn_if_replacing_another_config(destination: Path, slug: str) -> None:
@@ -1271,12 +1229,13 @@ def _require_matching_config(
     region: str,
     variant: str,
     artifact_path: str | None,
+    flag: str = "--qmax",
     allow_mismatch: bool,
 ) -> None:
     """Refuse to reuse a measurement taken against a different configuration.
 
-    ``C_max``, ``S`` and ``T_total`` are properties of a configuration — the GPU, the
-    serving code, the container knobs — not of a model. Replaying an artifact from one
+    ``Q_max`` and ``T_total`` are properties of a configuration — the GPU, the serving
+    code, the container knobs — not of a model. Replaying an artifact from one
     configuration onto another produces a plan for a fleet that does not exist, and
     nothing about the output would look wrong.
 
@@ -1285,7 +1244,7 @@ def _require_matching_config(
     """
     from tts_bench.fixture import DeployedConfig, FixtureError, describe_deployed_config
 
-    label = f"--measured {artifact_path}" if artifact_path else "the measured artifact"
+    label = f"{flag} {artifact_path}" if artifact_path else "the measured artifact"
     raw = artifact.get("deployed_config")
     recorded = DeployedConfig.from_dict(raw if isinstance(raw, dict) else {})
 
@@ -1313,24 +1272,6 @@ def _require_matching_config(
         recorded.assert_matches(live, allow_mismatch=allow_mismatch, artifact_label=label)
     except FixtureError as exc:
         raise click.ClickException(str(exc)) from exc
-
-
-def _config_ttfab_budget_ms(endpoint: str) -> float | None:
-    """The TTFAB budget configured for an endpoint, if speech_infra is importable.
-
-    A fallback for `ttotal` run without a cmax artifact. Lazy and forgiving for the same
-    reason as :func:`_expected_scaling`: `speech_infra` pulls in aws-cdk-lib, which the
-    measurement path has no other use for.
-    """
-    try:
-        from speech_infra.config import TTS_MODEL_CONFIGS
-    except ImportError:  # pragma: no cover - depends on install layout
-        return None
-
-    for config in TTS_MODEL_CONFIGS.values():
-        if config.endpoint_name == endpoint:
-            return float(config.ttfab_budget_ms)
-    return None
 
 
 def _expected_scaling() -> dict[str, ExpectedScaling]:
@@ -1388,7 +1329,7 @@ def drift(region: str, output: str | None, fail_on_error: bool) -> None:
 
     An orphan is an ERROR rather than a warning: it can move capacity that no
     template describes, `cdk deploy` will never remove it, and an unguarded
-    C_max run against such an endpoint measures a fleet instead of an instance.
+    Q_max run against such an endpoint measures a fleet instead of an instance.
     """
     import boto3
 
@@ -1402,9 +1343,9 @@ def drift(region: str, output: str | None, fail_on_error: bool) -> None:
     if not findings:
         click.echo("No drift: deployed autoscaling matches config.")
         # Where drift sits in the sequence: it is the preflight for a measurement, because
-        # an orphaned policy moving capacity mid-run is what makes a C_max curve read as a
-        # fleet. Clean means the freeze in `cmax --require-frozen` has nothing to fight.
-        click.echo("\nNext: tts-bench cmax --model <model> --require-frozen")
+        # an orphaned policy moving capacity mid-run is what makes a Q_max ladder read as a
+        # fleet. Clean means the freeze in `qmax --require-frozen` has nothing to fight.
+        click.echo("\nNext: tts-bench qmax --model <model> --require-frozen")
     else:
         order = {Severity.ERROR: 0, Severity.WARN: 1, Severity.INFO: 2}
         for finding in sorted(findings, key=lambda f: (order[f.severity], f.resource_id)):

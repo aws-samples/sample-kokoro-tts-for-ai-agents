@@ -1,25 +1,23 @@
-"""Tests for the planner: composition, refusals, and the two sweeps.
+"""Tests for the planner: composition, refusals, and the findings.
 
-The planner owns no equations — every one lives in `shared.capacity` and is tested
-there against the worked examples. So these tests are about the four things that can
-go wrong *between* the equations:
+The planner owns no equations — every one lives in `shared.capacity` and is tested there
+against the worked examples. So these tests are about the things that can go wrong
+*between* the equations:
 
-- **Composition.** The numbers must come out the same as hand-derivation, which is
-  checked against the values `config.py` currently ships: `C_target 0.713` and
-  `Q_max 296` at the deployed C_max and k=2. That pairing is the regression test for
-  the whole chain, because those four numbers were derived by hand once and the tool
-  exists to stop that happening again.
-- **The refusals.** Pairing a curve and a lag from different configurations, and a
-  `W_max` past the 60s invocation ceiling. Both are hard by design: the first produces
-  a plan for a fleet that exists nowhere, and the second admits requests that wait the
-  full budget and then fail anyway.
-- **Provenance.** A swept provision time is an assumption, and a plan built on one must
-  say so. If a substituted lag can pass for a measured one the whole sweep is
-  misleading rather than merely approximate.
-- **Monotonicity across both sweeps.** Raising `k` must never raise `C_target`, and a
-  longer provision time must never shorten `T_total`. Asserted as properties rather
-  than as fixed values, because the direction is the invariant a reader relies on when
-  choosing a row.
+- **Composition.** The two derived thresholds, the queue bound, the wait budget and the
+  fleet must come out where hand-derivation puts them. `Q_max = 50` at `k = 1.25` gives
+  `(37.5, 25.0)` and a safe floor of 3; that triple is the regression anchor for the
+  whole chain, because the numbers `config.py` shipped before it (`0.713`, `41`) were
+  hand-derived once and this tool exists to stop that happening again.
+- **The refusals.** A `Q_max` measured against one SLO planned against another, a
+  ladder and a lag from different configurations, and a `W_max` past the 60s invocation
+  ceiling. All three produce a plan for something that exists nowhere.
+- **Provenance.** A stated lag must not pass for a measured one. `t_total_measured` is a
+  separate flag from `provenance.origin` precisely because `Q_max` stays measured when
+  the lag was not, and the planner's own finding is the thing that says which.
+- **The two known limits of the simple rule.** `surge_survival` and `scale_in_safety`
+  exist to make them falsifiable rather than argued, so the tests assert the numbers
+  they report, not just their verdicts.
 
 `caplog` is not used: loguru does not propagate to the stdlib logging tree, so an
 assertion against it would pass whether or not anything was emitted. The `logged`
@@ -37,38 +35,54 @@ from loguru import logger
 from shared.capacity import (
     CLOUDWATCH_HIGH_RES_PERIOD_S,
     SAGEMAKER_INVOCATION_CEILING_S,
+    scale_thresholds,
 )
 from tts_bench.planner import (
-    CURVE_SPREAD_WARN,
-    DEFAULT_K_SWEEP,
-    DEFAULT_PROVISION_SWEEP_S,
     PROVISION_FROM_STAGE,
     PROVISION_TO_STAGE,
+    Q_MAX_SPREAD_WARN,
+    SHED_PROBABILITY_WARN,
     PlannerError,
     TTotalStages,
     assert_pairable,
     measured_from_artifacts,
     plan_one,
-    plan_sweep,
 )
 from tts_bench.types import (
-    CMaxReport,
-    KneePoint,
     Measured,
     Origin,
     Provenance,
+    QMaxReport,
     Scenario,
     StepSummary,
     Verdict,
 )
 
-#: The deployed Kokoro measurement, as `config.py` records it. Not rounded: the point
-#: of pinning these is to reproduce `scaling_target_value` exactly.
-C_MAX = 1.63
+#: The measured kokoro numbers, unrounded. ``S`` is the conflated figure the ladder
+#: records — 34ms client round trip plus ~59ms of service — which is the right quantity
+#: for a client-observed SLO and a slight over-estimate anywhere it stands in for
+#: server-side work.
 S_MEAN_S = 0.10986375146305409
 S_P95_S = 0.16457688123919073
 SLUG = "g5xlarge-139b9068"
 DIGEST = "139b9068c5eb1f03c8312c17391dc35838e43e2417ae80d61e628e6ffb3d6a28"
+
+#: ``Q_max`` the default fixture measures, and the two thresholds it derives. Named
+#: rather than inlined because nearly every test needs at least one of them, and a test
+#: that re-derived them by hand would agree with a broken planner.
+Q_MAX = 50
+C_SCALE_MAX = 37.5
+C_SCALE_MIN = 25.0
+
+#: W_max the default scenario derives: 3.0s SLO - 0.1646s p95 service. Named because
+#: several tests need the number the plan will actually use, and re-deriving it in each
+#: one was how a test came to assert against a wait budget the plan had not chosen.
+W_MAX_S = 3.0 - S_P95_S
+
+#: A ladder shaped roughly like M/M/1 on kokoro's measured service time, with rungs at
+#: the concurrencies the workflow depends on: 1 for the alarm threshold, 5 and 10 for
+#: ttotal's halving test, and 50 sitting just inside the 3000ms SLO.
+LADDER = {1: 92.0, 5: 379.0, 10: 667.0, 20: 1243.0, 50: 2910.0}
 
 
 @pytest.fixture
@@ -87,19 +101,29 @@ def logged():
 
 
 def _measured(**overrides: Any) -> Measured:
+    """A trustworthy joined measurement: frozen, one instance, unbounded queue.
+
+    Trustworthy by default so that a test about something else does not have to read
+    past a ``measurement_trust`` warning to find its own finding. The tests that care
+    about the warnings turn each precondition off individually.
+    """
     fields: dict[str, Any] = {
         "model_name": "kokoro-82m",
         "endpoint": "speech-kokoro-82m",
         "instance_type": "ml.g5.xlarge",
-        "c_max_curve": {300: C_MAX, 500: 2.0},
+        "q_max": Q_MAX,
+        "q_max_bracketed": True,
+        "slo_ms": 3000,
+        "ttfab_p95_at_c1_ms": LADDER[1],
         "s_mean_s": S_MEAN_S,
         "s_p95_s": S_P95_S,
         "t_total_s": 300.0,
         "chars_per_request": 25.0,
-        "curve_spread": {300: 0.05, 500: 0.1},
-        "runs_contributing": {300: 3, 500: 3},
-        "runs_total": 3,
+        "q_max_spread": 0.0,
+        "runs_contributing": 2,
+        "ladder_p95_ms": dict(LADDER),
         "frozen": True,
+        "unbounded_queue": True,
         "instance_counts_observed": (1,),
         "transport": "bidi",
         "deployed_config": {
@@ -113,31 +137,42 @@ def _measured(**overrides: Any) -> Measured:
 
 
 def _scenario(**overrides: Any) -> Scenario:
+    """The default scenario, at the SLO the default measurement was measured against.
+
+    ``ttfab_slo_ms`` has to match ``_measured``'s ``slo_ms`` or every plan refuses — see
+    ``TestSloMustMatchTheMeasurement``. A test overriding one generally overrides both,
+    which :func:`_plan_at_slo` does in one place.
+    """
     fields: dict[str, Any] = {
-        "peak_rps": 20.0,
-        "trough_rps": 2.0,
-        "growth_factor_k": 2.0,
-        "ttfab_budget_ms": 300,
+        "peak_rps": 450.0,
+        "trough_rps": 30.0,
+        "max_scaling_per_t_total": 1.25,
         "ttfab_slo_ms": 3000,
     }
     fields.update(overrides)
     return Scenario(**fields)
 
 
-#: W_max the default scenario derives: 3.0s SLO - 0.1646s p95 service. Named because
-#: several tests need the number the plan will actually use, and re-deriving it in each
-#: one was how a test came to assert against a wait budget the plan had not chosen.
-W_MAX_S = 3.0 - S_P95_S
+def _plan_at_slo(slo_ms: int, **measured_overrides: Any):
+    """A plan at a different SLO, with the measurement re-labelled to match.
+
+    Q_max is *defined by* the SLO, so moving one without the other is the mismatch the
+    planner refuses. These tests are about what the SLO does to the wait budget and the
+    ceiling, not about the refusal, so they move both.
+    """
+    return plan_one(
+        _measured(slo_ms=slo_ms, **measured_overrides),
+        _scenario(ttfab_slo_ms=slo_ms),
+    )
 
 
 def _slo_for_wait(wait_s: float, s_p95_s: float = S_P95_S) -> int:
     """The SLO that leaves ``wait_s`` of queueing budget, in ms.
 
-    W_max is no longer settable, so a test that wants a particular queue allowance has
-    to state the SLO that produces it. Inverting ``w_max_for_slo`` here rather than in
-    each test keeps the relation in one place; the tests still assert against
-    ``plan.w_max_s``, so a broken inversion shows up as a failure rather than as two
-    wrongs agreeing.
+    W_max is not settable, so a test that wants a particular queue allowance has to
+    state the SLO that produces it. Inverting ``w_max_for_slo`` here rather than in each
+    test keeps the relation in one place; the tests still assert against ``plan.w_max_s``,
+    so a broken inversion shows up as a failure rather than as two wrongs agreeing.
     """
     return round((wait_s + s_p95_s) * 1000)
 
@@ -146,7 +181,7 @@ def _stages(**overrides: Any) -> TTotalStages:
     fields: dict[str, Any] = {
         "total_s": 420.0,
         "provision_s": 180.0,
-        "trigger": "drive-load",
+        "trigger": "force-desired",
         "config_slug": SLUG,
         "run_id": "ttotal123",
     }
@@ -162,41 +197,100 @@ def _finding(plan, name: str):
 
 
 class TestPlanOneComposition:
-    def test_reproduces_the_deployed_config_numbers(self) -> None:
-        # The regression test for the whole chain, against the numbers config.py ships.
-        # C_target: 0.875 x 1.63 / 2 = 0.713, unchanged by the SLO -- c_slo_cap at a
-        # 2.84s W_max is 26.8, far above a sub-1 target.
-        #
-        # Q_max moved, and that is the fix rather than a regression: it was 296, from a
-        # hand-set 20s W_max no SLO justified. Under a 3s end-to-end promise
-        # W_max = 3.0 - 0.1646 = 2.835s and Lambda_cap 14.84 x 2.835 = 42.
+    def test_derives_both_thresholds_from_q_max_and_the_surge_ratio(self) -> None:
+        # The regression anchor for the whole chain. h = 0.25, so C_scale_max is
+        # (1-h) x 50 and C_scale_min is (1-2h) x 50 -- and both must arrive on the plan
+        # itself, not just inside a finding, because the plan is what gets pasted into
+        # config.py. These replace the hand-derived 0.713 and 41 that shipped before.
         plan = plan_one(_measured(), _scenario())
-        assert plan.c_target == pytest.approx(0.713, abs=5e-4)
-        assert plan.queue_max_depth == 42
+        assert plan.q_max == Q_MAX
+        assert plan.c_scale_max == pytest.approx(C_SCALE_MAX)
+        assert plan.c_scale_min == pytest.approx(C_SCALE_MIN)
+        assert plan.min_safe_instances == 3
+        assert not plan.q_max_is_lower_bound
+
+    def test_agrees_with_shared_capacity_rather_than_reimplementing_it(self) -> None:
+        # The planner composes; it must not carry a second copy of the arithmetic.
+        # Asserted against the function rather than against 37.5 so that a change to
+        # the rule fails here as a disagreement rather than passing in one of two places.
+        plan = plan_one(_measured(), _scenario())
+        expected = scale_thresholds(Q_MAX, 1.25)
+        assert (plan.c_scale_max, plan.c_scale_min, plan.min_safe_instances) == (
+            pytest.approx(expected.c_scale_max),
+            pytest.approx(expected.c_scale_min),
+            expected.min_safe_instances,
+        )
+
+    def test_the_queue_bound_is_q_max_itself(self) -> None:
+        # Not derived from the wait budget: past Q_max a request cannot reach first byte
+        # inside the SLO, so admitting it buys a late success instead of an honest 503.
+        plan = plan_one(_measured(), _scenario())
+        assert plan.queue_max_depth == plan.q_max == Q_MAX
+
+    def test_the_wait_budget_is_the_slo_less_p95_service(self) -> None:
+        plan = plan_one(_measured(), _scenario())
         assert plan.w_max_s == pytest.approx(W_MAX_S)
 
-    def test_the_queue_depth_follows_the_slo_and_nothing_else(self) -> None:
-        # The property the whole reframe buys: there is no way to state a queue that
-        # disagrees with the promise, because the promise is the only input.
-        tight = plan_one(_measured(), _scenario(ttfab_slo_ms=1000))
-        loose = plan_one(_measured(), _scenario(ttfab_slo_ms=10_000))
-        assert tight.queue_max_depth < loose.queue_max_depth
+    def test_the_wait_budget_follows_the_slo_and_nothing_else(self) -> None:
+        # The property the reframe buys: there is no second latency field, so nothing
+        # can state a queue allowance that disagrees with the promise.
+        tight = _plan_at_slo(1000)
+        loose = _plan_at_slo(10_000)
         assert tight.w_max_s == pytest.approx(1.0 - S_P95_S)
         assert loose.w_max_s == pytest.approx(10.0 - S_P95_S)
+        # And Q_max is unchanged by it, because Q_max is a measurement: what moves is
+        # whether the ladder's answer still looks consistent -- see queue_depth.
+        assert tight.queue_max_depth == loose.queue_max_depth == Q_MAX
+
+    def test_a_looser_surge_ratio_scales_out_earlier_and_needs_more_instances(self) -> None:
+        # The direction a reader relies on: reserving more headroom means firing sooner
+        # and buying more. Asserted as a property because the exact fleet sizes are
+        # n_instances' business.
+        tight = plan_one(_measured(), _scenario(max_scaling_per_t_total=1.05))
+        loose = plan_one(_measured(), _scenario(max_scaling_per_t_total=1.4))
+        assert loose.c_scale_max < tight.c_scale_max
+        assert loose.c_scale_min < tight.c_scale_min
+        assert loose.peak_instances >= tight.peak_instances
+
+    def test_a_flat_scenario_puts_both_thresholds_at_q_max(self) -> None:
+        # k=1 reserves no headroom, so there is no gap to scale in through. The plan is
+        # still coherent -- it is the "never scale, just hold the SLO" configuration --
+        # and scale_in_safety is what says the flap has nowhere to land.
+        plan = plan_one(_measured(), _scenario(max_scaling_per_t_total=1.0))
+        assert plan.c_scale_max == plan.c_scale_min == pytest.approx(float(Q_MAX))
+        assert plan.min_safe_instances is None
+
+    def test_a_surge_ratio_with_no_usable_thresholds_is_refused(self) -> None:
+        # 1.5 puts C_scale_min at zero, which deploys as "never scale in". Pydantic
+        # rejects it on the Scenario, so the planner's own refusal is unreachable from
+        # the CLI -- this asserts the guard exists rather than that it is the only one.
+        with pytest.raises(ValueError, match="less than 1.5"):
+            _scenario(max_scaling_per_t_total=1.5)
 
     def test_fleet_sizes_bracket_the_stated_load(self) -> None:
-        # 20 rps x 0.11s = 2.2 concurrent at 0.713 per instance -> 4 instances.
+        # 450 rps x 0.11s = 49.4 concurrent, at 37.5 per instance -> 2. The trough's
+        # 30 rps is 3.3 concurrent -> 1.
         plan = plan_one(_measured(), _scenario())
-        assert plan.peak_instances == 4
+        assert plan.peak_instances == 2
         assert plan.trough_instances == 1
         assert plan.min_instances == 1
-        assert plan.max_instances == 4
+        assert plan.max_instances == 2
+
+    def test_the_fleet_is_sized_on_the_threshold_not_on_q_max(self) -> None:
+        # Sizing at Q_max sizes the fleet to sit exactly where the SLO breaks. The
+        # difference is the whole cost of the headroom, and fleet_cost reports it.
+        plan = plan_one(_measured(), _scenario())
+        assert plan.peak_instances == 2
+        assert (
+            "2 instances at C_scale_max 37.50 against 1 at Q_max"
+            in _finding(plan, "fleet_cost").detail
+        )
 
     def test_min_is_the_trough_fleet_not_one(self) -> None:
         # A reserved-capacity account pays the floor whatever the traffic does, so a
         # stated trough that needs three instances must raise min -- defaulting to 1
         # would under-reserve exactly the capacity that was reserved on purpose.
-        plan = plan_one(_measured(), _scenario(trough_rps=18.0))
+        plan = plan_one(_measured(), _scenario(peak_rps=1000.0, trough_rps=700.0))
         assert plan.trough_instances == 3
         assert plan.min_instances == 3
 
@@ -206,15 +300,26 @@ class TestPlanOneComposition:
         plan = plan_one(_measured(), _scenario(peak_rps=0.5, trough_rps=0.5, min_instances_floor=3))
         assert plan.max_instances >= plan.min_instances == 3
 
+    def test_max_instances_is_not_capped_by_anything_but_the_scenario(self) -> None:
+        # The decoupling result: thresholds are per-instance and do not move with fleet
+        # size, so supporting 100x the traffic is a larger max_instances and nothing
+        # else. Nothing in the plan may quietly clamp it to a quota.
+        plan = plan_one(_measured(), _scenario(peak_rps=45_000.0, trough_rps=30.0))
+        assert plan.max_instances == plan.peak_instances == 132
+        assert plan.c_scale_max == pytest.approx(C_SCALE_MAX)
+        assert plan.c_scale_min == pytest.approx(C_SCALE_MIN)
+
     def test_streams_win_over_a_rate(self) -> None:
         # A stated stream count is a direct concurrency observation; lambda x S is the
         # same quantity inferred. For bidi the inference is the weaker of the two.
-        by_streams = plan_one(_measured(), _scenario(peak_rps=20.0, peak_streams=8.0))
-        assert by_streams.peak_instances == 12  # ceil(8 / 0.713)
+        by_streams = plan_one(_measured(), _scenario(peak_rps=450.0, peak_streams=80.0))
+        assert by_streams.peak_instances == 3  # ceil(80 / 37.5)
 
-    def test_utilization_is_the_derate_over_k(self) -> None:
-        plan = plan_one(_measured(), _scenario(growth_factor_k=2.0))
-        assert plan.utilization_at_target == pytest.approx(0.4375)
+    def test_utilization_is_recorded_because_the_threshold_hides_it(self) -> None:
+        # 37.5 in the queue is L/(1+L) = 97.4% utilized, not "three quarters of the way
+        # to trouble". Recorded on the plan because that is not visible from 37.5.
+        plan = plan_one(_measured(), _scenario())
+        assert plan.utilization_at_c_scale_max == pytest.approx(0.974, abs=5e-4)
 
     def test_cooldowns_are_asymmetric(self) -> None:
         # Scale-out must not be gated on the full lag: target tracking adds one
@@ -230,17 +335,10 @@ class TestPlanOneComposition:
         plan = plan_one(_measured(t_total_s=1.0), _scenario())
         assert plan.scale_out_cooldown_s >= CLOUDWATCH_HIGH_RES_PERIOD_S
 
-    def test_reads_the_knee_at_the_requested_budget(self) -> None:
-        loose = plan_one(_measured(), _scenario(ttfab_budget_ms=500))
-        tight = plan_one(_measured(), _scenario(ttfab_budget_ms=300))
-        assert loose.c_max == 2.0
-        assert tight.c_max == C_MAX
-        # A looser SLO admits more concurrency per instance, so it needs fewer of them.
-        assert loose.peak_instances <= tight.peak_instances
-
-    def test_refuses_a_budget_below_every_measured_one(self) -> None:
-        with pytest.raises(PlannerError, match="no C_max measured"):
-            plan_one(_measured(), _scenario(ttfab_budget_ms=100))
+    def test_scale_in_cooldown_is_floored_at_five_minutes(self) -> None:
+        # A fast T_total must not produce a twitchy scale-in: the flap
+        # scale_in_safety warns about is damped by this cooldown, not by the lag.
+        assert plan_one(_measured(t_total_s=1.0), _scenario()).scale_in_cooldown_s == 300
 
     def test_cost_is_the_peak_fleet(self) -> None:
         plan = plan_one(_measured(), _scenario())
@@ -254,70 +352,68 @@ class TestPlanOneComposition:
         assert plan.peak_cost_per_m_chars == math.inf
         assert plan.peak_cost_per_hour > 0
 
+    def test_the_inputs_are_carried_on_the_plan(self) -> None:
+        # The artifact is what a later reader has. A plan that dropped its inputs could
+        # not be checked against them, and re-deriving the six variables from the
+        # outputs is exactly the hand-arithmetic this tool replaces.
+        measured, scenario = _measured(), _scenario()
+        plan = plan_one(measured, scenario)
+        assert plan.measured == measured
+        assert plan.scenario == scenario
 
-class TestBindingConstraint:
-    def test_surge_headroom_binds_for_a_fast_model(self) -> None:
-        plan = plan_one(_measured(), _scenario())
-        assert plan.binding_constraint == "surge_headroom"
-        assert "surge_headroom" in _finding(plan, "binding_constraint").detail
 
-    def test_slo_wait_budget_binds_for_a_high_capacity_model(self) -> None:
-        # It takes a knee well above k for the wait budget to bind at all: c_slo_cap is
-        # never below 1 (the running request always fits), so a sub-1 target like
-        # Kokoro's is surge-bound at every SLO including one that leaves no wait at all.
-        # Here the derated knee is 3.5, and an SLO 0.2s above p95 service permits 2.82.
-        plan = plan_one(
-            _measured(c_max_curve={300: 8.0}, curve_spread={300: 0.05}, runs_contributing={300: 3}),
-            _scenario(ttfab_slo_ms=_slo_for_wait(0.2)),
-        )
-        assert plan.binding_constraint == "slo_wait_budget"
-        assert plan.c_target == pytest.approx(plan.w_max_s / S_MEAN_S + 1)
-        assert "faster model" in (_finding(plan, "binding_constraint").recommendation or "")
+class TestSloMustMatchTheMeasurement:
+    """One SLO, one number — enforced across the artifact boundary.
 
-    def test_a_sub_one_target_is_surge_bound_at_every_slo(self) -> None:
-        # Worth pinning: it explains why the deployed Kokoro config reports
-        # surge_headroom even where the SLO leaves no queue at all, which otherwise
-        # looks like a bug. The 3s SLO the tool is built around moves Q_max, not this.
-        for wait in (0.0, 0.05, 0.2, 1.0, 20.0):
-            plan = plan_one(_measured(), _scenario(ttfab_slo_ms=_slo_for_wait(wait)))
-            assert plan.binding_constraint == "surge_headroom"
-            assert plan.c_target == pytest.approx(0.875 * C_MAX / 2)
+    ``Q_max`` is *defined by* the SLO: it is the highest rung whose p95 stayed inside
+    that line. So a ladder measured at 3000ms says nothing about a 1000ms promise, and
+    reading it against one is the mistake two independent latency fields used to permit.
+    """
 
-    def test_the_reported_target_is_always_the_smaller_of_the_two(self) -> None:
-        # The property, over both regimes: whichever bound is named, the target must
-        # not exceed either one. A target above the wait budget misses the SLO; a
-        # target above the derated knee has no surge headroom left.
-        for c_max in (C_MAX, 8.0):
-            measured = _measured(
-                c_max_curve={300: c_max},
-                curve_spread={300: 0.05},
-                runs_contributing={300: 3},
-            )
-            for wait in (0.0, 0.05, 0.2, 1.0, 20.0):
-                plan = plan_one(measured, _scenario(ttfab_slo_ms=_slo_for_wait(wait)))
-                assert plan.c_target <= 0.875 * c_max / 2 + 1e-9
-                assert plan.c_target <= plan.w_max_s / S_MEAN_S + 1 + 1e-9
+    def test_a_mismatched_slo_is_refused(self) -> None:
+        with pytest.raises(PlannerError, match="measured against a 3000ms SLO"):
+            plan_one(_measured(slo_ms=3000), _scenario(ttfab_slo_ms=1000))
+
+    def test_the_refusal_names_both_values_and_both_fixes(self) -> None:
+        # Either direction is a legitimate resolution -- plan at what was measured, or
+        # measure at what you want to plan -- so the message has to offer both.
+        with pytest.raises(PlannerError) as excinfo:
+            plan_one(_measured(slo_ms=3000), _scenario(ttfab_slo_ms=1000))
+        message = str(excinfo.value)
+        assert "3000ms" in message
+        assert "1000ms" in message
+        assert "--ttfab-slo-ms 3000" in message
+        assert "qmax --slo-ms 1000" in message
+
+    def test_a_matching_slo_plans(self) -> None:
+        assert plan_one(_measured(slo_ms=1500), _scenario(ttfab_slo_ms=1500)).q_max == Q_MAX
+
+    def test_the_refusal_comes_before_any_arithmetic(self) -> None:
+        # A measurement that is also infeasible must still report the mismatch: the
+        # mismatch invalidates the input, so any finding computed from it would be a
+        # statement about a ladder that was never run.
+        with pytest.raises(PlannerError, match="Q_max was measured"):
+            plan_one(_measured(slo_ms=3000, s_p95_s=61.0), _scenario(ttfab_slo_ms=100))
 
 
 class TestInvocationCeiling:
     def test_a_wait_past_the_ceiling_is_infeasible_not_a_warning(self) -> None:
         # The hard constraint. Those requests wait the full W_max and then fail
-        # anyway, which is worse than refusing them at admission. Reached now by an SLO
-        # past the platform ceiling rather than a hand-set wait: with W_max derived, the
+        # anyway, which is worse than refusing them at admission. Reached by an SLO past
+        # the platform ceiling rather than a hand-set wait: with W_max derived, the
         # deadline *is* the SLO, so a 70s promise cannot be kept whatever the queue does.
-        plan = plan_one(_measured(), _scenario(ttfab_slo_ms=70_000))
-        finding = _finding(plan, "invocation_ceiling")
-        assert finding.verdict is Verdict.INFEASIBLE
+        plan = _plan_at_slo(70_000)
+        assert _finding(plan, "invocation_ceiling").verdict is Verdict.INFEASIBLE
         assert plan.infeasible
 
     def test_an_infeasible_plan_says_what_would_work(self) -> None:
-        plan = plan_one(_measured(), _scenario(ttfab_slo_ms=70_000))
+        plan = _plan_at_slo(70_000)
         recommendation = _finding(plan, "invocation_ceiling").recommendation or ""
         assert "--ttfab-slo-ms" in recommendation
         # And the number it names must itself pass, or it is advice to build another
         # infeasible plan.
         largest = int(recommendation.split("--ttfab-slo-ms")[1].split()[0])
-        assert not plan_one(_measured(), _scenario(ttfab_slo_ms=largest)).infeasible
+        assert not _plan_at_slo(largest).infeasible
 
     def test_the_stated_slo_is_feasible(self) -> None:
         plan = plan_one(_measured(), _scenario())
@@ -328,228 +424,340 @@ class TestInvocationCeiling:
         # A mean-sized deadline is missed by half the requests that reach it. This model
         # has a 0.5s p95 against a 0.05s mean, and at a 60s SLO the ceiling check sees
         # 59.5s of queue plus that 0.5s tail -- exactly 60s, and one step looser breaks.
-        plan = plan_one(_measured(s_mean_s=0.05, s_p95_s=0.5), _scenario(ttfab_slo_ms=60_001))
-        assert plan.infeasible
-        assert not plan_one(
-            _measured(s_mean_s=0.05, s_p95_s=0.5), _scenario(ttfab_slo_ms=60_000)
-        ).infeasible
+        assert _plan_at_slo(60_001, s_mean_s=0.05, s_p95_s=0.5).infeasible
+        assert not _plan_at_slo(60_000, s_mean_s=0.05, s_p95_s=0.5).infeasible
 
     def test_a_model_slower_than_the_ceiling_cannot_be_rescued(self) -> None:
         # p95 service of 61s exceeds the 60s ceiling on its own, so there is no SLO to
         # recommend -- an unqueued request already fails.
-        plan = plan_one(
-            _measured(s_mean_s=30.0, s_p95_s=61.0),
-            _scenario(ttfab_slo_ms=70_000),
-        )
+        plan = _plan_at_slo(70_000, s_mean_s=30.0, s_p95_s=61.0)
         recommendation = _finding(plan, "invocation_ceiling").recommendation or ""
         assert "no SLO or queue length fixes this" in recommendation
 
     def test_an_explicit_ceiling_is_honoured(self) -> None:
-        plan = plan_one(_measured(), _scenario(ttfab_slo_ms=20_000), ceiling_s=10.0)
+        plan = plan_one(_measured(slo_ms=20_000), _scenario(ttfab_slo_ms=20_000), ceiling_s=10.0)
         assert plan.infeasible
 
     def test_the_default_ceiling_is_sagemakers(self) -> None:
         assert SAGEMAKER_INVOCATION_CEILING_S == 60.0
 
+    def test_the_plan_records_the_ceiling_the_finding_judged_against(self) -> None:
+        # `scale_report` prints this number as a comment on ttfab_slo_ms, and that block
+        # is pasted into config.py verbatim. Reading the constant there instead named
+        # 60s on a run judged at 10 -- a comment contradicting the finding above it,
+        # which is how a policy gets deployed against a limit nobody checked. Asserted
+        # against the finding's own text so the field and the check cannot drift apart:
+        # there is one ceiling per run, not two that happen to agree.
+        plan = plan_one(_measured(slo_ms=20_000), _scenario(ttfab_slo_ms=20_000), ceiling_s=10.0)
+        assert plan.ceiling_s == 10.0
+        detail = _finding(plan, "invocation_ceiling").detail
+        assert f"{plan.ceiling_s:.0f}s SageMaker invocation ceiling" in detail
 
-class TestMeasurementFindings:
-    def test_an_unfrozen_curve_warns(self) -> None:
-        plan = plan_one(_measured(frozen=False), _scenario())
-        finding = _finding(plan, "measurement_trust")
+    def test_an_unstated_ceiling_is_recorded_as_sagemakers(self) -> None:
+        # The constant is the default, so an ordinary run is unchanged by carrying it.
+        plan = plan_one(_measured(), _scenario())
+        assert plan.ceiling_s == SAGEMAKER_INVOCATION_CEILING_S
+
+
+class TestMeasurementTrust:
+    """Whether ``Q_max`` reads as one instance's own limit.
+
+    First finding because it invalidates the rest: both thresholds are fractions of
+    ``Q_max`` and every fleet size divides by it, so a ladder that measured something
+    else makes the whole plan a description of nothing.
+    """
+
+    def test_a_trustworthy_measurement_passes(self) -> None:
+        finding = _finding(plan_one(_measured(), _scenario()), "measurement_trust")
+        assert finding.verdict is Verdict.OK
+
+    def test_an_unfrozen_ladder_warns(self) -> None:
+        finding = _finding(plan_one(_measured(frozen=False), _scenario()), "measurement_trust")
         assert finding.verdict is Verdict.WARN
         assert "not suspended" in finding.detail
 
     def test_a_resized_fleet_warns(self) -> None:
-        plan = plan_one(_measured(instance_counts_observed=(1, 2)), _scenario())
-        finding = _finding(plan, "measurement_trust")
+        finding = _finding(
+            plan_one(_measured(instance_counts_observed=(1, 2)), _scenario()), "measurement_trust"
+        )
         assert finding.verdict is Verdict.WARN
         assert "resized mid-run" in finding.detail
 
-    def test_a_single_contributing_run_is_not_agreement(self) -> None:
-        # The defect this exists for: spread is 0% when only one run found a knee,
-        # which otherwise reads exactly like three runs agreeing perfectly.
-        plan = plan_one(
-            _measured(curve_spread={300: 0.0, 500: 0.0}, runs_contributing={300: 1, 500: 3}),
-            _scenario(),
+    def test_a_bounded_container_queue_warns(self) -> None:
+        # Q_max is the depth at which the SLO breaks. A container that sheds first
+        # measures its own MAX_QUEUE_DEPTH instead, which is a different number that
+        # looks exactly the same on the ladder.
+        finding = _finding(
+            plan_one(_measured(unbounded_queue=False), _scenario()), "measurement_trust"
         )
-        finding = _finding(plan, "curve_repeatability")
         assert finding.verdict is Verdict.WARN
-        assert "1 of 3" in finding.detail
+        assert "bounds its admission queue" in finding.detail
 
-    def test_a_wide_spread_warns(self) -> None:
-        plan = plan_one(_measured(curve_spread={300: 0.45, 500: 0.1}), _scenario())
-        assert _finding(plan, "curve_repeatability").verdict is Verdict.WARN
+    def test_an_unchecked_queue_bound_is_not_a_pass(self) -> None:
+        # None, not False: the check never ran. Treating that as clear is how a bounded
+        # container would go unnoticed, since the ladder cannot tell the two apart.
+        finding = _finding(
+            plan_one(_measured(unbounded_queue=None), _scenario()), "measurement_trust"
+        )
+        assert finding.verdict is Verdict.WARN
+        assert "never checked" in finding.detail
+
+    def test_every_failing_precondition_is_named(self) -> None:
+        # Not the first one only: they have different fixes, and an operator who
+        # re-runs with --require-frozen alone would get the same warning back.
+        finding = _finding(
+            plan_one(
+                _measured(frozen=False, unbounded_queue=False, instance_counts_observed=(1, 4)),
+                _scenario(),
+            ),
+            "measurement_trust",
+        )
+        assert "not suspended" in finding.detail
+        assert "resized mid-run" in finding.detail
+        assert "bounds its admission queue" in finding.detail
+        assert "--require-frozen --require-unbounded-queue" in (finding.recommendation or "")
+
+
+class TestRepeatability:
+    """Whether ``Q_max`` is *stable*, which is a separate question from per-instance.
+
+    Both thresholds are fractions of it, so a ladder that resolved noise produces
+    confidently wrong thresholds — the failure looks identical to a good measurement
+    from the plan alone.
+    """
 
     def test_a_tight_spread_across_runs_passes(self) -> None:
-        plan = plan_one(_measured(), _scenario())
-        assert _finding(plan, "curve_repeatability").verdict is Verdict.OK
+        plan = plan_one(_measured(q_max_spread=0.0, runs_contributing=2), _scenario())
+        finding = _finding(plan, "curve_repeatability")
+        assert finding.verdict is Verdict.OK
+        assert "the plan uses the minimum" in finding.detail
 
-    def test_no_spread_recorded_is_suppressed_not_ok(self) -> None:
-        # SUPPRESSED because the condition was never evaluated. Marking a
-        # pre-fingerprint artifact OK would claim a repeatability nobody measured.
-        plan = plan_one(_measured(curve_spread={}, runs_contributing={}), _scenario())
-        assert _finding(plan, "curve_repeatability").verdict is Verdict.SUPPRESSED
+    def test_a_wide_spread_warns(self) -> None:
+        plan = plan_one(_measured(q_max_spread=0.45, runs_contributing=2), _scenario())
+        finding = _finding(plan, "curve_repeatability")
+        assert finding.verdict is Verdict.WARN
+        assert "45%" in finding.detail
 
-    def test_spread_is_read_at_the_planned_budget(self) -> None:
-        # The 500ms spread is fine and the 300ms one is not; planning at 300ms must
-        # see the bad one.
-        measured = _measured(curve_spread={300: 0.5, 500: 0.01})
-        assert _finding(plan_one(measured, _scenario(ttfab_budget_ms=300)), "curve_repeatability")
+    def test_a_single_run_is_suppressed_not_ok(self) -> None:
+        # The defect this exists for: spread is 0% when only one pass contributed,
+        # which otherwise reads exactly like two passes agreeing perfectly.
+        plan = plan_one(_measured(q_max_spread=0.0, runs_contributing=1), _scenario())
+        finding = _finding(plan, "curve_repeatability")
+        assert finding.verdict is Verdict.SUPPRESSED
+        assert "not an agreement" in finding.detail
+        assert "--runs 2" in (finding.recommendation or "")
+
+    def test_the_warn_threshold_is_twenty_percent(self) -> None:
+        assert Q_MAX_SPREAD_WARN == 0.2
+        # Either side of it, at the same number of contributing runs.
         assert (
             _finding(
-                plan_one(measured, _scenario(ttfab_budget_ms=300)), "curve_repeatability"
-            ).verdict
-            is Verdict.WARN
-        )
-        assert (
-            _finding(
-                plan_one(measured, _scenario(ttfab_budget_ms=500)), "curve_repeatability"
+                plan_one(_measured(q_max_spread=0.19, runs_contributing=2), _scenario()),
+                "curve_repeatability",
             ).verdict
             is Verdict.OK
         )
-
-    def test_the_warn_threshold_is_twenty_percent(self) -> None:
-        assert CURVE_SPREAD_WARN == 0.2
-
-
-class TestQueueFindings:
-    def test_flat_traffic_reads_as_covered_without_printing_infinity(self) -> None:
-        # W_absorbed is infinite at k=1, which is true but unreadable as a duration.
-        plan = plan_one(_measured(), _scenario(growth_factor_k=1.0))
-        detail = _finding(plan, "queue_covers_surge").detail
-        assert "inf" not in detail
-        assert "flat at k=1" in detail
-
-    def test_an_uncovered_surge_warns_with_the_remainder(self) -> None:
-        plan = plan_one(_measured(t_total_s=300.0), _scenario(growth_factor_k=3.0))
-        finding = _finding(plan, "queue_covers_surge")
-        assert finding.verdict is Verdict.WARN
-        assert "standing headroom" in finding.detail
-
-    def test_flat_traffic_does_not_warn_about_headroom(self) -> None:
-        # k=1 floors the uncovered lag at the metric period, but by formality --
-        # flat traffic needs no standing headroom at all, so warning would tell the
-        # operator to fix a plan with nothing wrong with it.
-        plan = plan_one(_measured(), _scenario(growth_factor_k=1.0))
-        assert _finding(plan, "headroom_lag").verdict is Verdict.OK
-
-    def test_a_floored_lag_above_k_one_warns(self) -> None:
-        # The 2.84s W_max the 3s SLO leaves absorbs 2.84s at k=2, so a 10s lag leaves
-        # 7.2s -- under the 10s metric period, which floors it. The headroom is then
-        # sized for growth CloudWatch cannot report in time to act on.
-        plan = plan_one(_measured(t_total_s=10.0), _scenario(growth_factor_k=2.0))
-        finding = _finding(plan, "headroom_lag")
-        assert finding.verdict is Verdict.WARN
-        assert "faster than" in finding.detail
-
-    def test_a_queue_that_rounds_to_zero_warns(self) -> None:
-        # An SLO that leaves no queue at all: exactly p95 service, so W_max is 0. The
-        # SLO finding calls that infeasible; this one says the queue cannot help.
-        plan = plan_one(_measured(), _scenario(ttfab_slo_ms=_slo_for_wait(0.0)))
-        finding = _finding(plan, "queue_depth")
-        assert finding.verdict is Verdict.WARN
-        assert plan.queue_max_depth == 0
-        assert "SLO leaves" in finding.detail
+        assert (
+            _finding(
+                plan_one(_measured(q_max_spread=0.21, runs_contributing=2), _scenario()),
+                "curve_repeatability",
+            ).verdict
+            is Verdict.WARN
+        )
 
 
-class TestWhichCMaxBinds:
-    """Which of the two measured limits was divided by, and how firmly.
+class TestQueueDepth:
+    """That the admission bound shipped is the one that was measured.
 
-    The distinction the report used to collapse into a single number. All four states
-    want a different next run, and three of them are not ``OK``: a knee that was never
-    bracketed over-sizes the fleet, a throughput ceiling means the knee's concurrency was
-    backlog, and an unmeasured ceiling means the comparison never happened at all.
+    There is no arithmetic to check — ``queue_max_depth`` *is* ``Q_max`` — so the
+    finding exists to say that, and to cross-check it against the depth the SLO's own
+    wait budget affords. The two agree by construction when the ladder bracketed its
+    answer, and any disagreement is the size of the extrapolation.
     """
 
-    def _bracketed(self, **overrides: Any) -> Measured:
-        """A curve whose knees are recorded as bracketed, so only the source varies.
-
-        Without this the default fixture records no ``c_max_bracketed`` at all, which is
-        the SUPPRESSED "unrecorded" state and would mask every other verdict here.
-        """
-        fields: dict[str, Any] = {"c_max_bracketed": {300: True, 500: True}}
-        fields.update(overrides)
-        return _measured(**fields)
-
-    def test_a_knee_under_the_ceiling_is_the_knee(self) -> None:
-        # Latency degrades before throughput does, which is the regime the tool was
-        # originally written for and the one kokoro on bidi is *not* in.
-        plan = plan_one(self._bracketed(c_max_throughput=5.0), _scenario())
-        finding = _finding(plan, "c_max_source")
-        assert plan.c_max_source == "latency_knee"
-        assert plan.c_max == C_MAX
+    def test_a_bracketed_ladder_passes_and_shows_the_cross_check(self) -> None:
+        # W_max 2.835s / S 0.110s implies room for about 26, against a measured 50. The
+        # gap is real and worth printing: S is conflated with a 34ms round trip, so the
+        # implied figure runs low.
+        finding = _finding(plan_one(_measured(), _scenario()), "queue_depth")
         assert finding.verdict is Verdict.OK
-        assert "latency degrades before throughput" in finding.detail
+        assert "bracketed from above" in finding.detail
+        assert "about 26" in finding.detail
 
-    def test_a_ceiling_under_the_knee_binds_and_says_the_knee_was_backlog(self) -> None:
-        # Kokoro's regime, and the whole reason the ceiling is measured: the ladder's
-        # higher concurrency was accumulated queue, so planning on the knee would size a
-        # fleet for capacity the instance does not have.
-        plan = plan_one(self._bracketed(c_max_throughput=1.0), _scenario())
-        finding = _finding(plan, "c_max_source")
-        assert plan.c_max_source == "throughput_ceiling"
-        assert plan.c_max == 1.0
-        assert finding.verdict is Verdict.OK
-        assert "queue backlog, not capacity" in finding.detail
-        # And the smaller C_max has to reach the fleet size, not just the finding.
-        assert (
-            plan.peak_instances
-            > plan_one(self._bracketed(c_max_throughput=5.0), _scenario()).peak_instances
-        )
-
-    def test_an_unmeasured_ceiling_is_suppressed_not_ok(self) -> None:
-        # The state every committed artifact is in. Absent must not read as "compared
-        # and the knee won" -- for a model that holds its inference lock for a whole
-        # session the ceiling is the likelier bound, so silence here is the dangerous
-        # direction.
-        plan = plan_one(self._bracketed(), _scenario())
-        finding = _finding(plan, "c_max_source")
-        assert plan.c_max_source == "latency_knee_only"
-        assert finding.verdict is Verdict.SUPPRESSED
-        assert "was never checked" in finding.detail
-        assert "measures the ceiling alongside the knee" in (finding.recommendation or "")
-
-    def test_an_unbracketed_knee_is_a_lower_bound_and_says_the_fleet_is_over_sized(
-        self,
-    ) -> None:
-        plan = plan_one(
-            self._bracketed(c_max_throughput=5.0, c_max_bracketed={300: False}), _scenario()
-        )
-        finding = _finding(plan, "c_max_source")
-        assert plan.c_max_is_lower_bound
+    def test_an_unbracketed_ladder_warns_that_q_max_is_a_lower_bound(self) -> None:
+        # The ladder ran out while still passing, so real capacity is at least this.
+        # Conservative in the safe direction -- the policy adds instances sooner than it
+        # needs to -- but it costs money, so it is a warning rather than silence.
+        plan = plan_one(_measured(q_max_bracketed=False), _scenario())
+        finding = _finding(plan, "queue_depth")
         assert finding.verdict is Verdict.WARN
-        assert "LOWER BOUND" in finding.detail
-        assert "--target-concurrency" in (finding.recommendation or "")
-
-    def test_an_unbracketed_ceiling_advises_raising_the_worker_pool(self) -> None:
-        # A different fix from the knee's: a ceiling can be a lower bound because the
-        # client pool never handed the server the offered rate, and extending the ladder
-        # would then measure the same client limit one step higher.
-        plan = plan_one(
-            self._bracketed(c_max_throughput=1.0, c_max_throughput_bracketed=False), _scenario()
-        )
-        finding = _finding(plan, "c_max_source")
-        assert plan.c_max_source == "throughput_ceiling"
-        assert plan.c_max_is_lower_bound
-        assert finding.verdict is Verdict.WARN
-        assert "--max-workers" in (finding.recommendation or "")
-
-    def test_an_unrecorded_bracketing_is_suppressed_rather_than_passed(self) -> None:
-        # An artifact predating the check. Not the same claim as a bracketed knee, and
-        # the plan records None rather than False so a reader can tell which.
-        plan = plan_one(_measured(c_max_throughput=5.0, c_max_bracketed={}), _scenario())
-        finding = _finding(plan, "c_max_source")
-        assert plan.c_max_is_lower_bound is None
-        assert finding.verdict is Verdict.SUPPRESSED
-        assert "unrecorded" in finding.detail
+        assert "LOWER bound" in finding.detail
+        assert "--concurrency rungs above 50" in (finding.recommendation or "")
 
     def test_the_lower_bound_flag_reaches_the_plan_not_only_the_finding(self) -> None:
         # The artifact is what a later reader has; a warning printed once to a terminal
         # is not a record of it.
-        assert (
-            plan_one(self._bracketed(c_max_throughput=5.0), _scenario()).c_max_is_lower_bound
-            is False
-        )
+        assert plan_one(_measured(q_max_bracketed=False), _scenario()).q_max_is_lower_bound
+        assert not plan_one(_measured(q_max_bracketed=True), _scenario()).q_max_is_lower_bound
+
+
+class TestThresholdUnits:
+    """The shipped defect this finding exists for.
+
+    ``C_scale_max`` is a client-measured occupancy; the deployed alarm compares
+    ``ConcurrentRequestsPerModel`` / *Maximum* over 10s against its threshold. Deploying
+    the unconverted figure is how 0.713 reached the endpoint — a value that inverts to a
+    negative arrival rate, so no traffic satisfies it and target tracking asks for the
+    whole fleet on one request.
+    """
+
+    def test_a_measured_ratio_converts_the_threshold(self) -> None:
+        plan = plan_one(_measured(cw_units_ratio_by_rung={50: 1.35}), _scenario())
+        assert plan.cw_units_ratio == pytest.approx(1.35)
+        assert plan.c_scale_max_in_cw_units == pytest.approx(37.5 * 1.35)
+        finding = _finding(plan, "threshold_units")
+        assert finding.verdict is Verdict.OK
+        assert "50.62" in finding.detail
+
+    def test_the_converted_number_is_what_deploys(self) -> None:
+        # Both figures are on the plan, and they must not be confused: the occupancy is
+        # what was measured, the conversion is what the alarm reads.
+        plan = plan_one(_measured(cw_units_ratio_by_rung={50: 1.35}), _scenario())
+        assert plan.c_scale_max_in_cw_units != pytest.approx(plan.c_scale_max)
+        assert "The converted figure is what" in _finding(plan, "threshold_units").detail
+
+    def test_the_rung_nearest_the_threshold_is_used(self) -> None:
+        # The ratio is not a constant -- it ran 9.8x at low load to 1.35x at high load
+        # across one kokoro ladder -- so it has to be read where the threshold sits, not
+        # averaged across the ladder.
+        plan = plan_one(_measured(cw_units_ratio_by_rung={5: 9.8, 10: 5.1, 50: 1.35}), _scenario())
+        assert plan.cw_units_ratio == pytest.approx(1.35)
+
+    def test_a_tie_between_rungs_takes_the_higher_one(self) -> None:
+        # 37.5 is equidistant from 25 and 50. The ratio shrinks as load rises, so the
+        # higher rung gives the smaller multiplier and the tighter threshold.
+        plan = plan_one(_measured(cw_units_ratio_by_rung={25: 3.0, 50: 1.35}), _scenario())
+        assert plan.cw_units_ratio == pytest.approx(1.35)
+
+    def test_no_server_statistic_is_suppressed_not_ok(self) -> None:
+        # The conversion did not happen, which is not the same as not needing one.
+        # SUPPRESSED, and the recommendation says it cannot be backfilled: high-res
+        # datapoints retain 3 hours.
+        plan = plan_one(_measured(cw_units_ratio_by_rung={}), _scenario())
+        assert plan.c_scale_max_in_cw_units is None
+        assert plan.cw_units_ratio is None
+        finding = _finding(plan, "threshold_units")
+        assert finding.verdict is Verdict.SUPPRESSED
+        assert "0.713" in finding.detail
+        assert "retain 3 hours" in (finding.recommendation or "")
+
+
+class TestSurgeSurvival:
+    """The first known limit of the simple rule, made falsifiable.
+
+    ``C_scale_max`` reserves headroom in queue *slots*, a finite stock, while surviving
+    a surge is a question about drain *rate*, a flow. Occupancy converts to utilization
+    steeply, so three quarters of ``Q_max`` is 97% utilized rather than three quarters of
+    the way to trouble. Simulated rather than argued, because the simulation has a number.
+    """
+
+    def test_the_default_threshold_warns_with_the_simulated_probability(self) -> None:
+        # 88% at the numbers this branch measured. The finding is the whole reason the
+        # simple rule is shippable: it says out loud what the rule costs.
+        plan = plan_one(_measured(t_total_s=231.0), _scenario())
+        finding = _finding(plan, "surge_survival")
+        assert finding.verdict is Verdict.WARN
+        assert plan.shed_probability_at_c_scale_max == pytest.approx(0.855, abs=0.01)
+        assert "86%" in finding.detail
+        assert "97.4% utilization" in finding.detail
+        assert "scale out earlier" in (finding.recommendation or "")
+
+    def test_a_short_lag_survives(self) -> None:
+        # The same threshold is fine when help arrives quickly -- which is why the
+        # finding is about the pair rather than about C_scale_max alone.
+        plan = plan_one(_measured(t_total_s=0.5), _scenario())
+        finding = _finding(plan, "surge_survival")
+        assert finding.verdict is Verdict.OK
+        assert plan.shed_probability_at_c_scale_max is not None
+        assert plan.shed_probability_at_c_scale_max <= SHED_PROBABILITY_WARN
+
+    def test_the_probability_rises_with_the_lag(self) -> None:
+        # The monotonicity a reader relies on. Asserted as a property because the
+        # simulation's exact values are shared.capacity's business.
+        probabilities = [
+            plan_one(_measured(t_total_s=t), _scenario()).shed_probability_at_c_scale_max
+            for t in (1.0, 10.0, 60.0, 300.0)
+        ]
+        assert probabilities == sorted(probabilities)
+
+    def test_it_is_deterministic_across_runs(self) -> None:
+        # A published number that moved between two invocations of the same command
+        # would be indistinguishable from a changed measurement.
+        first = plan_one(_measured(), _scenario()).shed_probability_at_c_scale_max
+        second = plan_one(_measured(), _scenario()).shed_probability_at_c_scale_max
+        assert first == second
+
+    def test_the_warn_line_is_one_in_ten(self) -> None:
+        # Not zero: a queue is a stochastic object and some tail risk is the price of
+        # running one at all.
+        assert SHED_PROBABILITY_WARN == 0.1
+
+
+class TestScaleInSafety:
+    """The second known limit: scale-in redistributes load rather than removing it.
+
+    Dropping one of ``N`` multiplies each survivor's concurrency by ``N/(N-1)``, so at
+    ``N=2`` the survivor inherits *double*. At a 1.25 ratio the thresholds are 0.75 and
+    0.5 of ``Q_max``, so 2->1 lands exactly on ``Q_max`` — and kokoro runs
+    ``min_instances=1``, which makes 2->1 the common case rather than the corner one.
+    """
+
+    def test_kokoros_floor_of_one_warns(self) -> None:
+        plan = plan_one(_measured(), _scenario())
+        finding = _finding(plan, "scale_in_safety")
+        assert finding.verdict is Verdict.WARN
+        assert plan.min_instances == 1
+        assert "only stable from 3 instances up" in finding.detail
+        assert "2->1" in finding.detail
+        # The survivor inherits 25.0 x 2 / 1 = 50.0, which is Q_max exactly.
+        assert "50.00" in finding.detail
+        # Named as the flag that exists: `--min-floor` (dest min_instances_floor). Advice
+        # naming a flag click would reject is advice nobody can follow.
+        assert "raise --min-floor to 3" in (finding.recommendation or "")
+
+    def test_a_floor_at_the_safe_size_passes(self) -> None:
+        plan = plan_one(_measured(), _scenario(min_instances_floor=3))
+        finding = _finding(plan, "scale_in_safety")
+        assert finding.verdict is Verdict.OK
+        assert plan.min_safe_instances == 3
+        # 25.0 x 3 / 2 = 37.5, which is C_scale_max -- safe by a hair, and that is what
+        # min_safe_instances means.
+        assert "37.50" in finding.detail
+
+    def test_the_ratio_test_is_stated_so_it_can_be_checked(self) -> None:
+        # N/(N-1) <= C_scale_max / C_scale_min. Printing the ratio is what lets a
+        # reader verify the floor rather than take it.
+        finding = _finding(plan_one(_measured(), _scenario()), "scale_in_safety")
+        assert "N/(N-1)" in finding.detail
+        assert "1.50" in finding.detail  # 37.5 / 25.0
+
+    def test_a_flat_scenario_has_no_safe_size_at_all(self) -> None:
+        # At k=1 the thresholds coincide, so every scale-in scales straight back out.
+        # Distinct from "the floor is too low": no floor helps.
+        plan = plan_one(_measured(), _scenario(max_scaling_per_t_total=1.0))
+        finding = _finding(plan, "scale_in_safety")
+        assert finding.verdict is Verdict.WARN
+        assert plan.min_safe_instances is None
+        assert "no fleet size" in finding.detail
+        assert "smaller --max-scaling-per-t-total" in (finding.recommendation or "")
+
+    def test_the_safe_floor_falls_as_the_thresholds_separate(self) -> None:
+        # A wider gap tolerates a smaller fleet, which is the trade the ratio buys.
+        wide = plan_one(_measured(), _scenario(max_scaling_per_t_total=1.4))
+        narrow = plan_one(_measured(), _scenario(max_scaling_per_t_total=1.1))
+        assert wide.min_safe_instances is not None
+        assert narrow.min_safe_instances is not None
+        assert wide.min_safe_instances < narrow.min_safe_instances
 
 
 class TestSloBudget:
@@ -557,7 +765,7 @@ class TestSloBudget:
 
     Stated as its own finding because the failure it catches is silent: a model whose p95
     already misses the promise reports ``W_max = 0``, and a reader seeing
-    ``queue_max_depth = 0`` beside it would take that for a design choice.
+    ``queue_max_depth`` beside it would take that for a design choice.
     """
 
     def test_shows_the_arithmetic_rather_than_the_result(self) -> None:
@@ -570,100 +778,223 @@ class TestSloBudget:
         # p95 service is 165ms, so a 150ms promise is broken before a request waits at
         # all. INFEASIBLE rather than WARN because nothing this module emits moves it:
         # queue depth, instance count and policy all govern waiting, and there is none.
-        plan = plan_one(_measured(), _scenario(ttfab_slo_ms=150))
+        plan = _plan_at_slo(150)
         finding = _finding(plan, "slo_budget")
         assert finding.verdict is Verdict.INFEASIBLE
         assert plan.infeasible
         assert plan.w_max_s == 0.0
-        assert plan.queue_max_depth == 0
         assert "No queue depth, instance count, or scaling policy rescues this" in finding.detail
 
     def test_the_infeasible_recommendation_names_an_slo_that_works(self) -> None:
-        plan = plan_one(_measured(), _scenario(ttfab_slo_ms=150))
-        recommendation = _finding(plan, "slo_budget").recommendation or ""
+        recommendation = _finding(_plan_at_slo(150), "slo_budget").recommendation or ""
         slo = int(recommendation.split("--ttfab-slo-ms above")[1].split(",")[0])
-        assert (
-            _finding(plan_one(_measured(), _scenario(ttfab_slo_ms=slo + 1)), "slo_budget").verdict
-            is not Verdict.INFEASIBLE
-        )
+        assert _finding(_plan_at_slo(slo + 1), "slo_budget").verdict is not Verdict.INFEASIBLE
 
-    def test_an_slo_exactly_at_p95_service_is_infeasible(self) -> None:
-        # The boundary. W_max is 0 there, so the promise holds only for a request that
-        # never waits -- which is not a promise a queued endpoint can keep.
-        plan = plan_one(_measured(), _scenario(ttfab_slo_ms=round(S_P95_S * 1000)))
-        # round() lands one tenth of a millisecond above p95, so this is feasible by a
-        # hair and warns instead. Pinned to document which side of the line it falls on.
+    def test_the_boundary_at_p95_service_falls_on_the_feasible_side(self) -> None:
+        # W_max is 0 exactly at p95 service, and an SLO cannot be stated more finely than
+        # a millisecond: 165ms is four tenths of a millisecond above kokoro's 164.577ms
+        # p95, so the promise is technically keepable and this warns rather than refusing.
+        # Pinned because "0.4ms of queue allowance" and "infeasible" are one rounding
+        # apart, and a reader needs to know which side of the line the tool puts it on.
+        plan = _plan_at_slo(round(S_P95_S * 1000))
         assert _finding(plan, "slo_budget").verdict is Verdict.WARN
-        assert plan.w_max_s < S_P95_S
+        assert 0.0 < plan.w_max_s < 0.001
+        # One millisecond tighter and there is no budget at all.
+        assert _finding(_plan_at_slo(164), "slo_budget").verdict is Verdict.INFEASIBLE
 
     def test_a_wait_budget_under_one_service_time_warns(self) -> None:
         # Feasible but barely: a single request queued ahead already misses the SLO, so
         # the promise holds for an uncontended request and little more.
-        plan = plan_one(_measured(), _scenario(ttfab_slo_ms=_slo_for_wait(S_P95_S / 2)))
-        finding = _finding(plan, "slo_budget")
+        finding = _finding(_plan_at_slo(_slo_for_wait(S_P95_S / 2)), "slo_budget")
         assert finding.verdict is Verdict.WARN
         assert "a single request queued ahead misses the SLO" in finding.detail
 
     def test_a_roomy_slo_passes(self) -> None:
-        plan = plan_one(_measured(), _scenario(ttfab_slo_ms=_slo_for_wait(S_P95_S * 3)))
-        assert _finding(plan, "slo_budget").verdict is Verdict.OK
+        assert (
+            _finding(_plan_at_slo(_slo_for_wait(S_P95_S * 3)), "slo_budget").verdict is Verdict.OK
+        )
 
 
 class TestFleetCost:
-    def test_a_costly_reserve_warns(self) -> None:
-        plan = plan_one(_measured(), _scenario(growth_factor_k=5.0, peak_rps=100.0))
-        finding = _finding(plan, "fleet_cost")
-        assert finding.verdict is Verdict.WARN
-        assert "cheaper than" in (finding.recommendation or "")
+    """What the headroom costs, and why it never warns.
 
-    def test_k_one_costs_one_times_itself(self) -> None:
-        plan = plan_one(_measured(), _scenario(growth_factor_k=1.0))
-        assert plan.relative_fleet_cost_vs_k1 == pytest.approx(1.0)
+    Both fleets are the same demand over a different divisor, so the ratio is bounded by
+    ``Q_max / C_scale_max`` = ``1 / (1 - h)``, and ``scale_thresholds`` refuses
+    ``h >= 0.5``. So the continuous ceiling is under 2x and integer rounding reaches
+    exactly 2x and no further — there is no reachable multiple at which "shorten T_total
+    instead of buying headroom" becomes the cheaper advice. The finding reports the cost
+    and leaves the judgement to the reader.
+    """
 
     def test_cost_is_labelled_an_upper_bound(self) -> None:
+        # On-demand rates: a reserved-capacity account pays less, and we can verify a
+        # Pricing API number but not a contract rate.
+        assert "upper bound" in _finding(plan_one(_measured(), _scenario()), "fleet_cost").detail
+
+    def test_it_reports_both_fleet_sizes_so_the_ratio_can_be_checked(self) -> None:
+        finding = _finding(plan_one(_measured(), _scenario()), "fleet_cost")
+        assert "2.0x" in finding.detail
+        assert "2 instances at C_scale_max 37.50 against 1 at Q_max" in finding.detail
+
+    def test_a_flat_scenario_costs_nothing_extra(self) -> None:
+        # At k=1 the two fleets are the same fleet: no headroom reserved, no premium.
+        finding = _finding(
+            plan_one(_measured(), _scenario(max_scaling_per_t_total=1.0)), "fleet_cost"
+        )
+        assert "1.0x" in finding.detail
+
+    def test_it_never_warns_because_the_multiple_is_bounded(self) -> None:
+        # The bound is structural, so this is a property over the reachable range rather
+        # than a spot check: a WARN branch here would be dead code, and a reader seeing
+        # only OK verdicts is entitled to know that is the model and not an unchecked
+        # condition. The old C_max model could reach 4x, because its divisor moved with
+        # k without a bound.
+        for surge in (1.0, 1.05, 1.25, 1.4, 1.49):
+            for peak in (0.5, 20.0, 345.0, 450.0, 1000.0, 45_000.0):
+                plan = plan_one(
+                    _measured(),
+                    _scenario(peak_rps=peak, trough_rps=0.5, max_scaling_per_t_total=surge),
+                )
+                assert _finding(plan, "fleet_cost").verdict is Verdict.OK
+
+
+class TestProvisionStage:
+    """Which parts of ``T_total`` are measured and which are stated.
+
+    Never suppressed: the deliverable is a plan for an account whose placement latency is
+    not ours to measure, so which part is which is the single most important caveat on
+    the whole output.
+    """
+
+    def test_a_measured_provision_stage_is_labelled_this_accounts(self) -> None:
+        plan = plan_one(_measured(t_total_s=420.0), _scenario(), provision_s=180.0)
+        finding = _finding(plan, "provision_stage")
+        assert finding.verdict is Verdict.OK
+        assert "180s (43%)" in finding.detail
+        assert "not of the configuration" in finding.detail
+
+    def test_an_unobserved_boundary_says_so_rather_than_guessing(self) -> None:
+        finding = _finding(plan_one(_measured(), _scenario(), provision_s=None), "provision_stage")
+        assert finding.verdict is Verdict.OK
+        assert "never observed the boundary" in finding.detail
+        assert "missing_stages" in (finding.recommendation or "")
+
+    def test_the_bounded_policy_term_is_named_as_bounded(self) -> None:
+        # force-desired raises DesiredInstanceCount directly, so the policy's own
+        # detection lag is bypassed and bounded from the deployed alarm's periods and
+        # cooldown rather than measured. Summing it silently would launder the bound.
+        finding = _finding(
+            plan_one(
+                _measured(t_total_s=420.0), _scenario(), provision_s=180.0, policy_bound_s=60.0
+            ),
+            "provision_stage",
+        )
+        assert "60s is the policy's detection lag" in finding.detail
+        assert "BOUNDED" in finding.detail
+
+    def test_a_wholly_stated_lag_is_not_reported_as_measured(self) -> None:
+        # `provision_s is None` happens for two opposite reasons: the lag was measured
+        # whole, or it was stated whole via --assume-t-total. Reporting the second as a
+        # measurement launders a command-line argument into an observation, which is the
+        # one thing this finding exists to prevent.
+        finding = _finding(
+            plan_one(_measured(t_total_measured=False), _scenario()), "provision_stage"
+        )
+        assert finding.verdict is Verdict.WARN
+        assert "stated whole, not measured" in finding.detail
+        assert "tts-bench ttotal" in (finding.recommendation or "")
+
+
+class TestFindingOrder:
+    def test_findings_are_ordered_by_what_invalidates_what(self) -> None:
+        # An untrustworthy measurement makes the rest moot, an infeasible SLO makes the
+        # fleet size irrelevant, and a threshold in the wrong units makes the policy
+        # wrong whatever the numbers say. Pinned because the report prints them in this
+        # order and a reader stops at the first thing that matters.
         plan = plan_one(_measured(), _scenario())
-        assert "upper bound" in _finding(plan, "fleet_cost").detail
+        assert [f.name for f in plan.findings] == [
+            "measurement_trust",
+            "curve_repeatability",
+            "slo_budget",
+            "invocation_ceiling",
+            "queue_depth",
+            "threshold_units",
+            "surge_survival",
+            "scale_in_safety",
+            "fleet_cost",
+            "provision_stage",
+        ]
+
+    def test_every_finding_is_emitted_on_every_plan(self) -> None:
+        # Silence and a pass are different claims. A finding that dropped out when its
+        # inputs were missing would read as OK, which is what SUPPRESSED is for.
+        bare = plan_one(
+            _measured(
+                frozen=False,
+                unbounded_queue=None,
+                runs_contributing=1,
+                q_max_bracketed=False,
+                cw_units_ratio_by_rung={},
+                ladder_p95_ms={},
+                t_total_measured=False,
+            ),
+            _scenario(),
+        )
+        assert len(bare.findings) == 10
+        assert all(f.detail for f in bare.findings)
 
 
 class TestTTotalStages:
-    def test_transferable_is_the_total_less_the_provision(self) -> None:
-        assert _stages().transferable_s == pytest.approx(240.0)
+    def test_the_planning_lag_adds_the_bounded_policy_term(self) -> None:
+        # Production scales out through the policy, not through a capacity call, so the
+        # measured half alone under-states what a surge has to be absorbed across. The
+        # two stay separate on the artifact and are added exactly once, here.
+        assert _stages(policy_bound_s=60.0).plan_total_s == pytest.approx(480.0)
 
-    def test_an_unobserved_provision_leaves_the_total_whole(self) -> None:
-        # Removing an unknown is not a subtraction we can do, so the whole lag is
-        # treated as transferable rather than silently halved.
-        stages = _stages(provision_s=None)
-        assert stages.transferable_s == pytest.approx(420.0)
-        assert not stages.provision_measured
+    def test_no_policy_term_leaves_the_measured_total_alone(self) -> None:
+        assert _stages().plan_total_s == pytest.approx(420.0)
 
-    def test_substituting_a_provision_time(self) -> None:
-        assert _stages().with_provision_s(60.0) == pytest.approx(300.0)
-        assert _stages().with_provision_s(600.0) == pytest.approx(840.0)
-
-    def test_substituting_into_no_total_is_refused(self) -> None:
-        with pytest.raises(PlannerError, match="no measured T_total"):
-            _stages(total_s=None).with_provision_s(60.0)
-
-    def test_a_negative_provision_is_rejected(self) -> None:
-        with pytest.raises(ValueError, match="non-negative"):
-            _stages().with_provision_s(-1.0)
+    def test_no_measured_total_has_no_planning_lag(self) -> None:
+        assert _stages(total_s=None, policy_bound_s=60.0).plan_total_s is None
 
     def test_reads_the_provision_stage_from_an_artifact(self) -> None:
         stages = TTotalStages.from_artifact(
             {
                 "t_total_s": 420.0,
-                "trigger": "drive-load",
+                "policy_lag_bound_s": 60.0,
+                "trigger": "force-desired",
                 "config_slug": SLUG,
                 "run_id": "r1",
                 "durations": [
-                    {"from": "load_applied", "to": "metric_published", "seconds": 20.0},
+                    {"from": "in_service", "to": "traffic_recovered", "seconds": 20.0},
                     {"from": PROVISION_FROM_STAGE, "to": PROVISION_TO_STAGE, "seconds": 180.0},
                 ],
             }
         )
         assert stages.provision_s == pytest.approx(180.0)
-        assert stages.transferable_s == pytest.approx(240.0)
+        assert stages.plan_total_s == pytest.approx(480.0)
+        assert stages.provision_measured
         assert stages.config_slug == SLUG
+        assert stages.trigger == "force-desired"
+
+    def test_the_bound_is_read_from_the_artifact_not_a_constant(self) -> None:
+        # The deployed policy's periods and cooldown are what the number came from, so a
+        # plan built later must use the bound that applied when the lag was measured --
+        # importing today's constant would silently re-date the measurement.
+        assert TTotalStages.from_artifact({"t_total_s": 100.0}).policy_bound_s is None
+        assert TTotalStages.from_artifact(
+            {"t_total_s": 100.0, "policy_lag_bound_s": 45.0}
+        ).plan_total_s == pytest.approx(145.0)
+
+    def test_a_duration_for_another_stage_pair_is_ignored(self) -> None:
+        stages = TTotalStages.from_artifact(
+            {
+                "t_total_s": 420.0,
+                "durations": [{"from": "in_service", "to": "traffic_recovered", "seconds": 20.0}],
+            }
+        )
+        assert stages.provision_s is None
+        assert not stages.provision_measured
 
     def test_an_artifact_missing_everything_still_parses(self) -> None:
         # A run that observed half the timeline is still the best information
@@ -672,10 +1003,24 @@ class TestTTotalStages:
         stages = TTotalStages.from_artifact({})
         assert stages.total_s is None
         assert stages.provision_s is None
-        assert stages.transferable_s is None
+        assert stages.plan_total_s is None
+        assert stages.missing_stages == ()
+
+    def test_malformed_durations_do_not_raise(self) -> None:
+        for durations in ("not a list", [None], [{"from": PROVISION_FROM_STAGE}], [[]]):
+            stages = TTotalStages.from_artifact({"t_total_s": 1.0, "durations": durations})
+            assert stages.provision_s is None
 
     def test_a_bounded_total_is_carried_through(self) -> None:
         assert TTotalStages.from_artifact({"t_total_s": 300.0, "t_total_bounded": True}).bounded
+
+    def test_missing_stages_are_carried_through(self) -> None:
+        # weights_fetched is never emitted by kokoro's serve.py, so this list is
+        # non-empty on every real artifact and the provision finding cites it.
+        stages = TTotalStages.from_artifact(
+            {"t_total_s": 300.0, "missing_stages": ["weights_fetched"]}
+        )
+        assert stages.missing_stages == ("weights_fetched",)
 
 
 class TestAssertPairable:
@@ -705,190 +1050,105 @@ class TestAssertPairable:
         assert SLUG in str(excinfo.value)
         assert "g6xlarge-abcd1234" in str(excinfo.value)
 
-
-class TestPlanSweep:
-    def test_one_row_per_pair(self) -> None:
-        rows = plan_sweep(
-            _measured(),
-            _scenario(),
-            _stages(),
-            provision_sweep_s=[60.0, 300.0],
-            k_sweep=[1.0, 2.0, 3.0],
-        )
-        assert len(rows) == 6
-        assert {(row.provision_s, row.k) for row in rows} == {
-            (p, k) for p in (60.0, 300.0) for k in (1.0, 2.0, 3.0)
-        }
-
-    def test_no_sweep_plans_once_against_the_measured_lag(self) -> None:
-        rows = plan_sweep(_measured(t_total_s=300.0), _scenario(), _stages())
-        assert len(rows) == 1
-        assert rows[0].provision_s is None
-        assert not rows[0].provision_assumed
-        assert rows[0].t_total_s == pytest.approx(300.0)
-
-    def test_a_longer_provision_never_shortens_the_lag(self) -> None:
-        rows = plan_sweep(
-            _measured(), _scenario(), _stages(), provision_sweep_s=DEFAULT_PROVISION_SWEEP_S
-        )
-        lags = [row.t_total_s for row in rows]
-        assert lags == sorted(lags)
-        # And each is the transferable half plus what was stated.
-        for row in rows:
-            assert row.t_total_s == pytest.approx(240.0 + (row.provision_s or 0.0))
-
-    def test_a_higher_k_never_raises_the_target(self) -> None:
-        rows = plan_sweep(_measured(), _scenario(), _stages(), k_sweep=DEFAULT_K_SWEEP)
-        targets = [row.plan.c_target for row in rows]
-        assert targets == sorted(targets, reverse=True)
-
-    def test_a_higher_k_never_shrinks_the_fleet(self) -> None:
-        rows = plan_sweep(_measured(), _scenario(), _stages(), k_sweep=DEFAULT_K_SWEEP)
-        fleets = [row.plan.peak_instances for row in rows]
-        assert fleets == sorted(fleets)
-
-    def test_the_swept_k_overrides_the_scenario(self) -> None:
-        rows = plan_sweep(_measured(), _scenario(growth_factor_k=2.0), _stages(), k_sweep=[5.0])
-        assert rows[0].plan.scenario.growth_factor_k == 5.0
-
-    def test_a_substituted_lag_is_marked_an_assumption(self) -> None:
-        # The whole point of the sweep: a row built on a stated provision time must
-        # not pass for a measured one.
-        rows = plan_sweep(_measured(), _scenario(), _stages(), provision_sweep_s=[60.0])
-        note = rows[0].plan.measured.provenance.note
-        assert "substituted, not measured" in note
-        assert _finding(rows[0].plan, "provision_stage").detail.startswith("T_total assumes a 60s")
-
-    def test_sweeping_the_measured_provision_time_is_still_an_assumption(self) -> None:
-        # 180s is what was measured, so substituting it reproduces the total exactly.
-        # The row is nonetheless built on a *stated* provision time -- it is labelled
-        # `provision_assumed` and its finding says "assumes a 180s provision stage" --
-        # so a provenance still reading "measured" would have one plan describe its own
-        # input two ways. Numeric equality is not evidence that no claim changed.
-        rows = plan_sweep(_measured(), _scenario(), _stages(), provision_sweep_s=[180.0])
-        assert rows[0].t_total_s == pytest.approx(420.0)
-        assert rows[0].provision_assumed
-        assert "substituted, not measured" in (rows[0].plan.measured.provenance.note or "")
-
-    def test_the_measured_row_says_the_lag_is_this_accounts(self) -> None:
-        rows = plan_sweep(_measured(), _scenario(), _stages())
-        finding = _finding(rows[0].plan, "provision_stage")
-        assert finding.verdict is Verdict.OK
-        assert "as measured" in finding.detail
-        assert "--provision-s" in (finding.recommendation or "")
-
-    def test_a_wholly_stated_lag_is_not_reported_as_measured(self) -> None:
-        # `provision_s is None` means "nothing was substituted", which happens for two
-        # opposite reasons: the lag was measured whole, or it was stated whole via
-        # --assume-t-total. Reporting the second as "used exactly as measured" launders
-        # a command-line argument into an observation.
-        stated = _measured(t_total_measured=False)
-        finding = _finding(plan_one(stated, _scenario()), "provision_stage")
-        assert finding.verdict is Verdict.WARN
-        assert "stated whole, not measured" in finding.detail
-        assert "tts-bench ttotal" in (finding.recommendation or "")
-
-    def test_a_swept_row_reports_the_substitution_whatever_the_lags_origin(self) -> None:
-        # Once a provision time is substituted, that is the fact worth reporting -- the
-        # stage breakdown it was substituted into came from a measurement either way.
-        rows = plan_sweep(
-            _measured(t_total_measured=False), _scenario(), _stages(), provision_sweep_s=[60.0]
-        )
-        finding = _finding(rows[0].plan, "provision_stage")
-        assert finding.verdict is Verdict.OK
-        assert "assumes a 60s" in finding.detail
-
-    def test_a_sweep_without_stages_is_refused(self) -> None:
-        with pytest.raises(PlannerError, match="needs the measured stage breakdown"):
-            plan_sweep(_measured(), _scenario(), None, provision_sweep_s=[60.0])
-
-    def test_a_sweep_with_no_measured_total_is_refused(self) -> None:
-        with pytest.raises(PlannerError, match="no measured T_total"):
-            plan_sweep(_measured(), _scenario(), _stages(total_s=None), provision_sweep_s=[60.0])
-
-    def test_the_ceiling_verdict_holds_across_every_row(self) -> None:
-        # Infeasibility comes from the SLO and p95 service, neither of which the sweep
-        # varies -- so it must not appear to depend on the row.
-        rows = plan_sweep(
-            _measured(),
-            _scenario(ttfab_slo_ms=70_000),
-            _stages(),
-            provision_sweep_s=[60.0, 600.0],
-            k_sweep=[1.0, 3.0],
-        )
-        assert all(row.plan.infeasible for row in rows)
+    def test_the_refusal_says_how_to_proceed(self) -> None:
+        with pytest.raises(PlannerError, match="--allow-config-mismatch"):
+            assert_pairable(_measured(), _stages(config_slug="g6xlarge-abcd1234"))
 
 
 class TestMeasuredFromArtifacts:
-    def _report(self, **overrides: Any) -> CMaxReport:
+    """Joining the two artifacts, which is the only place the measured variables meet."""
+
+    def _step(self, **overrides: Any) -> StepSummary:
+        fields: dict[str, Any] = {
+            "run_index": 0,
+            "step_index": 0,
+            "concurrency": 1,
+            "achieved_rps": 9.0,
+            "completed": 100,
+            "ok": 100,
+            "chars": 2500,
+            "ttfab_p95_ms": LADDER[1],
+            "concurrency_mean": 1.0,
+            "meets_slo": True,
+            "saturated": False,
+            "settled": True,
+            "usable": True,
+        }
+        fields.update(overrides)
+        return StepSummary(**fields)
+
+    def _report(self, **overrides: Any) -> QMaxReport:
         fields: dict[str, Any] = {
             "model_name": "kokoro-82m",
             "endpoint": "speech-kokoro-82m",
             "instance_type": "ml.g5.xlarge",
-            "run_id": "cmax123",
-            "c_max_curve": {300: C_MAX},
-            "curve_spread": {300: 0.05},
-            "runs_contributing": {300: 3},
-            "runs": 3,
-            "hold_s": 240.0,
-            "measure_window_s": 120.0,
-            "knees": [
-                KneePoint(
-                    ttfab_budget_ms=300,
-                    concurrency=C_MAX,
-                    offered_rps=14.8,
-                    p95_ttfab_ms=280.0,
-                    step_index=2,
-                    bracketed=True,
-                )
-            ],
+            "run_id": "qmax123",
+            "slo_ms": 3000,
+            "q_max": Q_MAX,
+            "q_max_per_run": (Q_MAX, Q_MAX),
+            "q_max_bracketed": True,
+            "ttfab_p95_at_q_max_ms": LADDER[Q_MAX],
             "s_mean_s": S_MEAN_S,
             "s_p95_s": S_P95_S,
             "frozen": True,
+            "unbounded_queue": True,
             "instance_counts_observed": (1,),
             "transport": "bidi",
+            "runs": 2,
+            "hold_s": 120.0,
+            "measure_window_s": 90.0,
             "deployed_config": {
                 "instance_type": "ml.g5.xlarge",
                 "image_digest": DIGEST,
                 "container_env": {},
             },
             "steps": [
-                StepSummary(
-                    run_index=0,
-                    step_index=0,
-                    target_concurrency=1.0,
-                    offered_rps=9.0,
-                    achieved_rps=9.0,
-                    completed=100,
-                    ok=100,
-                    chars_per_hour=810000.0,
-                    saturated=False,
-                    settled=True,
-                    usable=True,
-                )
+                self._step(step_index=index, concurrency=rung, ttfab_p95_ms=p95)
+                for index, (rung, p95) in enumerate(LADDER.items())
             ],
         }
         fields.update(overrides)
-        return CMaxReport(**fields)
+        return QMaxReport(**fields)
 
-    def test_joins_a_curve_and_a_lag(self) -> None:
+    def test_joins_a_ladder_and_a_lag(self) -> None:
         measured = measured_from_artifacts(self._report(), _stages())
+        assert measured.q_max == Q_MAX
+        assert measured.slo_ms == 3000
         assert measured.t_total_s == pytest.approx(420.0)
-        assert measured.c_max_curve == {300: C_MAX}
         assert measured.provenance.origin is Origin.MEASURED
+        assert measured.t_total_measured
+
+    def test_the_bounded_policy_term_reaches_the_lag_the_plan_uses(self) -> None:
+        # The join is where the two terms are summed, so this is what the plan's
+        # cooldowns and shed probability are computed against.
+        measured = measured_from_artifacts(self._report(), _stages(policy_bound_s=60.0))
+        assert measured.t_total_s == pytest.approx(480.0)
+        note = measured.provenance.note or ""
+        assert "60s policy lag" in note
+        assert "not measured" in note
+
+    def test_the_ladder_survives_the_join(self) -> None:
+        # ttotal's recovery test reads a *pair* of rungs off this, so a plan artifact
+        # read back later must not have to re-run a 40-minute ladder to answer it.
+        measured = measured_from_artifacts(self._report(), _stages())
+        assert measured.ladder_p95_ms == LADDER
+        assert measured.ttfab_p95_at_c1_ms == pytest.approx(LADDER[1])
 
     def test_carries_the_spread_through_to_the_planner(self) -> None:
-        # Without this the planner cannot tell a repeatable C_max from a single
-        # sample, and every fleet size divides by C_max.
-        measured = measured_from_artifacts(self._report(), _stages())
-        assert measured.curve_spread == {300: 0.05}
-        assert measured.runs_contributing == {300: 3}
-        assert measured.runs_total == 3
+        # Without this the planner cannot tell a repeatable Q_max from a single sample,
+        # and both thresholds are fractions of Q_max.
+        measured = measured_from_artifacts(
+            self._report(q_max=40, q_max_per_run=(40, 50)), _stages()
+        )
+        assert measured.q_max == 40
+        assert measured.q_max_spread == pytest.approx(0.25)
+        assert measured.runs_contributing == 2
 
     def test_carries_chars_per_request_for_pricing(self) -> None:
-        # 810000 chars/hour at 9 rps -> 25 chars/request.
-        measured = measured_from_artifacts(self._report(), _stages())
-        assert measured.chars_per_request == pytest.approx(25.0)
+        # 2500 chars across 100 completions -> 25 per request.
+        assert measured_from_artifacts(
+            self._report(), _stages()
+        ).chars_per_request == pytest.approx(25.0)
 
     def test_refuses_a_mismatched_pair(self) -> None:
         with pytest.raises(PlannerError, match="cannot pair"):
@@ -915,7 +1175,7 @@ class TestMeasuredFromArtifacts:
 
     def test_the_origin_stays_measured_when_only_the_lag_was_stated(self) -> None:
         # A flag of its own rather than `origin`, which describes the object as a whole:
-        # C_max and S were measured here, so flipping the origin to ASSUMPTION would
+        # Q_max and S were measured here, so flipping the origin to ASSUMPTION would
         # disown two real measurements to disclaim one stated number.
         measured = measured_from_artifacts(
             self._report(), _stages(total_s=None), assume_t_total_s=240.0
@@ -929,14 +1189,17 @@ class TestMeasuredFromArtifacts:
         assert measured.t_total_measured
 
     def test_a_bounded_total_says_it_is_a_floor(self) -> None:
-        measured = measured_from_artifacts(self._report(), _stages(bounded=True))
-        assert "floor" in (measured.provenance.note or "")
+        # A bounded total stops at in_service, so it *under*-reports the lag -- the
+        # dangerous direction, since the plan absorbs a surge across it.
+        assert "floor" in (
+            measured_from_artifacts(self._report(), _stages(bounded=True)).provenance.note or ""
+        )
 
-    def test_the_curves_own_note_survives_the_join(self) -> None:
+    def test_the_ladders_own_note_survives_the_join(self) -> None:
         # Both notes, not a summary of one. A `Measured` read back out of a plan
-        # artifact is all a reader has, so an unfrozen curve joined to an assumed lag
-        # must still say the curve was unfrozen -- that caveat cannot be reconstructed
-        # from `origin`, and it is the one that invalidates C_max outright.
+        # artifact is all a reader has, so an unfrozen ladder joined to an assumed lag
+        # must still say the ladder was unfrozen -- that caveat cannot be reconstructed
+        # from `origin`, and it is the one that invalidates Q_max outright.
         report = self._report(
             frozen=False,
             provenance=Provenance(origin=Origin.MEASURED, note="WITHOUT the autoscaling freeze"),
@@ -946,8 +1209,20 @@ class TestMeasuredFromArtifacts:
         assert "WITHOUT the autoscaling freeze" in note
         assert "stated, not measured" in note
 
+    def test_the_preconditions_survive_the_join(self) -> None:
+        # measurement_trust reads all three off the joined object, so a ladder run
+        # without a precondition has to stay identifiable as such after the join.
+        measured = measured_from_artifacts(
+            self._report(frozen=False, unbounded_queue=False, instance_counts_observed=(1, 2)),
+            _stages(),
+        )
+        assert not measured.frozen
+        assert measured.unbounded_queue is False
+        assert measured.instance_counts_observed == (1, 2)
+        assert not measured.trustworthy
+
     def test_pairing_can_be_skipped_when_the_lag_was_stated(self) -> None:
-        # A stated lag carries no fingerprint, so checking one against the curve's
+        # A stated lag carries no fingerprint, so checking one against the ladder's
         # would report a mismatch where there is nothing to mismatch.
         measured = measured_from_artifacts(
             self._report(),
@@ -957,3 +1232,11 @@ class TestMeasuredFromArtifacts:
         )
         assert measured.t_total_s == pytest.approx(300.0)
         assert "stated, not measured" in (measured.provenance.note or "")
+
+    def test_the_joined_measurement_plans(self) -> None:
+        # End to end through the seam the CLI uses: two artifacts in, a plan out, at
+        # the SLO the ladder recorded.
+        measured = measured_from_artifacts(self._report(), _stages())
+        plan = plan_one(measured, _scenario(ttfab_slo_ms=measured.slo_ms))
+        assert plan.c_scale_max == pytest.approx(C_SCALE_MAX)
+        assert plan.queue_max_depth == Q_MAX

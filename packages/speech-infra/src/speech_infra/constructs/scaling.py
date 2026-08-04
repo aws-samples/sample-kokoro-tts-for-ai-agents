@@ -117,7 +117,7 @@ class EndpointAutoscaling(Construct):
 
         if model_config.emergency_step_enabled:
             # For load that arrives faster than target tracking converges: it adds
-            # roughly one step per cooldown, so a sudden multiple of C_target waits
+            # roughly one step per cooldown, so a sudden multiple of C_scale_max waits
             # several cooldowns for capacity it needed at once. Scale-out only — the
             # step policy above owns scale-in, and two policies removing instances
             # would race.

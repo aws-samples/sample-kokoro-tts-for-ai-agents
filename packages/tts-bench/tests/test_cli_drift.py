@@ -172,7 +172,7 @@ class TestDriftCommand:
         assert "No drift" in result.output
 
     def test_a_clean_account_points_at_the_measurement(self, runner: CliRunner) -> None:
-        # drift is the preflight for cmax, and saying so is what makes the sequence
+        # drift is the preflight for qmax, and saying so is what makes the sequence
         # discoverable. Only on a clean account: with findings on screen, the next step
         # is to fix them, not to start a 45-minute measurement against them.
         result = _run_drift(
@@ -180,7 +180,7 @@ class TestDriftCommand:
             _fake_appscaling(targets=_baseline_targets(), policies=[]),
             _fake_cloudwatch(metrics=[], alarms=[]),
         )
-        assert "Next: tts-bench cmax" in result.output
+        assert "Next: tts-bench qmax" in result.output
         assert "--require-frozen" in result.output
 
     def test_findings_do_not_point_at_the_measurement(self, runner: CliRunner) -> None:

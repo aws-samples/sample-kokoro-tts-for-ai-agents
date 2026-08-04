@@ -23,20 +23,10 @@ from shared.capacity import (
     w_max_for_slo,
 )
 
-#: Kokoro-82M on ml.g5.xlarge, bidi transport, from
-#: artifacts/cmax-kokoro-82m-bidi-g5xlarge-139b9068.json. The numbers the 3s SLO was
-#: actually reasoned about, so a regression here means the worked example moved.
-KOKORO_S_MEAN_S = 0.10602401316328536
-KOKORO_S_P95_S = 0.1645768812391907
-
-#: Service time from the latency-vs-queue-position fit on the same artifact:
-#: TTFAB(q) = 33.9ms + (q+1) x 57.5ms, R^2 0.9998 over 32,960 OK events. Distinct
-#: from KOKORO_S_MEAN_S, which conflates 34ms of client RTT with 59ms of service --
-#: the reason the queueing math takes this number and not that one.
+# Synthetic round numbers for arithmetic verification. Not a measurement — do not paste into config.py.
+KOKORO_S_MEAN_S = 0.106
+KOKORO_S_P95_S = 0.165
 KOKORO_SERVICE_S = 0.0575
-
-#: Q_max = W_max / service at the 3s SLO, and T_total from the 07-31 activity
-#: history (3m51s). The pair the worked examples below use.
 KOKORO_Q_MAX = 50.0
 KOKORO_T_TOTAL_S = 231.0
 

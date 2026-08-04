@@ -18,8 +18,9 @@ from tts_inference.types import TTSModelName
 #: Note the per-GPU arithmetic, because it is the whole question behind a multi-GPU
 #: container: ``ml.g6.12xlarge`` has four L4s at $1.438/GPU-hr against $1.1267 for one
 #: on an ``ml.g6.xlarge`` — 5.1x the price of a single-GPU box. So a container driving
-#: four GPUs has to beat ``4 x C_max`` just to break even on unit cost. What it buys
-#: instead is one ``T_total`` per four GPUs of capacity rather than four.
+#: four GPUs has to serve more than 5x the throughput of a single-GPU one just to break
+#: even on unit cost. What it buys instead is one ``T_total`` per four GPUs of capacity
+#: rather than four, and a fleet that steps in units of four.
 INSTANCE_COST_PER_HOUR: dict[str, float] = {
     "ml.g5.xlarge": 1.408,
     "ml.g5.2xlarge": 2.816,
@@ -87,15 +88,17 @@ def cost_per_m_chars(
 
     ``chars_per_hr`` is the throughput of the **whole fleet**, not of one
     instance, and ``instance_count`` scales only the cost side. Deliberately no
-    linear-scaling assumption: a planned fleet runs at ``derate / k``
-    utilization, not saturated, so its useful throughput is well below
+    linear-scaling assumption: a planned fleet is sized to scale out at
+    ``C_scale_max``, below ``Q_max``, so it runs with queue headroom rather than
+    saturated and its useful throughput is well below
     ``instance_count x saturated_per_instance``. Passing per-instance throughput
     with ``instance_count=N`` would divide by an ``N`` that never appears in the
     numerator's reality and report the saturated unit cost for an idle fleet.
 
     ``calculate_cost`` measures one instance and passes ``instance_count=1``;
-    the planner passes the derated fleet throughput alongside ``N_peak``, which
-    is why the surge reserve shows up as a higher unit cost.
+    the planner passes the fleet throughput at ``C_scale_max`` alongside
+    ``N_peak``, which is why reserving surge headroom shows up as a higher unit
+    cost.
 
     Returns:
         ``inf`` when throughput is zero — an endpoint that produces nothing has
@@ -126,13 +129,13 @@ def find_saturation_concurrency(
     more concurrency yields < 20% improvement.
 
     .. warning::
-        Not suitable for capacity planning; use ``tts_bench.cmax`` instead.
-        Two reasons. The ladder is geometric, so it cannot resolve a ``C_max``
-        of 1 from 2 — on Kokoro (capacity 1) throughput pins at every level, the
-        20% plateau test trips immediately, and this returns 4. And the burst is
-        closed-loop: each worker waits for its own response, so the offered rate
-        is set by the server rather than by us, which is exactly the coordinated
-        omission that hides a latency knee.
+        Not suitable for capacity planning; use ``tts_bench.qmax`` instead. It
+        answers the wrong question: throughput plateaus at the point the server
+        is saturated, whereas what bounds the SLO is the *wait*, which keeps
+        growing long after throughput has flattened. On Kokoro the plateau trips
+        at level 4 while requests still reach first byte in 300ms — nowhere near
+        the concurrency where the 3s promise breaks. ``qmax`` steps concurrency
+        against the SLO itself, which is the quantity a scaling policy needs.
     """
     prev_throughput = 0.0
     best_level = 1

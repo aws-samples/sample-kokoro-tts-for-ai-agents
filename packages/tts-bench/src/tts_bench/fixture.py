@@ -1,14 +1,26 @@
 """Freeze autoscaling and pin instance count for the duration of a benchmark.
 
-``C_max`` is a *per-instance* quantity. If the fleet grows mid-run, achieved
-throughput rises for a reason unrelated to the latency knee, and the saturation
-marker (achieved < 0.95 x offered) never trips — the run reports a ``C_max`` that
-is really ``N x C_max``, with no error and no warning. That number then
-propagates into ``C_target``, ``N_peak``, queue depth, and fleet cost.
+``Q_max`` is a *per-instance* quantity, and the ladder holds ``N`` requests
+outstanding against whatever fleet is behind the endpoint. If the fleet grows
+mid-run, those ``N`` requests spread across more instances, so each one queues
+less and the ladder keeps passing the SLO at rungs a single instance could not
+serve — the run reports a ``Q_max`` that is really ``N_instances x Q_max``, with
+no error and no warning. Both scaling thresholds are fractions of that number,
+and so is the container's admission bound.
+
+Nothing in the measurement can detect it afterwards. Closed-loop holds ``N``
+exactly by construction, which is what makes the ladder trustworthy, and is also
+why a larger fleet shows up as *better latency* rather than as saturation. So
+freezing is enforced rather than advised: see ``require_frozen``, and
+``instance_counts_observed`` on the artifact as the after-the-fact check.
 
 Two live scaling policies in this account make that reachable today
-(``speech-orpheus-3b`` has ``max_capacity=4``), so freezing is enforced rather
-than advised: see ``require_frozen``.
+(``speech-orpheus-3b`` has ``max_capacity=4``).
+
+The same freeze covers ``T_total``. That run forces a scale-out itself, and the
+deployed policy would otherwise fire during it and add instances from a second,
+untracked cause — suspension stops Application Auto Scaling but not our own
+``UpdateEndpointWeightsAndCapacities``, which is exactly the arrangement wanted.
 
 Freezing is deliberately non-destructive. ``RegisterScalableTarget`` requires
 only ``ServiceNamespace``/``ResourceId``/``ScalableDimension``, so
@@ -292,8 +304,9 @@ def freeze(
     """Suspend scaling, pin capacity, and verify. Returns state for :func:`thaw`.
 
     Args:
-        pin_to: Instance count to hold for the run. ``1`` for ``C_max``, since
-            the measurement is per-instance.
+        pin_to: Instance count to hold for the run. ``1`` for ``Q_max``, since
+            the measurement is per-instance, and ``1`` for ``T_total`` too — that
+            run raises the count itself and needs a known starting point.
 
     Returns:
         The state captured *before* any change, suitable for :func:`thaw`.
@@ -412,8 +425,9 @@ def require_frozen(
 ) -> EndpointFixture:
     """Assert the endpoint cannot grow mid-run. Raises rather than warns.
 
-    A warning would be ignored and the resulting ``C_max`` would look normal, so
-    this is the enforcement point behind ``cmax --require-frozen``.
+    A warning would be ignored and the resulting ``Q_max`` would look normal — a
+    larger fleet reads as better latency, not as an error — so this is the
+    enforcement point behind ``qmax --require-frozen``.
 
     Raises:
         FixtureError: If scale-out is active or the instance count is wrong.
@@ -439,6 +453,84 @@ def require_frozen(
             + ". Run with --no-require-frozen only if you accept a fleet-wide number."
         )
     return state
+
+
+#: Container environment keys that bound how deep the admission queue may get. A
+#: ``Q_max`` ladder is supposed to find the depth at which the *SLO* breaks, so any
+#: of these being set means the container sheds first and the ladder measures the
+#: bound instead. Named individually rather than pattern-matched: a preflight that
+#: refuses on anything queue-shaped would block runs for knobs it does not
+#: understand, and this list is checked against ``containers/*/serve.py``.
+QUEUE_DEPTH_ENV_KEYS: tuple[str, ...] = ("MAX_QUEUE_DEPTH", "MAX_PENDING_REQUESTS")
+
+
+def require_unbounded_queue(
+    endpoint_name: str,
+    *,
+    region: str = "us-east-1",
+    variant: str = DEFAULT_VARIANT,
+    sagemaker: BaseClient | None = None,
+    deployed: DeployedConfig | None = None,
+) -> DeployedConfig:
+    """Assert the container will queue rather than shed. Raises rather than warns.
+
+    ``Q_max`` is *defined* as the concurrency at which p95 first-byte time crosses the
+    SLO. A container with a depth bound stops accepting work before that point, so the
+    ladder finds the bound and reports it as a capacity number — and it looks entirely
+    normal, since the rejections land in ``outcome_counts`` rather than in the latency
+    percentiles the pass/fail line reads.
+
+    Machine-checked rather than remembered: ``DeployedConfig`` already reads
+    ``container_env`` off ``DescribeModel``, so the same call that fingerprints the run
+    answers this.
+
+    This is the *measurement* precondition, and it is the opposite of what we want in
+    production — enforcing ``Q_max`` at the instance is the point of measuring it. The
+    order matters: measure unbounded, then deploy the bound.
+
+    Args:
+        deployed: A fingerprint already read for this run, to avoid a second round of
+            three ``describe_*`` calls. Read fresh when omitted.
+
+    Returns:
+        The configuration checked, so a caller can record it.
+
+    Raises:
+        FixtureError: If any key in :data:`QUEUE_DEPTH_ENV_KEYS` is set to a non-zero
+            value. ``0`` and unset both pass — a container reading ``0`` as "no bound"
+            is the convention in ``streaming_proxy.py``, and refusing it would block a
+            valid run.
+    """
+    config = deployed or describe_deployed_config(
+        endpoint_name, region=region, variant=variant, sagemaker=sagemaker
+    )
+
+    bounds: list[str] = []
+    for key in QUEUE_DEPTH_ENV_KEYS:
+        raw = config.container_env.get(key)
+        if raw is None:
+            continue
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            # Unparseable is not a pass. The container's own parse may well succeed
+            # where ours did not, and guessing which way it went is how a bounded
+            # queue gets measured as an unbounded one.
+            bounds.append(f"{key}={raw!r} (unparseable, so its effect is unknown)")
+            continue
+        if value != 0:
+            bounds.append(f"{key}={value}")
+
+    if bounds:
+        raise FixtureError(
+            f"{endpoint_name} bounds its admission queue ({', '.join(bounds)}), so a "
+            "Q_max ladder would measure that bound rather than the concurrency at which "
+            "the SLO breaks: the container starts refusing work before latency ever "
+            "crosses the line. Measure Q_max against an unbounded queue first, then "
+            "deploy the bound. Run with --no-require-unbounded-queue to record the "
+            "number anyway, marked as measured against a bounded queue."
+        )
+    return config
 
 
 #: Service Quotas code for "ml.<type> for endpoint usage". One quota per instance
@@ -620,7 +712,7 @@ _SLUG_DIGEST_CHARS = 8
 class DeployedConfig:
     """What a benchmark was actually measured against.
 
-    ``C_max``, ``S`` and ``T_total`` are properties of a *configuration*, not of a
+    ``Q_max``, ``S`` and ``T_total`` are properties of a *configuration*, not of a
     model. Three things move them, and all three are read here:
 
     * ``instance_type`` — the GPU. Also the GPU *count*: a container driving four
@@ -629,8 +721,8 @@ class DeployedConfig:
     * ``image_digest`` — the serving code. CDK tags container assets by a content
       hash of the build context, so this changes exactly when the container does,
       which is what makes an admission queue or a batching change visible here.
-    * ``container_env`` — the knobs. ``MAX_REQUEST_AGE_S`` and a future queue depth
-      are set this way, and either would move the knee without touching the image.
+    * ``container_env`` — the knobs. ``MAX_REQUEST_AGE_S`` and ``MAX_QUEUE_DEPTH``
+      are set this way, and either would bound the wait without touching the image.
 
     Recorded on every artifact and checked before one is replayed; see
     :meth:`assert_matches`.
@@ -678,14 +770,14 @@ class DeployedConfig:
         if self.instance_type != other.instance_type:
             out.append(
                 f"instance_type: artifact {self.instance_type!r}, deployed "
-                f"{other.instance_type!r} — S and TTFAB are properties of the GPU, so "
-                "the whole knee moves"
+                f"{other.instance_type!r} — S and TTFAB are properties of the GPU, and "
+                "Q_max is W_max/S, so every number moves"
             )
         if self.image_digest != other.image_digest:
             out.append(
                 f"image_digest: artifact {_short(self.image_digest)}, deployed "
                 f"{_short(other.image_digest)} — the serving code differs, which can move "
-                "C_max on identical hardware"
+                "Q_max on identical hardware"
             )
         if self.container_env != other.container_env:
             out.append(
@@ -703,9 +795,10 @@ class DeployedConfig:
     ) -> None:
         """Refuse to reuse a measurement taken against a different configuration.
 
-        A hard error rather than a warning: every downstream number — ``C_target``,
-        the fleet size, the queue depth, the cost — is derived from inputs that only
-        hold for the configuration they were measured on, and a warning scrolls past.
+        A hard error rather than a warning: every downstream number — the two scaling
+        thresholds, the fleet size, the queue depth, the cost — is derived from inputs
+        that only hold for the configuration they were measured on, and a warning
+        scrolls past.
 
         Args:
             other: The live configuration, from :func:`describe_deployed_config`.
@@ -855,9 +948,9 @@ def fingerprint_or_registry(
     still honest, since a fallback fingerprint has no image digest and so can never
     silently compare equal to a real one.
 
-    Shared by ``cmax`` and ``ttotal`` rather than owned by either, because a
-    ``C_max`` curve and a ``T_total`` lag are both properties of a configuration and
-    the planner refuses to combine two artifacts that disagree about which one.
+    Shared by ``qmax`` and ``ttotal`` rather than owned by either, because a ``Q_max``
+    and a ``T_total`` are both properties of a configuration and the planner refuses to
+    combine two artifacts that disagree about which one.
     """
     registry_type = registry_instance_type(model)
     try:
@@ -916,8 +1009,18 @@ def require_scalable(
 ) -> EndpointFixture:
     """Assert a scale event is actually possible. The inverse of :func:`require_frozen`.
 
-    ``ttotal`` needs scaling live. Without this check it would drive load for
-    twenty minutes waiting for an event that cannot happen.
+    **Currently has no caller.** ``ttotal`` was its only one and deliberately stopped:
+    the ``force-desired`` trigger raises ``DesiredInstanceCount`` itself under
+    :func:`freeze`, so a live policy is not a precondition for it but a *confound* — the
+    deployed ``> 0.713`` alarm firing mid-run is the best explanation for the 1->4 jump
+    on 2026-07-31. Every check above the quota block therefore demands the very thing
+    that mode suppresses.
+
+    The quota block below is the half that still earns its keep, and it is reachable on
+    its own through :func:`endpoint_quota_headroom`: a forced 1->2 that SageMaker refuses
+    with ``ResourceLimitExceeded`` leaves the endpoint ``InService`` at its old count and
+    surfaces nothing, so a run without that preflight waits out its whole timeout for an
+    instance that was never coming.
 
     Args:
         require_quota_headroom: Instances the account must be able to add. ``None``

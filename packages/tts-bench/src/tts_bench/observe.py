@@ -2,11 +2,14 @@
 
 Four jobs, all strictly read-only:
 
-1. **Join server-side metrics to a load step** (:func:`fetch_window`). ``cmax``
+1. **Join server-side metrics to a load step** (:func:`fetch_window`). ``qmax``
    measures concurrency client-side; AWS publishes ``ConcurrentRequestsPerModel``
-   independently. When the two disagree the bottleneck is in *our* dispatcher, not
-   the server, and the resulting ``C_max`` describes the benchmark rather than the
-   model — see :func:`concurrency_agreement`.
+   independently. Two reasons to fetch both. When the client's figure is the
+   *lower* one the bottleneck is in *our* dispatcher, not the server, and the
+   resulting ``Q_max`` describes the benchmark rather than the model — see
+   :func:`concurrency_agreement`. And the ratio between them is what converts a
+   measured threshold into the units the deployed alarm reads, which is not a
+   constant: see :attr:`~tts_bench.types.QMaxReport.cw_units_ratio_by_rung`.
 2. **Supply ``ttotal``'s timeline** (:func:`first_datapoint_at_or_above`,
    :func:`alarm_transitions`, :func:`scaling_activities`). Each stage boundary is
    a timestamp from a different API; this module fetches them, ``ttotal.py``
@@ -433,7 +436,7 @@ class Agreement:
         return (
             f"client held {self.client_mean:.2f} in flight but the server counted only "
             f"{self.server_mean:.2f}; load is bottlenecked before it reaches the endpoint "
-            "(connection pool, dispatcher, or DNS) — this C_max would describe the benchmark"
+            "(connection pool, dispatcher, or DNS) — this rung would describe the benchmark"
         )
 
 

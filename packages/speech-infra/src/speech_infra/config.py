@@ -39,13 +39,31 @@ class ModelEndpointConfig(BaseModel):
     scaling_metric_namespace: str = "AWS/SageMaker"
     scaling_metric_name: str = "ConcurrentRequestsPerModel"
 
-    #: Per-instance concurrency the scale-out policy tracks. A float because
-    #: ``derate x C_max / k`` rarely lands on an integer: kokoro's measured
-    #: C_max of 1.63 at k=2 gives 0.713, which an int cannot express.
+    #: ``C_scale_max``: the concurrency (queued + executing) at which one instance is
+    #: added. Derived, never chosen — with ``h = max_scaling_per_T_total - 1`` it is
+    #: ``(1 - h) x Q_max``, so the fleet still has ``h`` of queue headroom when the
+    #: request for capacity goes out. A float because that product rarely lands on an
+    #: integer.
+    #:
+    #: **In CloudWatch ``Maximum`` units, not client units.** The policy compares this
+    #: against ``ConcurrentRequestsPerModel`` / ``Maximum`` over 10s, which is a
+    #: different quantity from a client-measured mean in-flight: on one kokoro ladder
+    #: the two differed by 1.35x to 9.8x, shrinking as load rose. The 0.713 that used
+    #: to sit in the kokoro block below was the client figure deployed unconverted, and
+    #: no positive arrival rate satisfies it. ``tts-bench plan`` measures the ratio on
+    #: the same ladder that measures ``Q_max`` and emits this field already converted.
     scaling_target_value: float = 8.0
 
-    #: Concurrency at or below which one instance is removed. Well under
-    #: ``scaling_target_value`` so the two policies do not oscillate around it.
+    #: ``C_scale_min``: the concurrency at or below which one instance is removed, in the
+    #: same CloudWatch units. ``(1 - 2h) x Q_max`` — one surge of *excess* headroom, so
+    #: scale-in needs the load to have really gone rather than merely dipped.
+    #:
+    #: Removing 1 of N instances multiplies per-instance concurrency by ``N/(N-1)``, so
+    #: this is only stable while ``N/(N-1) <= C_scale_max/C_scale_min``, i.e. ``N >= 3``
+    #: at ``h=0.25``. Below that a scale-in lands the survivors at or above
+    #: ``scaling_target_value`` and they scale straight back out; ``plan`` emits a
+    #: ``scale_in_safety`` finding with the smallest safe N, and the long
+    #: ``scale_in_cooldown_s`` damps what remains.
     scale_in_threshold: float = 0.2
 
     #: Cooldowns are deliberately asymmetric. Scaling out costs money and is
@@ -58,31 +76,33 @@ class ModelEndpointConfig(BaseModel):
     #: converge one step at a time. Off until a measurement justifies it.
     emergency_step_enabled: bool = False
 
-    #: End-to-end p95 first-byte SLO, milliseconds: queue wait *plus* service, the
-    #: whole promise to the client. Everything about queueing follows from it —
-    #: ``W_max = SLO - S_p95`` and ``queue_max_depth = Lambda_cap x W_max`` — so it is
-    #: the only queueing number stated here. It replaced a hand-set ``max_added_wait_s``
-    #: that sat beside ``ttfab_budget_ms`` with no relation between them, which is how
-    #: this model came to declare a 20s queue allowance under a 300ms budget: a request
-    #: spending its allowance took 20.2s to first byte while the config claimed 0.3s.
-    #: Two independent fields can disagree with the promise; one derived pair cannot.
+    #: End-to-end p95 first-byte SLO, milliseconds: queue wait *plus* service, the whole
+    #: promise to the client. **One SLO, one number, one field.** Every other queueing
+    #: number descends from it: it is the pass/fail line the ``Q_max`` ladder walks, so
+    #: ``queue_max_depth`` is *defined* by it, and both scaling thresholds are fractions
+    #: of that ``Q_max``.
+    #:
+    #: It is the only latency figure stated here, deliberately. A second one used to sit
+    #: beside it (a 300ms "budget" naming which knee of a multi-budget curve to read), and
+    #: two independent latency fields can disagree with the promise: that pair is how this
+    #: model came to declare a 20s queue allowance under a 300ms budget, where a request
+    #: spending its allowance reached first byte at 20.2s while the config claimed 0.3s.
+    #: The consumers that need a *tighter* threshold than the promise — the
+    #: ``FirstChunkLatencyP95`` alarm, which watches service time on an instance already
+    #: serving and so has spent none of the queue allowance — read the ladder's own N=1
+    #: rung (``ttfab_p95_at_c1_ms``) instead. Measured on every rerun, not hand-set.
     ttfab_slo_ms: int = 3000
 
-    #: The p95 TTFAB budget ``scaling_target_value`` was derived against — the *measured*
-    #: budget the C_max ladder read its knee at, not the promise. Recorded beside the
-    #: target because a target without its budget is unfalsifiable: you cannot tell later
-    #: which knee it was sized from. Deliberately tighter than ``ttfab_slo_ms``, and the
-    #: reason the ``FirstChunkLatencyP95`` alarm reads this rather than the SLO: that
-    #: alarm watches *service* time on an instance already serving, where an in-flight
-    #: request has spent none of the queue allowance, so an SLO-sized threshold would
-    #: only fire once the endpoint was already 10x past where it stops keeping up.
-    ttfab_budget_ms: int = 300
-
-    #: Q_max per instance = Lambda_cap x W_max, where W_max derives from
-    #: ``ttfab_slo_ms``. Consumed by the container admission queue; 0 means unbounded,
-    #: i.e. not yet planned for this model. Stored rather than derived here because it
-    #: needs ``Lambda_cap``, which is a measurement — ``tts-bench plan`` computes it and
-    #: refuses when a stored value disagrees with what the SLO implies.
+    #: ``Q_max``: the largest concurrency (queued + executing) at which a request still
+    #: reaches first byte inside ``ttfab_slo_ms``. Consumed by the container admission
+    #: queue, which sheds past it — a request that cannot make the SLO is better refused
+    #: than served late. 0 means unbounded, i.e. not yet measured for this model.
+    #:
+    #: Measured, not computed: ``tts-bench qmax`` steps concurrency against a frozen
+    #: single instance until p95 first byte crosses the SLO. It cannot be derived here
+    #: because it depends on the queue discipline and the service-time distribution, not
+    #: just their means — and because a value that is only ever *stated* cannot be shown
+    #: wrong by a rerun on a different instance type.
     queue_max_depth: int = 0
 
     container_startup_health_check_timeout_s: int = 600
@@ -162,53 +182,28 @@ STT_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
 }
 
 TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
-    # The one model with a measured C_max, so the one model configured to scale.
+    # The one model whose Q_max and T_total are measured, so the one model configured to
+    # scale. The model these numbers come from -- six variables, two chosen, two measured,
+    # two derived, and the rerun constraints -- is written down once, in
+    # docs/autoscaling-capacity-model.md. The operator recipe is packages/tts-bench/README.md.
     #
-    # Every scaling number below derives from artifacts/cmax-kokoro-bidi-g5xl.json,
-    # measured on this same ml.g5.xlarge (A10G): C_max 1.63 concurrent at p95 TTFAB
-    # 276ms, S mean 110ms and p95 174ms, so Lambda_cap 14.84 rps. At the chosen k=2:
-    # C_target = 0.875 x 1.63 / 2 = 0.713, or 44% utilization.
-    #
-    # queue_max_depth follows from the SLO and nothing else:
-    #   W_max = 3.0s SLO - 0.174s p95 service = 2.826s
-    #   Q_max = 14.84 rps x 2.826s = 41 per instance
-    # It was 296, from a hand-set 20s W_max that no SLO justified -- a request spending
-    # that allowance reached first byte at 20.2s. Recompute all four via
-    # shared/capacity.py -- ideally `tts-bench plan` -- if any input changes.
-    #
-    # A move to ml.g6.xlarge was attempted 2026-07-30 and rolled back. SageMaker refuses
-    # an instance-type change while an Application Auto Scaling scalable target is
-    # registered on the variant, which needs three deploys (deregister, retype,
-    # re-register) and a window with no autoscaling. Any future type change on a model
-    # with scaling_enabled hits the same rule.
-    #
-    # Separately, us-east-1 could not place a second ml.g5.xlarge for this account --
-    # three attempts, the decisive one with quota free (4, one in use), no load, and one
-    # instance requested, still Updating at 22 min with no FailureReason. That is EC2
-    # capacity for the type, not an account limit. It bounds what T_total we can measure
-    # here, which is why the plan sweeps the provision stage rather than assuming ours.
-    #
-    # C_target below 1 is not a mistake. Kokoro holds its inference lock for a whole
-    # bidi session, so an instance serves about one stream and one sustained request
-    # is enough to scale out. For this model max_instances, not the target, is the
-    # lever that sizes the fleet.
+    # Do not hand-edit the derived fields. `uv run tts-bench plan --qmax <artifact> --ttotal
+    # <artifact>` prints this block ready to paste, and `tts-bench drift` then confirms that
+    # what deployed is what was computed.
     "kokoro-82m": ModelEndpointConfig(
         model_name="kokoro-82m",
         hf_model_id="hexgrad/Kokoro-82M",
         instance_type="ml.g5.xlarge",
         container_type=ContainerType.PYTORCH_CUSTOM,
-        streaming_mode=StreamingMode.BIDIRECTIONAL,
+        streaming_mode=StreamingMode.RESPONSE_STREAM,
         # min=1 rather than 0 because SageMaker real-time variants cannot scale to
         # zero; max(min_instances, 1) already coerced it, so 1 is what deploys.
         min_instances=1,
-        # Placeholder: enough to observe a real scale-out, which `tts-bench ttotal`
-        # needs. Size it properly once `tts-bench plan` runs against a stated peak.
+        # Sits exactly at the ml.g5.xlarge quota (L-1928E07B), so a quota increase
+        # precedes any higher peak. Nothing else depends on it: the thresholds are
+        # fractions of Q_max, so raising this is one number and touches no other field.
         max_instances=4,
-        scaling_target_value=0.713,
-        scale_in_threshold=0.2,
         ttfab_slo_ms=3000,
-        ttfab_budget_ms=300,
-        queue_max_depth=41,
     ),
     "kokoro-82m-cpu": ModelEndpointConfig(
         model_name="kokoro-82m-cpu",
@@ -223,7 +218,7 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
     # min/max stated explicitly rather than inherited. Taking the class defaults
     # (1-4) made `scaling_enabled` true for a model with no endpoint and no stack,
     # which is the whole reason `tts-bench drift` reported a missing_target for it.
-    # No model gets scaling until its own C_max is measured.
+    # No model gets scaling until its own Q_max and T_total are measured.
     "maya-veena": ModelEndpointConfig(
         model_name="maya-veena",
         hf_model_id="maya-research/veena-tts",

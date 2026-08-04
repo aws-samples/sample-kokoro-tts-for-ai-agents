@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from shared.capacity import SAGEMAKER_INVOCATION_CEILING_S
 from tts_bench.types import Verdict
 
 if TYPE_CHECKING:
@@ -156,7 +155,10 @@ def _render_lag(plan: ScalingPlan, stages: TTotalStages) -> list[str]:
             "account's placement latency"
         )
     if stages.bounded:
-        out.append("      FLOOR           recovery was inferred, so the measured half is a floor")
+        out.append(
+            "      FLOOR           recovery was never bounded, so the measured half stops at "
+            "in_service and is a floor"
+        )
     return out
 
 
@@ -259,16 +261,19 @@ def render_config(plan: ScalingPlan) -> str:
 def _ceiling_clause(plan: ScalingPlan) -> str:
     """Whether the deadline fits the invocation ceiling, per the finding that judged it.
 
-    Read off ``invocation_ceiling`` rather than restated here, because the ceiling is not
-    always SageMaker's: ``--ceiling-s`` moves it, and a block that hardcoded 60s once
-    printed "fits the 60s invocation ceiling" on a plan the ceiling check had just
-    STOPped. This block gets pasted into ``config.py``, so a comment contradicting the
-    findings above it is worse than no comment.
+    Both halves come off the plan rather than being restated here. The *verdict* is read
+    from ``invocation_ceiling``, so a plan the check STOPped cannot be described as
+    fitting; the *number* is ``plan.ceiling_s``, the value that check was given, because
+    the ceiling is not always SageMaker's — ``--ceiling-s`` moves it, and the constant is
+    only the default. A block that interpolated the constant printed "fits the 60s
+    invocation ceiling" for a run judged at 2s, naming a limit that was never tested.
+    This block gets pasted into ``config.py``, so a comment contradicting the findings
+    above it is worse than no comment.
     """
     finding = next((f for f in plan.findings if f.name == "invocation_ceiling"), None)
     if finding is not None and finding.verdict is Verdict.INFEASIBLE:
         return "EXCEEDS the invocation ceiling — see the STOP finding above; do not deploy this"
-    return f"fits the {SAGEMAKER_INVOCATION_CEILING_S:.0f}s invocation ceiling"
+    return f"fits the {plan.ceiling_s:.0f}s invocation ceiling"
 
 
 def render_alarm_threshold(plan: ScalingPlan) -> str:

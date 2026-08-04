@@ -262,6 +262,11 @@ class WindowStats:
     window_end_ts: float
     completed: int
     ok: int
+    chars: int
+    """Characters synthesized by the completions in the window. A raw count, kept here
+    rather than turned into a rate: the planner needs chars-per-*request* to price a
+    fleet in $/M chars, and a count over a count needs no units conversion — which is
+    where the open-loop ``chars_per_hour`` went wrong."""
     outcome_counts: dict[str, int]
     ttfab_p50_ms: float | None
     ttfab_p95_ms: float | None
@@ -408,6 +413,10 @@ def summarize_window(
         window_end_ts=end_ts,
         completed=len(completed),
         ok=len(oks),
+        # Over every completion, not just the successes: a rejected request still had
+        # text attached, and the planner's chars-per-request is the mean size of what
+        # the benchmark asked for rather than of what came back.
+        chars=sum(e.chars for e in completed),
         outcome_counts=outcome_counts,
         ttfab_p50_ms=_percentile(ttfabs, 50),
         ttfab_p95_ms=ttfab_p95,

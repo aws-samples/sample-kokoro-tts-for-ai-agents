@@ -4,31 +4,46 @@ Split by testability, the same way ``test_observe.py`` is. The timeline rules �
 reconstructing a missing ``container_start``, bounding recovery, choosing the dominant
 stage — are pure functions and are tested directly. The fetch paths use botocore
 ``Stubber``, which validates every response against the real service model, so a
-``describe_log_streams`` reply missing a field or a ``GetMetricStatistics`` call with an
-illegal period fails here rather than against a live endpoint.
+``describe_log_streams`` reply missing a field fails here rather than against a live
+endpoint.
 
 ``LOG_LINES`` is copied from a real ``speech-kokoro-82m`` stream, banner and all. Its
 notable property is what it is *missing*: no ``container_start`` marker, because the
 CUDA base image prints its banner before our entrypoint runs. That is the ordinary case,
 not the edge case, which is why the reconstruction path is the one that has to work.
+
+Two things this suite is written *against*, because both shipped and both were silent:
+
+- ``t_total_bounded`` read ``recovered.bounded``, which :func:`assemble_timeline` sets on
+  every run, so it was a constant ``True`` and every cleanly-recovered run was reported
+  as a floor. :class:`TestTotalIsBoundedOnlyWithoutARecoveryEndpoint` pins both directions.
+- ``render_text`` referenced a ``policy_lag_bound_s`` attribute that does not exist, so
+  the entire success path raised ``AttributeError``. :class:`TestRenderText` renders a
+  report with a measurable ``t_total_s``, which is the case that never ran.
 """
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import boto3
+import botocore.exceptions
 import pytest
 from botocore.stub import Stubber
 from loguru import logger
 
 from shared.stages import format_stage_marker, parse_stage_markers
+from tts_bench import fixture as fixture_mod
+from tts_bench import ttotal as ttotal_mod
+from tts_bench.fixture import SUSPEND_ALL
 from tts_bench.loadgen import LoadEvent
 from tts_bench.observe import LogStream
 from tts_bench.ttotal import (
+    POLICY_LAG_BOUND_S,
     RECOVERY_MIN_SAMPLES,
-    TRIGGER_DRIVE_LOAD,
+    RECOVERY_TOLERANCE,
     TRIGGER_FORCE_DESIRED,
     ScaleEvent,
     StageTime,
@@ -39,10 +54,10 @@ from tts_bench.ttotal import (
     assemble_timeline,
     collect_timeline,
     container_timeline,
-    deployed_target_value,
-    policy_alarm_names,
+    measure,
     read_capacity,
     recovery_bound,
+    recovery_references,
     render_text,
     restore_desired_count,
     wait_for_scale_out,
@@ -53,6 +68,17 @@ VARIANT = "primary"
 RID = f"endpoint/{ENDPOINT}/variant/{VARIANT}"
 STREAM = "primary/i-0abc123def4567890"
 T0 = datetime(2026, 7, 30, 11, 0, 0, tzinfo=UTC)
+
+#: A ``Q_max`` ladder shaped like the measured kokoro one, with rungs at 5 and 10 — the
+#: pair the halving test needs. Both sides of "recovery" come from here, so a ladder
+#: without both rungs is a re-run of ``qmax`` rather than something ``ttotal`` can patch up.
+LADDER = {1: 92.0, 5: 379.0, 10: 667.0, 20: 1243.0, 50: 2910.0}
+
+#: What the probe should read at N=10 while one instance serves it, and the level it must
+#: drop to once a second instance splits the traffic. Written as the arithmetic rather
+#: than as 473.75 so a change to RECOVERY_TOLERANCE moves the fixture with the module.
+P95_AT_PROBE_MS = LADDER[10]
+RECOVERED_TARGET_MS = LADDER[5] * RECOVERY_TOLERANCE
 
 #: Verbatim from a live stream. The banner lines matter: they are why the parser has to
 #: search each line rather than match it, and why `container_start` is absent.
@@ -85,14 +111,13 @@ def _event(*, first_byte_at: datetime | None, ttfab_ms: float | None) -> LoadEve
         run_id="run",
         step_index=0,
         seq=0,
-        offered_rps=5.0,
+        worker_index=0,
+        concurrency=10,
         model="kokoro-82m",
         endpoint=ENDPOINT,
-        scheduled_ts=(ts or 0.0) - 0.1,
         dispatch_ts=(ts or 0.0) - 0.1,
         first_byte_ts=ts,
         end_ts=(ts + 0.5) if ts else None,
-        dispatch_delay_ms=0.0,
         ttfab_ms=ttfab_ms,
         latency_ms=500.0,
         outcome="ok",
@@ -103,7 +128,7 @@ def _event(*, first_byte_at: datetime | None, ttfab_ms: float | None) -> LoadEve
         audio_bytes=4800,
         audio_duration_s=0.2,
         rtf=0.4,
-        in_flight_at_dispatch=2,
+        in_flight_at_dispatch=10,
         instance_count=1,
     )
 
@@ -129,15 +154,6 @@ def sagemaker() -> Any:
 @pytest.fixture
 def appscaling() -> Any:
     client = boto3.client("application-autoscaling", region_name="us-east-1")
-    stub = Stubber(client)
-    stub.activate()
-    yield client, stub
-    stub.deactivate()
-
-
-@pytest.fixture
-def cloudwatch() -> Any:
-    client = boto3.client("cloudwatch", region_name="us-east-1")
     stub = Stubber(client)
     stub.activate()
     yield client, stub
@@ -261,6 +277,49 @@ class TestContainerTimeline:
         assert container_timeline([]) == []
 
 
+class TestRecoveryReferences:
+    """The two reference points the halving test compares against.
+
+    Both are rungs on the ``Q_max`` ladder, measured on the same configuration by the
+    same run. Nothing here is derived from the SLO: at 3000 ms an overloaded probe is
+    already "inside budget", so the SLO cannot tell an overload from a recovery.
+    """
+
+    def test_the_probes_rung_and_its_half_with_tolerance(self) -> None:
+        expected_before, recovered_target = recovery_references(LADDER, probe_concurrency=10)
+
+        assert expected_before == pytest.approx(LADDER[10])
+        assert recovered_target == pytest.approx(LADDER[5] * RECOVERY_TOLERANCE)
+
+    @pytest.mark.parametrize("probe_concurrency", [1, 0, 7, -2])
+    def test_a_concurrency_that_cannot_halve_is_refused(self, probe_concurrency: int) -> None:
+        # There is no "half of 7" rung to compare against, and at N=1 there is nothing to
+        # split: p95 is already healthy before the scale-out, so recovery would be
+        # declared at the first sample after in_service and the stage would measure nothing.
+        with pytest.raises(TTotalError, match="must be an even number of at least 2 to halve"):
+            recovery_references(LADDER, probe_concurrency=probe_concurrency)
+
+    def test_a_ladder_missing_the_half_rung_is_refused_not_interpolated(self) -> None:
+        # Why it refuses instead of falling back to the nearest rung: a probe held at 10
+        # compared against the ladder's value at 20 would still print a p95 target that
+        # looks measured. The fix is a re-run of `qmax`, so the message says exactly that.
+        with pytest.raises(TTotalError) as excinfo:
+            recovery_references({1: 92.0, 10: 667.0, 20: 1243.0}, probe_concurrency=10)
+
+        message = str(excinfo.value)
+        assert "concurrency [5]" in message
+        # The rungs it does have, so the reader can see what to add rather than re-deriving it.
+        assert "measured rungs: [1, 10, 20]" in message
+        assert "--concurrency including 5,10" in message
+
+    def test_a_ladder_missing_the_probes_own_rung_is_refused_too(self) -> None:
+        # Without it there is nothing to check the probe *against*: a probe that never
+        # reached its own expected p95 is a bad probe, not a failed recovery, and the two
+        # need opposite responses.
+        with pytest.raises(TTotalError, match=r"no usable p95 at concurrency \[10\]"):
+            recovery_references({1: 92.0, 5: 379.0}, probe_concurrency=10)
+
+
 class TestRecoveryBound:
     def test_finds_the_first_sustained_window_inside_budget(self) -> None:
         in_service = T0 + timedelta(seconds=10)
@@ -319,11 +378,11 @@ class TestRecoveryBound:
         assert "0 completion(s)" in note
 
     def test_the_budget_has_to_discriminate_overload_from_recovery(self) -> None:
-        # Why this threshold is the *measured* budget and not the 3s end-to-end SLO the
-        # planner promises against. Kokoro overloaded at 3x C_target reaches a p95 TTFAB of
-        # 818ms -- already inside 3000ms. At that threshold the very first window passes and
-        # recovery is dated to in_service, so the stage measures nothing; at the 300ms
-        # budget the overloaded windows fail and the real boundary is found.
+        # Why this threshold is the ladder's *measured* half-concurrency p95 and not the
+        # 3s end-to-end SLO the planner promises against. Kokoro's probe at N=10 reaches a
+        # p95 TTFAB of 818ms -- already inside 3000ms. At that threshold the very first
+        # window passes and recovery is dated to in_service, so the stage measures nothing;
+        # at the 300ms budget the overloaded windows fail and the real boundary is found.
         in_service = T0 + timedelta(seconds=10)
         events = [
             *_events(in_service, 60, ttfab_ms=818.0, every_s=2.0),
@@ -357,16 +416,22 @@ class TestRecoveryBound:
         assert at is None
 
 
+#: The trigger, 30s after the probe started holding N=10. Named because the clock starts
+#: here and not at the probe's start, and every span assertion below is read against it.
+DESIRED_SET_AT = T0 + timedelta(seconds=30)
+IN_SERVICE_AT = T0 + timedelta(seconds=240)
+RECOVERED_AT = T0 + timedelta(seconds=330)
+
+
 def _full_timeline() -> list[StageTime]:
-    """A timeline with every stage observed, spanning 300s."""
+    """A timeline with every stage observed.
+
+    The timestamps are chosen so the two candidate spans differ visibly: 330s from the
+    probe's start, 300s from the trigger. ``t_total_s`` is the second one.
+    """
     return assemble_timeline(
         load_applied_at=T0,
-        metric_published_at=T0 + timedelta(seconds=20),
-        metric_note=None,
-        alarm_fired_at=T0 + timedelta(seconds=50),
-        alarm_note="alarm TargetTracking-AlarmHigh",
-        activity_started_at=T0 + timedelta(seconds=55),
-        activity_note="Setting desired instance count to 2. (Successful)",
+        desired_set_at=DESIRED_SET_AT,
         stream=LogStream(
             name=STREAM,
             first_event_at=T0 + timedelta(seconds=180),
@@ -381,9 +446,9 @@ def _full_timeline() -> list[StageTime]:
                 ]
             )
         ),
-        in_service_at=T0 + timedelta(seconds=240),
-        recovered_at=T0 + timedelta(seconds=300),
-        recovery_note="p95 TTFAB held at or under 300ms across 40 completions",
+        in_service_at=IN_SERVICE_AT,
+        recovered_at=RECOVERED_AT,
+        recovery_note="p95 TTFAB held at or under 474ms across 40 completions",
     )
 
 
@@ -392,7 +457,7 @@ def _report(**overrides: Any) -> TTotalReport:
         model_name="kokoro-82m",
         endpoint=ENDPOINT,
         run_id="run123",
-        trigger=TRIGGER_DRIVE_LOAD,
+        trigger=TRIGGER_FORCE_DESIRED,
         from_instances=1,
         to_instances=2,
     )
@@ -402,7 +467,40 @@ def _report(**overrides: Any) -> TTotalReport:
     return report
 
 
+def _without(report: TTotalReport, *stages: TimelineStage) -> None:
+    """Blank the timestamps of ``stages`` in place, keeping the entries themselves.
+
+    Blanked rather than dropped, because that is what an unobserved stage looks like
+    coming out of :func:`assemble_timeline` — it degrades to a gap, never to an absence.
+    """
+    names = {str(stage) for stage in stages}
+    report.timeline = [
+        StageTime(e.stage, None, bounded=e.bounded, source=e.source, note=e.note)
+        if e.stage in names
+        else e
+        for e in report.timeline
+    ]
+
+
 class TestTimelineAssembly:
+    def test_the_probe_is_established_before_the_trigger(self) -> None:
+        # load_applied is on the timeline to record that the recovery comparison had a
+        # pre-scale steady state to compare against — not to start the clock.
+        entry = next(e for e in _full_timeline() if e.stage == str(TimelineStage.LOAD_APPLIED))
+        assert entry.at == T0
+        assert "not the start of the clock" in (entry.note or "")
+
+    def test_emits_the_stages_in_the_order_they_normally_occur(self) -> None:
+        # The emitted order, before any sorting by observed time: trigger, then the
+        # instance's first external sign, then the container, then the fleet, then traffic.
+        stages = [e.stage for e in _full_timeline()]
+        assert stages[:3] == [
+            str(TimelineStage.LOAD_APPLIED),
+            str(TimelineStage.DESIRED_SET),
+            str(TimelineStage.INSTANCE_LOGGING),
+        ]
+        assert stages[-2:] == [str(TimelineStage.IN_SERVICE), str(TimelineStage.TRAFFIC_RECOVERED)]
+
     def test_marks_instance_logging_as_bounded(self) -> None:
         # A container cannot time its own image pull, so the stream opening is the only
         # visible bound on it — and it is a bound, not a measurement.
@@ -415,6 +513,23 @@ class TestTimelineAssembly:
         # to an instance. Observed is not the same as measured here.
         entry = next(e for e in _full_timeline() if e.stage == str(TimelineStage.TRAFFIC_RECOVERED))
         assert entry.bounded is True
+
+    def test_a_container_that_never_reported_ready_leaves_a_stated_gap(self) -> None:
+        # Every image emits `ready`, unlike the other container stages, so its absence is
+        # stated rather than omitted — otherwise a report with no container half at all
+        # reads as complete.
+        timeline = assemble_timeline(
+            load_applied_at=T0,
+            desired_set_at=DESIRED_SET_AT,
+            stream=None,
+            container_stages=[],
+            in_service_at=IN_SERVICE_AT,
+            recovered_at=None,
+            recovery_note="not evaluated",
+        )
+        entry = next(e for e in timeline if e.stage == str(TimelineStage.READY))
+        assert entry.at is None
+        assert "no container reported becoming ready" in (entry.note or "")
 
     def test_orders_by_observed_time_not_by_enum(self) -> None:
         # Container stage order differs by image; imposing this module's order would
@@ -434,44 +549,46 @@ class TestTimelineAssembly:
 
 
 class TestTTotalReport:
-    def test_t_total_spans_load_applied_to_recovery(self) -> None:
+    def test_t_total_spans_the_trigger_to_recovery(self) -> None:
+        # 300s from desired_set, not the 330s from the probe's start: the warm-up is this
+        # module's choice, so folding it in would inflate a number the policy is scaled by.
         assert _report().t_total_s == pytest.approx(300.0)
 
-    def test_the_narrower_reading_starts_at_metric_publication(self) -> None:
-        # The two differ by the client's own ramp, which a plan still has to absorb —
-        # hence both, rather than picking one and losing the distinction.
-        assert _report().t_total_from_metric_s == pytest.approx(280.0)
-
-    def test_is_not_the_sum_of_its_stages(self) -> None:
-        # The span, deliberately: summing would swallow any gap between two APIs' clocks
-        # and under-report T_total, which is the dangerous direction.
+    def test_the_warmup_before_the_trigger_is_on_the_timeline_but_not_in_the_number(self) -> None:
+        # The stage list telescopes across the whole observed span, warm-up included, so it
+        # sums to 330s. T_total is 300s because it starts at the trigger: how long the probe
+        # was held first is this module's own choice, and billing it to the lag would inflate
+        # the figure the policy is sized by.
         report = _report()
-        assert report.t_total_s is not None
-        assert sum(d.seconds for d in report.durations) <= report.t_total_s
+        assert sum(d.seconds for d in report.durations) == pytest.approx(330.0)
+        assert report.t_total_s == pytest.approx(300.0)
+        first = report.durations[0]
+        assert (first.from_stage, first.to_stage) == (
+            str(TimelineStage.LOAD_APPLIED),
+            str(TimelineStage.DESIRED_SET),
+        )
 
-    def test_flags_bounded_when_recovery_was_never_observed(self) -> None:
+    def test_the_planning_figure_adds_the_policy_lag_as_a_separate_term(self) -> None:
+        # Production scales out via the policy, which this trigger bypasses. The bound is
+        # added for planning and kept in its own field, because one term is measured and
+        # the other is arithmetic off the deployed configuration.
         report = _report()
-        report.timeline = [
-            e if e.stage != str(TimelineStage.TRAFFIC_RECOVERED) else StageTime(e.stage, None)
-            for e in report.timeline
-        ]
-
-        assert report.t_total_bounded is True
-        # Falls back to in_service rather than reporting nothing at all.
-        assert report.t_total_s == pytest.approx(240.0)
+        assert report.t_total_with_policy_bound_s == pytest.approx(300.0 + POLICY_LAG_BOUND_S)
 
     def test_dominant_stage_is_the_longest(self) -> None:
         dominant = _report().dominant_stage
         assert dominant is not None
-        # activity start -> stream open: provisioning and image pull, the stage that
-        # dominates a real kokoro scale-out.
-        assert dominant.from_stage == str(TimelineStage.ACTIVITY_STARTED)
-        assert dominant.seconds == pytest.approx(125.0)
+        # Trigger -> stream open: provisioning and image pull, the stage that dominates a
+        # real kokoro scale-out and the only one worth attacking to shrink T_total.
+        assert dominant.from_stage == str(TimelineStage.DESIRED_SET)
+        assert dominant.to_stage == str(TimelineStage.INSTANCE_LOGGING)
+        assert dominant.seconds == pytest.approx(150.0)
 
     def test_splits_the_aws_half_from_the_container_half(self) -> None:
         report = _report()
-        # Ends at container_start (11:03:05 = T0+185s), not at the stream opening.
-        assert report.aws_share_s == pytest.approx(185.0)
+        # desired_set (T0+30s) to container_start (11:03:05 = T0+185s), not to the stream
+        # opening: the container's own claim is tighter when it is available.
+        assert report.aws_share_s == pytest.approx(155.0)
         # container_start -> ready.
         assert report.container_share_s == pytest.approx(7.0)
 
@@ -490,15 +607,14 @@ class TestTTotalReport:
 
         # Stream opening to in_service: looser, but it is what remains observable.
         assert report.container_share_s == pytest.approx(60.0)
-        assert report.aws_share_s == pytest.approx(180.0)
+        assert report.aws_share_s == pytest.approx(150.0)
 
     def test_missing_stages_are_listed_not_dropped(self) -> None:
+        # A stage with no timestamp stays on the timeline as a gap. Dropping it would make
+        # a report whose container half was never read look like one that had none.
         report = _report()
-        report.timeline = [
-            e if e.stage != str(TimelineStage.ALARM_FIRED) else StageTime(e.stage, None)
-            for e in report.timeline
-        ]
-        assert str(TimelineStage.ALARM_FIRED) in report.missing_stages
+        _without(report, TimelineStage.INSTANCE_LOGGING)
+        assert str(TimelineStage.INSTANCE_LOGGING) in report.missing_stages
 
     def test_provenance_records_the_trigger(self) -> None:
         from tts_bench.types import Origin
@@ -507,12 +623,17 @@ class TestTTotalReport:
         assert prov.origin is Origin.MEASURED
         assert prov.run_id == "run123"
         assert prov.endpoint == ENDPOINT
-        assert TRIGGER_DRIVE_LOAD in (prov.note or "")
+        assert TRIGGER_FORCE_DESIRED in (prov.note or "")
 
-    def test_provenance_warns_that_force_desired_is_only_half(self) -> None:
-        # The guard against a container-only figure being planned with as a full T_total.
-        prov = _report(trigger=TRIGGER_FORCE_DESIRED).provenance()
-        assert "container half only" in (prov.note or "")
+    def test_provenance_warns_that_the_policy_half_is_only_bounded(self) -> None:
+        # The guard against a capacity-only figure being planned with as a full T_total.
+        prov = _report().provenance()
+        assert "capacity half only" in (prov.note or "")
+        assert f"{POLICY_LAG_BOUND_S:.0f}s rather than measured" in (prov.note or "")
+
+    def test_provenance_measures_from_the_trigger(self) -> None:
+        prov = _report().provenance()
+        assert prov.measured_at == DESIRED_SET_AT.isoformat()
 
     def test_to_dict_is_json_serializable_with_shares(self) -> None:
         import json
@@ -522,13 +643,66 @@ class TestTTotalReport:
         shares = [d["share"] for d in payload["durations"]]
         assert all(0.0 <= s <= 1.0 for s in shares)
 
-    def test_render_text_marks_bounded_stages(self) -> None:
+
+class TestTotalIsBoundedOnlyWithoutARecoveryEndpoint:
+    """``t_total_bounded`` means "no recovery endpoint", not "recovery was inferred".
+
+    The defect this pins shipped: the property read ``recovered.bounded``, and
+    :func:`assemble_timeline` sets that flag on *every* run — recovery is always an
+    inference, since SageMaker never says which instance served a request. So the
+    property was a constant ``True``, and the report's FLOOR line, ``provenance()``,
+    ``scale_report``'s FLOOR line and the planner all called cleanly-recovered runs a
+    floor. The two facts are separate and both are asserted here.
+    """
+
+    def test_a_recovered_run_is_not_a_floor(self) -> None:
+        report = _report()
+        assert report.at(TimelineStage.TRAFFIC_RECOVERED) is not None
+        assert report.t_total_bounded is False
+
+    def test_the_recovered_stage_stays_marked_as_inferred(self) -> None:
+        # Reintroducing `return recovered.bounded` passes the pair above only if this
+        # flag is also dropped — and dropping it would print a bound as a measurement.
+        entry = _report().entry(TimelineStage.TRAFFIC_RECOVERED)
+        assert entry is not None and entry.bounded is True
+
+    def test_a_run_with_no_recovery_endpoint_is_a_floor(self) -> None:
+        report = _report()
+        _without(report, TimelineStage.TRAFFIC_RECOVERED)
+
+        assert report.t_total_bounded is True
+        # Falls back to in_service rather than reporting nothing at all: 210s from the
+        # trigger, strictly earlier than the instance serving, so it under-reports.
+        assert report.t_total_s == pytest.approx(210.0)
+        assert "floor" in (report.provenance().note or "")
+
+
+class TestRenderText:
+    def test_it_renders_a_measurable_run(self) -> None:
+        # The defect this covers: render_text read a `report.policy_lag_bound_s` that does
+        # not exist, so every successful run raised AttributeError on the way to stdout.
+        # Only the not-measurable path had a test, and it never reached that line.
+        text = render_text(_report())
+
+        assert "300.0s from capacity requested to traffic recovered" in text
+        # The planning figure, labelled a BOUND rather than a measurement: it is part
+        # measured and part arithmetic, and folding the two is how a bound gets quoted.
+        assert f"{POLICY_LAG_BOUND_S:.0f}s BOUND" in text
+        assert "360.0s including" in text
+
+    def test_it_marks_bounded_stages(self) -> None:
         text = render_text(_report())
         assert "T_total for speech-kokoro-82m" in text
         assert "dominant stage" in text
         assert "~ marks a stage bounded by inference" in text
 
-    def test_render_text_survives_an_empty_timeline(self) -> None:
+    def test_a_run_that_never_recovered_is_labelled_a_floor(self) -> None:
+        report = _report()
+        _without(report, TimelineStage.TRAFFIC_RECOVERED)
+
+        assert "FLOOR" in render_text(report)
+
+    def test_it_survives_an_empty_timeline(self) -> None:
         # A report with nothing observed still has to print. It is the outcome of a
         # scale event whose APIs all came back empty, which is worth seeing.
         report = _report()
@@ -538,7 +712,7 @@ class TestTTotalReport:
 
 
 class TestTheReportCarriesItsConfiguration:
-    """A lag belongs to a configuration, the same way a C_max curve does.
+    """A lag belongs to a configuration, the same way a ``Q_max`` ladder does.
 
     ``plan`` consumes the two together, so a fingerprint on only one side would leave
     the pairing check with nothing to compare — and container start, which dominates
@@ -723,147 +897,15 @@ class TestRestoreDesiredCount:
         assert any("update-endpoint-weights-and-capacities" in line for line in logged)
 
 
-def _policy(*, target_value: float | None = 0.713, alarms: list[str] | None = None) -> dict:
-    policy: dict[str, Any] = {
-        "PolicyARN": f"arn:aws:autoscaling:us-east-1:1234:scalingPolicy:abc:resource/{RID}",
-        "PolicyName": "TrackConcurrency",
-        "ServiceNamespace": "sagemaker",
-        "ResourceId": RID,
-        "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
-        "PolicyType": "TargetTrackingScaling",
-        "CreationTime": T0,
-        "Alarms": [
-            {"AlarmName": name, "AlarmARN": f"arn:aws:cloudwatch:us-east-1:1234:alarm:{name}"}
-            for name in (alarms or ["TargetTracking-AlarmHigh"])
-        ],
-    }
-    if target_value is not None:
-        policy["TargetTrackingScalingPolicyConfiguration"] = {
-            "TargetValue": target_value,
-            "PredefinedMetricSpecification": {
-                "PredefinedMetricType": ("SageMakerVariantConcurrentRequestsPerModelHighResolution")
-            },
-            "DisableScaleIn": True,
-        }
-    return policy
+def _stub_collect(logs: Any, *, log_lines: list[str], new_stream: bool = True) -> Any:
+    """Queue one full pass of ``collect_timeline``'s reads, in call order.
 
-
-class TestPolicyReads:
-    def test_reads_the_deployed_target_value(self, appscaling: Any) -> None:
-        # Read off the deployment, not from config: a config that has moved ahead of the
-        # last `cdk deploy` would put metric_published at the wrong threshold.
-        client, stub = appscaling
-        stub.add_response("describe_scaling_policies", {"ScalingPolicies": [_policy()]})
-
-        assert deployed_target_value(client, endpoint=ENDPOINT) == pytest.approx(0.713)
-
-    def test_no_target_tracking_policy_returns_none(self, appscaling: Any) -> None:
-        client, stub = appscaling
-        step_only = _policy(target_value=None)
-        step_only["PolicyType"] = "StepScaling"
-        stub.add_response("describe_scaling_policies", {"ScalingPolicies": [step_only]})
-
-        assert deployed_target_value(client, endpoint=ENDPOINT) is None
-
-    def test_alarm_names_come_from_the_policy(self, appscaling: Any) -> None:
-        # Target tracking generates its alarm names, so they cannot be predicted from
-        # config — they have to be read back.
-        client, stub = appscaling
-        stub.add_response(
-            "describe_scaling_policies",
-            {"ScalingPolicies": [_policy(alarms=["AlarmHigh", "AlarmLow"])]},
-        )
-
-        assert policy_alarm_names(client, endpoint=ENDPOINT) == ["AlarmHigh", "AlarmLow"]
-
-    def test_a_read_failure_degrades_to_no_attribution(self, appscaling: Any) -> None:
-        client, stub = appscaling
-        stub.add_client_error("describe_scaling_policies", service_error_code="AccessDenied")
-
-        assert policy_alarm_names(client, endpoint=ENDPOINT) == []
-
-
-#: Verbatim from the ``StatusMessage`` of the activity that blocked the first live run.
-#: The wording is AWS's, which is why the module quotes it rather than classifying it.
-QUOTA_REFUSAL = (
-    "Failed to set desired instance count to 4. Reason: The account-level service limit "
-    "'ml.g5.xlarge for endpoint usage' is 4 Instances, with current utilization of 3 "
-    "Instances and a request delta of 3 Instances. Please use AWS Service Quotas to "
-    "request an increase for this quota."
-)
-
-
-def _activity(
-    *,
-    at_s: float,
-    status: str = "Successful",
-    activity_id: str = "act-1",
-    description: str = "Setting desired instance count to 2.",
-    status_message: str | None = None,
-) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "ActivityId": activity_id,
-        "ServiceNamespace": "sagemaker",
-        "ResourceId": RID,
-        "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
-        "Description": description,
-        "Cause": "monitor alarm TargetTracking-AlarmHigh in state ALARM",
-        "StartTime": T0 + timedelta(seconds=at_s),
-        "StatusCode": status,
-    }
-    if status == "Successful":
-        entry["EndTime"] = T0 + timedelta(seconds=at_s + 185)
-    if status_message is not None:
-        entry["StatusMessage"] = status_message
-    return entry
-
-
-def _stub_collect(
-    cloudwatch: Any,
-    appscaling: Any,
-    logs: Any,
-    *,
-    log_lines: list[str],
-    concurrency: float = 2.0,
-    new_stream: bool = True,
-    activities: list[dict[str, Any]] | None = None,
-) -> tuple[Any, Any, Any]:
-    """Queue one full pass of ``collect_timeline``'s reads, in call order."""
-    cw_client, cw_stub = cloudwatch
-    aas_client, aas_stub = appscaling
+    Logs only. The metric, alarm and scaling-activity reads this used to queue were
+    attribution for a policy-driven trigger; under a freeze no policy runs, so those
+    APIs are silent by design and querying them would invite reading meaning into it.
+    """
     logs_client, logs_stub = logs
 
-    cw_stub.add_response(
-        "get_metric_statistics",
-        {
-            "Datapoints": [
-                {
-                    "Timestamp": T0 + timedelta(seconds=20),
-                    "Maximum": concurrency,
-                    "Average": concurrency,
-                    "Unit": "None",
-                }
-            ]
-        },
-    )
-    aas_stub.add_response("describe_scaling_policies", {"ScalingPolicies": [_policy()]})
-    cw_stub.add_response(
-        "describe_alarm_history",
-        {
-            "AlarmHistoryItems": [
-                {
-                    "AlarmName": "TargetTracking-AlarmHigh",
-                    "Timestamp": T0 + timedelta(seconds=50),
-                    "HistoryItemType": "StateUpdate",
-                    "HistorySummary": "Alarm updated from OK to ALARM",
-                }
-            ]
-        },
-    )
-    aas_stub.add_response(
-        "describe_scaling_activities",
-        {"ScalingActivities": activities if activities is not None else [_activity(at_s=55)]},
-    )
     streams = [
         {
             "logStreamName": "primary/i-0oldinstance00000",
@@ -899,31 +941,54 @@ def _stub_collect(
         # CloudWatch returns the same token at the end of a stream rather than omitting
         # it; this second response is what the read loop's guard has to terminate on.
         logs_stub.add_response("get_log_events", {"events": [], "nextForwardToken": "f/1"})
-    return cw_client, aas_client, logs_client
+    return logs_client
 
 
 class TestCollectTimeline:
+    """Assembling one observed scale event from the logs, with the probe's own p95.
+
+    The default probe series is the shape a working scale-out produces: 105 completions
+    at the ladder's N=10 value while one instance serves, then a drop to its N=5 value
+    ten seconds after ``in_service``. That drop is the only evidence a second instance
+    took traffic, so it is also what dates ``traffic_recovered``.
+    """
+
     def _event(self) -> ScaleEvent:
         return ScaleEvent(
             from_instances=1,
             to_instances=2,
-            desired_changed_at=T0 + timedelta(seconds=60),
-            in_service_at=T0 + timedelta(seconds=240),
+            desired_changed_at=T0 + timedelta(seconds=40),
+            in_service_at=IN_SERVICE_AT,
         )
 
-    def _call(self, cw: Any, aas: Any, lg: Any, **overrides: Any) -> TTotalReport:
+    def _halving_events(self, halves_at: datetime) -> list[LoadEvent]:
+        """A saturated probe that drops to the ladder's half-concurrency p95 at an instant.
+
+        The overloaded samples keep coming at a 5s cadence right up to ``halves_at``. A gap
+        there wider than the 60s recovery window would make every candidate window too
+        sparse to judge, and the bound would come back empty for want of samples rather
+        than for want of a halving — the wrong reason, and indistinguishable on the report.
+        """
+        held_after = int((halves_at - IN_SERVICE_AT).total_seconds() // 5)
+        return [
+            *_events(DESIRED_SET_AT, 105, ttfab_ms=LADDER[10], every_s=2.0),
+            *_events(IN_SERVICE_AT, held_after, ttfab_ms=LADDER[10], every_s=5.0),
+            *_events(halves_at, 40, ttfab_ms=LADDER[5], every_s=6.0),
+        ]
+
+    def _call(self, lg: Any, **overrides: Any) -> TTotalReport:
         kwargs: dict[str, Any] = {
-            "cloudwatch": cw,
-            "appscaling": aas,
             "logs": lg,
             "endpoint": ENDPOINT,
             "variant": VARIANT,
             "model_name": "kokoro-82m",
             "run_id": "run123",
-            "trigger": TRIGGER_DRIVE_LOAD,
-            "scaling_target": 0.713,
-            "ttfab_budget_ms": 300.0,
+            "trigger": TRIGGER_FORCE_DESIRED,
+            "recovered_budget_ms": RECOVERED_TARGET_MS,
+            "p95_expected_before_ms": P95_AT_PROBE_MS,
+            "probe_concurrency": 10,
             "load_applied_at": T0,
+            "desired_set_at": DESIRED_SET_AT,
             "window_start": T0 - timedelta(seconds=5),
             "window_end": T0 + timedelta(seconds=500),
             "streams_before": [
@@ -934,60 +999,129 @@ class TestCollectTimeline:
                 )
             ],
             "event": self._event(),
-            "load_events": [
-                *_events(T0, 60, ttfab_ms=1200.0, every_s=2.0),
-                *_events(T0 + timedelta(seconds=250), 40, ttfab_ms=120.0),
-            ],
+            "load_events": self._halving_events(T0 + timedelta(seconds=250)),
         }
         kwargs.update(overrides)
         return collect_timeline(**kwargs)
 
-    def test_assembles_every_stage_from_its_own_api(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
-        cw, aas, lg = _stub_collect(cloudwatch, appscaling, logs, log_lines=LOG_LINES)
+    def test_assembles_every_stage_it_can_read(self, logs: Any) -> None:
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
 
-        report = self._call(cw, aas, lg)
+        report = self._call(lg)
 
-        assert report.at(TimelineStage.METRIC_PUBLISHED) == T0 + timedelta(seconds=20)
-        assert report.at(TimelineStage.ALARM_FIRED) == T0 + timedelta(seconds=50)
-        assert report.at(TimelineStage.ACTIVITY_STARTED) == T0 + timedelta(seconds=55)
+        assert report.at(TimelineStage.LOAD_APPLIED) == T0
+        assert report.at(TimelineStage.DESIRED_SET) == DESIRED_SET_AT
         assert report.at(TimelineStage.INSTANCE_LOGGING) == T0 + timedelta(seconds=180)
         assert report.at(TimelineStage.READY) is not None
-        assert report.at(TimelineStage.IN_SERVICE) == T0 + timedelta(seconds=240)
+        assert report.at(TimelineStage.IN_SERVICE) == IN_SERVICE_AT
         assert report.at(TimelineStage.TRAFFIC_RECOVERED) == T0 + timedelta(seconds=250)
-        assert report.t_total_s == pytest.approx(250.0)
+        # 250s - 30s: from the trigger, not from the probe's start.
+        assert report.t_total_s == pytest.approx(220.0)
 
-    def test_names_the_new_instance_by_log_stream_diff(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
+    def test_names_the_new_instance_by_log_stream_diff(self, logs: Any) -> None:
         # SageMaker does not report which instance it added; the set difference over
         # stream names is the only way to identify it.
-        cw, aas, lg = _stub_collect(cloudwatch, appscaling, logs, log_lines=LOG_LINES)
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
 
-        report = self._call(cw, aas, lg)
+        report = self._call(lg)
 
         assert report.instance_id == "i-0abc123def4567890"
 
-    def test_records_the_degradation_being_recovered_from(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
-        cw, aas, lg = _stub_collect(cloudwatch, appscaling, logs, log_lines=LOG_LINES)
+    def test_records_the_degradation_being_recovered_from(self, logs: Any) -> None:
+        # Without the before figure a recovery has nothing to be a recovery *from*, and
+        # the two ladder rungs on the report are what make the halving checkable.
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
 
-        report = self._call(cw, aas, lg)
+        report = self._call(lg)
 
-        assert report.p95_before_ms == pytest.approx(1200.0)
-        assert report.p95_after_ms == pytest.approx(120.0)
+        assert report.p95_before_ms == pytest.approx(LADDER[10])
+        assert report.p95_after_ms == pytest.approx(LADDER[5])
+        assert report.p95_expected_before_ms == pytest.approx(LADDER[10])
+        assert report.p95_recovered_target_ms == pytest.approx(RECOVERED_TARGET_MS)
         assert report.requests_before > 0 and report.requests_after > 0
 
-    def test_stamps_the_configuration_it_was_given(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
-        cw, aas, lg = _stub_collect(cloudwatch, appscaling, logs, log_lines=LOG_LINES)
+    def test_a_series_that_halves_at_a_known_instant_recovers_there(self, logs: Any) -> None:
+        # The measurement itself, against a series whose transition is placed by hand:
+        # recovery must land on the first completion at the halved level, not on the
+        # window that merely contains it.
+        halves_at = IN_SERVICE_AT + timedelta(seconds=90)
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
+
+        report = self._call(lg, load_events=self._halving_events(halves_at))
+
+        assert report.at(TimelineStage.TRAFFIC_RECOVERED) == halves_at
+        assert report.t_total_bounded is False
+        assert report.t_total_s == pytest.approx((halves_at - DESIRED_SET_AT).total_seconds())
+
+    def test_a_series_that_never_halves_reports_a_floor(self, logs: Any) -> None:
+        # Either the added instance never took traffic, or the probe's p95 was not what
+        # the ladder measured. Both end the span at in_service, which is strictly earlier
+        # than the instance serving — so the number under-reports and has to say so.
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
 
         report = self._call(
-            cw,
-            aas,
+            lg, load_events=_events(DESIRED_SET_AT, 160, ttfab_ms=LADDER[10], every_s=2.0)
+        )
+
+        assert report.t_total_bounded is True
+        assert str(TimelineStage.TRAFFIC_RECOVERED) in report.missing_stages
+        assert any("floor" in note for note in report.notes)
+        # Still reports a number, ending at in_service: 240s - 30s.
+        assert report.t_total_s == pytest.approx(210.0)
+
+    def test_a_probe_that_was_never_saturating_says_to_raise_the_concurrency(
+        self, logs: Any
+    ) -> None:
+        # A probe whose pre-scale p95 is already at the recovered level gives the halving
+        # nothing to detect: traffic_recovered lands on the first sample after in_service,
+        # which is a tautology rather than a measurement. Asserted here so the run says
+        # which knob to move instead of leaving it to be inferred from two numbers.
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
+
+        report = self._call(
+            lg,
+            load_events=[
+                *_events(DESIRED_SET_AT, 105, ttfab_ms=LADDER[1], every_s=2.0),
+                *_events(IN_SERVICE_AT, 40, ttfab_ms=LADDER[1], every_s=6.0),
+            ],
+        )
+
+        note = next(n for n in report.notes if "never saturating" in n)
+        assert "--probe-concurrency" in note
+        assert f"expected {LADDER[10]:.0f}ms at N=10" in note
+        # The tautology the note exists to warn about, made visible.
+        assert report.at(TimelineStage.TRAFFIC_RECOVERED) == IN_SERVICE_AT
+
+    def test_a_probe_that_never_ran_reports_recovery_missing(self, logs: Any) -> None:
+        # A run whose probe died leaves no completions to bound recovery with. Ending
+        # silently at in_service would look like a complete measurement, so the stage is
+        # a stated gap and the span is labelled a floor.
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
+
+        report = self._call(lg, load_events=[], load_applied_at=None)
+
+        assert str(TimelineStage.TRAFFIC_RECOVERED) in report.missing_stages
+        assert report.t_total_bounded is True
+        entry = report.entry(TimelineStage.LOAD_APPLIED)
+        assert entry is not None and "no probe ran" in (entry.note or "")
+        recovered = report.entry(TimelineStage.TRAFFIC_RECOVERED)
+        assert recovered is not None and "completion(s)" in (recovered.note or "")
+
+    def test_the_policy_half_is_named_as_bounded_on_every_report(self, logs: Any) -> None:
+        # The trigger's known omission, stated on the artifact rather than only in the
+        # docs: a capacity-only figure planned with as a full T_total is silent.
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
+
+        report = self._call(lg)
+
+        note = next(n for n in report.notes if TRIGGER_FORCE_DESIRED in n)
+        assert f"bounded separately at {POLICY_LAG_BOUND_S:.0f}s" in note
+        assert "t_total_with_policy_bound_s" in note
+
+    def test_stamps_the_configuration_it_was_given(self, logs: Any) -> None:
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
+
+        report = self._call(
             lg,
             deployed_config={
                 "instance_type": "ml.g5.xlarge",
@@ -998,342 +1132,406 @@ class TestCollectTimeline:
 
         assert report.config_slug == "g5xlarge-139b9068"
 
-    def test_a_rebuild_with_no_configuration_still_assembles(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
+    def test_a_rebuild_with_no_configuration_still_assembles(self, logs: Any) -> None:
         # Optional so a report can be rebuilt from a window whose endpoint has since
         # changed. The slug then refuses to match a real fingerprint rather than
         # inventing one, which is what makes the planner's pairing check safe.
-        cw, aas, lg = _stub_collect(cloudwatch, appscaling, logs, log_lines=LOG_LINES)
+        lg = _stub_collect(logs, log_lines=LOG_LINES)
 
-        report = self._call(cw, aas, lg)
+        report = self._call(lg)
 
         assert report.deployed_config == {}
         assert report.config_slug == "unknown-nodigest"
 
-    def test_a_stream_with_no_markers_is_a_gap_not_a_failure(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
+    def test_a_stream_with_no_markers_is_a_gap_not_a_failure(self, logs: Any) -> None:
         # An image built before the markers existed, or one whose startup lines aged
         # out. The AWS half is still fully attributed.
-        cw, aas, lg = _stub_collect(cloudwatch, appscaling, logs, log_lines=LOG_LINES[:7])
+        lg = _stub_collect(logs, log_lines=LOG_LINES[:7])
 
-        report = self._call(cw, aas, lg)
+        report = self._call(lg)
 
         assert str(TimelineStage.READY) in report.missing_stages
         assert any("no STAGE markers" in n for n in report.notes)
-        assert report.at(TimelineStage.ALARM_FIRED) is not None
-        assert report.t_total_s == pytest.approx(250.0)
+        assert report.at(TimelineStage.INSTANCE_LOGGING) is not None
+        assert report.t_total_s == pytest.approx(220.0)
 
-    def test_no_new_stream_is_a_gap_not_a_failure(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
+    def test_no_new_stream_is_a_gap_not_a_failure(self, logs: Any) -> None:
         # Logs lag the endpoint by a minute or two, so this is a routine outcome.
-        cw, aas, lg = _stub_collect(
-            cloudwatch, appscaling, logs, log_lines=LOG_LINES, new_stream=False
-        )
+        lg = _stub_collect(logs, log_lines=LOG_LINES, new_stream=False)
 
-        report = self._call(cw, aas, lg)
+        report = self._call(lg)
 
         assert report.instance_id is None
         assert str(TimelineStage.INSTANCE_LOGGING) in report.missing_stages
         assert any("no new log stream" in n for n in report.notes)
 
-    def test_says_so_when_concurrency_never_reached_the_target(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
-        # Capacity changed but the metric never showed the crossing: detection lag is
-        # unattributed, and the report must not imply otherwise.
-        cw, aas, lg = _stub_collect(
-            cloudwatch, appscaling, logs, log_lines=LOG_LINES, concurrency=0.1
+    def test_a_fleet_that_never_grew_does_not_evaluate_recovery(self, logs: Any) -> None:
+        # No in_service means there is nothing to have recovered from. Running the bound
+        # anyway would date recovery from the probe's own start and report a span that
+        # measured the warm-up.
+        lg = _stub_collect(logs, log_lines=LOG_LINES, new_stream=False)
+
+        report = self._call(
+            lg,
+            event=ScaleEvent(
+                from_instances=1, to_instances=1, desired_changed_at=None, in_service_at=None
+            ),
         )
 
-        report = self._call(cw, aas, lg)
-
-        assert str(TimelineStage.METRIC_PUBLISHED) in report.missing_stages
-        assert report.t_total_from_metric_s is None
-        assert any("never reached the scaling target" in n for n in report.notes)
-
-    def test_force_desired_skips_the_policy_reads_and_says_why(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
-        # No metric, no alarm — and the note has to be explicit that this is not a full
-        # T_total, or a container-only figure ends up sized against a real surge.
-        _, aas_stub = appscaling
-        _, logs_stub = logs
-        aas_stub.add_response("describe_scaling_activities", {"ScalingActivities": []})
-        logs_stub.add_response("describe_log_streams", {"logStreams": []})
-
-        report = self._call(cloudwatch[0], appscaling[0], logs[0], trigger=TRIGGER_FORCE_DESIRED)
-
-        assert str(TimelineStage.METRIC_PUBLISHED) in report.missing_stages
-        assert str(TimelineStage.ALARM_FIRED) in report.missing_stages
-        assert any("must not be fed to the planner" in n for n in report.notes)
-        cloudwatch[1].assert_no_pending_responses()
-
-    def test_an_unrecovered_run_is_flagged_as_a_floor(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
-        cw, aas, lg = _stub_collect(cloudwatch, appscaling, logs, log_lines=LOG_LINES)
-
-        report = self._call(cw, aas, lg, load_events=_events(T0, 200, ttfab_ms=2000.0, every_s=2.0))
-
+        entry = report.entry(TimelineStage.TRAFFIC_RECOVERED)
+        assert entry is not None and "never reached the new instance count" in (entry.note or "")
+        assert report.p95_before_ms is None
         assert report.t_total_bounded is True
-        assert str(TimelineStage.TRAFFIC_RECOVERED) in report.missing_stages
-        assert any("floor" in n for n in report.notes)
-        # Still reports a number, ending at in_service.
-        assert report.t_total_s == pytest.approx(240.0)
-
-    def test_times_the_activity_that_worked_not_the_ones_refused(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
-        # A quota-blocked policy retries every ten seconds, so the *first* activity in
-        # the window is a rejection. Timing it would attribute the whole AWS half to an
-        # attempt that changed nothing — here, 55s early.
-        cw, aas, lg = _stub_collect(
-            cloudwatch,
-            appscaling,
-            logs,
-            log_lines=LOG_LINES,
-            activities=[
-                _activity(at_s=0, status="Failed", activity_id="f1", status_message=QUOTA_REFUSAL),
-                _activity(at_s=10, status="Failed", activity_id="f2", status_message=QUOTA_REFUSAL),
-                _activity(at_s=55, activity_id="ok"),
-            ],
-        )
-
-        report = self._call(cw, aas, lg)
-
-        assert report.at(TimelineStage.ACTIVITY_STARTED) == T0 + timedelta(seconds=55)
-
-    def test_failed_activities_are_reported_in_awss_own_words(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
-        # The StatusMessage is the only place the reason appears anywhere in AWS, so it
-        # is quoted rather than summarized — the set of reasons is AWS's to extend.
-        cw, aas, lg = _stub_collect(
-            cloudwatch,
-            appscaling,
-            logs,
-            log_lines=LOG_LINES,
-            activities=[
-                _activity(at_s=0, status="Failed", activity_id="f1", status_message=QUOTA_REFUSAL),
-                _activity(at_s=55, activity_id="ok"),
-            ],
-        )
-
-        report = self._call(cw, aas, lg)
-
-        note = next(n for n in report.notes if "FAILED" in n)
-        assert "1 of 2" in note
-        assert "ml.g5.xlarge for endpoint usage" in note
-        assert "InService at its old count" in note
-
-    def test_an_all_failed_window_still_reports_a_timeline(
-        self, cloudwatch: Any, appscaling: Any, logs: Any
-    ) -> None:
-        # Reachable: capacity came from somewhere else — a manual bump, or a scale-in
-        # reversing — while every policy attempt was refused. The report says so instead
-        # of implying the policy delivered the instance.
-        cw, aas, lg = _stub_collect(
-            cloudwatch,
-            appscaling,
-            logs,
-            log_lines=LOG_LINES,
-            activities=[
-                _activity(at_s=0, status="Failed", activity_id="f1", status_message=QUOTA_REFUSAL)
-            ],
-        )
-
-        report = self._call(cw, aas, lg)
-
-        entry = next(e for e in report.timeline if e.stage == str(TimelineStage.ACTIVITY_STARTED))
-        assert entry.note is not None and "no activity succeeded" in entry.note
-        assert report.at(TimelineStage.IN_SERVICE) == T0 + timedelta(seconds=240)
 
 
 class TestExplainNoScaleOut:
     """The error text after a timeout.
 
-    A run that reaches this has already spent ``max_wait_s`` of real load. Two causes
-    are indistinguishable from the endpoint — which stays ``InService`` at its old count
-    either way — so the message has to name which one it was, or the operator pays for
-    another run to find out.
+    A run that reaches this has already spent ``max_wait_s`` of real load, so the message
+    has to name which outcome it was or the operator pays for another run to find out.
+    Two outcomes, and they cost very different things to fix: ``Updating`` means SageMaker
+    took the change and cannot place the instance, while a return to ``InService`` at the
+    old count means it gave up without recording a failure anywhere.
+
+    Pure now — no client. Capacity was set directly under a freeze, so no policy is in the
+    path and there is no activity log worth reading.
     """
 
-    def _explain(self, client: Any, **overrides: Any) -> str:
+    def _explain(self, **overrides: Any) -> str:
         kwargs: dict[str, Any] = {
             "endpoint": ENDPOINT,
-            "variant": VARIANT,
             "from_instances": 1,
             "max_wait_s": 1500.0,
-            "scaling_target": 0.713,
-            "window_start": T0,
-            "window_end": T0 + timedelta(seconds=1500),
         }
         kwargs.update(overrides)
-        return _explain_no_scale_out(client, **kwargs)
+        return _explain_no_scale_out(**kwargs)
 
-    def test_a_refusal_is_quoted_and_named_as_one(self, appscaling: Any) -> None:
-        client, stub = appscaling
-        stub.add_response(
-            "describe_scaling_activities",
-            {
-                "ScalingActivities": [
-                    _activity(
-                        at_s=100,
-                        status="Failed",
-                        activity_id="f1",
-                        description="Setting desired instance count to 4.",
-                        status_message=QUOTA_REFUSAL,
-                    )
-                ]
-            },
-        )
+    def test_still_updating_means_the_change_was_taken_but_not_placed(self) -> None:
+        # The live outcome, and the one a longer --max-wait cannot fix: AWS accepted the
+        # count, reserved the quota, and no instance ever arrived. The advice has to point
+        # at hardware availability rather than at patience.
+        message = self._explain(endpoint_status="Updating")
 
-        message = self._explain(client)
-
-        assert "The policy DID act" in message
-        assert "not a detection problem" in message
-        assert "ml.g5.xlarge for endpoint usage" in message
-
-    def test_a_slow_provision_is_told_apart_from_a_refusal(self, appscaling: Any) -> None:
-        # AWS accepted "set desired to 4" and is still pulling images. Reporting that as a
-        # failure sent one live run's reader after the quota, which had already been fixed.
-        # Opposite fix: wait longer.
-        client, stub = appscaling
-        stub.add_response(
-            "describe_scaling_activities",
-            {"ScalingActivities": [_activity(at_s=50, status="InProgress", activity_id="live")]},
-        )
-
-        message = self._explain(client, window_end=T0 + timedelta(seconds=500))
-
-        assert "ACCEPTED" in message
-        assert "not refusing" in message
-        assert "--max-wait" in message
-        assert "lower max_capacity" in message
-        # The elapsed figure, so "still provisioning" can be judged against how long.
-        assert "450s" in message
-        # And emphatically NOT the word that sent the last read astray.
-        assert "failed" not in message.lower()
-
-    def test_a_very_long_in_flight_reads_as_capacity_not_patience(self, appscaling: Any) -> None:
-        """The live outcome, and the one a longer ``--max-wait`` cannot fix.
-
-        AWS accepted "set desired instance count to 4", ``AWS/Usage`` for
-        ``endpoint/ml.g5.xlarge`` went to 4 — the quota *was* reserved — and then no
-        instance ever arrived. 34 minutes later the endpoint returned to ``InService`` at
-        its old count with no ``FailureReason`` and the activity never left ``InProgress``.
-        Advising a longer wait there burns another run for the same nothing.
-        """
-        client, stub = appscaling
-        stub.add_response(
-            "describe_scaling_activities",
-            {
-                "ScalingActivities": [
-                    _activity(
-                        at_s=50,
-                        status="InProgress",
-                        activity_id="live",
-                        description="Setting desired instance count to 4.",
-                        status_message=(
-                            "Successfully set desired instance count to 4. Waiting for "
-                            "change to be fulfilled by sagemaker."
-                        ),
-                    )
-                ]
-            },
-        )
-
-        message = self._explain(client)
-
-        assert "ACCEPTED" in message
-        assert "capacity being unavailable" in message
-        assert "24min" in message
-        # The advice has to invert, or the reader pays for the same 25 minutes again.
-        assert "another instance type or region rather than a longer --max-wait" in message
-        # It may say AWS did not *report* a failure; it must not claim one occurred.
-        assert "scaling activities failed" not in message
-
-    def test_a_refusal_wins_over_a_later_retry_in_flight(self, appscaling: Any) -> None:
-        # A window can hold both. The refusal is the more expensive finding, so it leads.
-        client, stub = appscaling
-        stub.add_response(
-            "describe_scaling_activities",
-            {
-                "ScalingActivities": [
-                    _activity(
-                        at_s=10, status="Failed", activity_id="f1", status_message=QUOTA_REFUSAL
-                    ),
-                    _activity(at_s=60, status="InProgress", activity_id="live"),
-                ]
-            },
-        )
-
-        assert "The policy DID act" in self._explain(client)
-
-    def test_an_all_terminal_window_that_still_did_not_arrive(self, appscaling: Any) -> None:
-        # Succeeded, nothing in flight, and yet the count never rose. Nothing to blame,
-        # so it says where to look rather than inventing a cause.
-        client, stub = appscaling
-        stub.add_response(
-            "describe_scaling_activities",
-            {"ScalingActivities": [_activity(at_s=100, activity_id="ok")]},
-        )
-
-        message = self._explain(client)
-
-        assert "none failed and none is still in flight" in message
-        assert "describe-scaling-activities" in message
-
-    def test_force_desired_is_not_diagnosed_from_the_activity_log(self, appscaling: Any) -> None:
-        # That mode sets DesiredInstanceCount directly, so no policy runs and the activity
-        # log is silent by design. Reading "the policy never acted" out of that silence
-        # would send the operator to check a C_target the run never used -- and the Stubber
-        # proves the point: no describe_scaling_activities response is queued, so any call
-        # fails the test.
-        client, _ = appscaling
-
-        message = self._explain(client, trigger=TRIGGER_FORCE_DESIRED, endpoint_status="Updating")
-
-        assert "no policy was involved" in message or "still Updating" in message
-        assert "C_target" not in message
+        assert "accepted the change and has not placed the instance" in message
         assert "instance capacity for the type" in message
+        assert "another instance type or region" in message
 
-    def test_force_desired_back_in_service_means_aws_gave_up(self, appscaling: Any) -> None:
-        # The observed ending: SageMaker returns the endpoint to InService at the old count
-        # and records no FailureReason anywhere. Nothing else in the account says so.
-        client, _ = appscaling
-
-        message = self._explain(client, trigger=TRIGGER_FORCE_DESIRED, endpoint_status="InService")
+    def test_back_in_service_means_aws_abandoned_the_change(self) -> None:
+        # The observed ending: SageMaker returns the endpoint to InService at the old
+        # count and records no FailureReason anywhere. Nothing else in the account says so.
+        message = self._explain(endpoint_status="InService")
 
         assert "abandoned the change without recording a failure" in message
 
-    def test_no_activity_at_all_points_at_the_offered_load(self, appscaling: Any) -> None:
-        # The policy never decided, so the fault is upstream: too little load, or an
-        # alarm still in INSUFFICIENT_DATA.
-        client, stub = appscaling
-        stub.add_response("describe_scaling_activities", {"ScalingActivities": []})
-
-        message = self._explain(client)
-
-        assert "the policy never acted" in message
-        assert "C_target=0.713" in message
-        assert "tts-bench drift" in message
-
-    def test_every_message_states_the_count_it_never_passed(self, appscaling: Any) -> None:
-        client, stub = appscaling
-        stub.add_response("describe_scaling_activities", {"ScalingActivities": []})
-
-        message = self._explain(client, from_instances=2, max_wait_s=600.0)
+    @pytest.mark.parametrize("endpoint_status", ["Updating", "InService", None])
+    def test_every_message_states_the_count_and_window_it_never_passed(
+        self, endpoint_status: str | None
+    ) -> None:
+        # Whichever branch it takes, the timeout is the thing that happened. A diagnosis
+        # that omits the count and the wait cannot be judged against the run's own flags.
+        message = self._explain(from_instances=2, max_wait_s=600.0, endpoint_status=endpoint_status)
 
         assert "more than 2 instance(s) within 600s" in message
 
-    def test_an_unreadable_activity_log_does_not_mask_the_timeout(self, appscaling: Any) -> None:
-        # scaling_activities() degrades to [] on AccessDenied, so this reads as "never
-        # acted". The timeout itself still has to survive being reported.
-        client, stub = appscaling
-        stub.add_client_error("describe_scaling_activities", service_error_code="AccessDenied")
+    @pytest.mark.parametrize("endpoint_status", ["Updating", "InService", None])
+    def test_no_message_blames_a_policy(self, endpoint_status: str | None) -> None:
+        # Nothing scaling was live: the freeze suspended the deployed policy and capacity
+        # was set directly, so the scaling activity log is silent by design. Reading "the
+        # policy never acted" out of that silence would send the operator to check a
+        # threshold this run never used.
+        message = self._explain(endpoint_status=endpoint_status)
 
-        assert "did not reach more than 1 instance(s)" in self._explain(client)
+        assert "the policy never acted" not in message
+        assert "C_target" not in message
+        assert "set directly" in message
+        assert "scaling config" in message or "silent by design" in message
+
+
+def _endpoint_config() -> dict[str, Any]:
+    """The endpoint config ``fingerprint_or_registry`` reads the instance type from."""
+    return {
+        "EndpointConfigName": f"{ENDPOINT}-config",
+        "EndpointConfigArn": (
+            f"arn:aws:sagemaker:us-east-1:1234:endpoint-config/{ENDPOINT}-config"
+        ),
+        "ProductionVariants": [
+            {
+                "VariantName": VARIANT,
+                "ModelName": "kokoro-model",
+                # ml.g5.xlarge is what cost.MODEL_INSTANCE_TYPES says for kokoro, so the
+                # fingerprint read stays silent and the test is about the freeze.
+                "InstanceType": "ml.g5.xlarge",
+                "InitialInstanceCount": 1,
+            }
+        ],
+        "CreationTime": T0,
+    }
+
+
+def _model() -> dict[str, Any]:
+    return {
+        "ModelName": "kokoro-model",
+        "ModelArn": "arn:aws:sagemaker:us-east-1:1234:model/kokoro-model",
+        "CreationTime": T0,
+        "PrimaryContainer": {
+            "Image": "1234.dkr.ecr.us-east-1.amazonaws.com/cdk-assets:139b9068c5eb1f03",
+            "Environment": {"MAX_REQUEST_AGE_S": "56"},
+        },
+    }
+
+
+def _scalable_target(*, suspended: bool) -> dict[str, Any]:
+    return {
+        "ServiceNamespace": "sagemaker",
+        "ResourceId": RID,
+        "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+        "MinCapacity": 1,
+        "MaxCapacity": 4,
+        "RoleARN": "arn:aws:iam::1234:role/aws-service-role/sagemaker.application-autoscaling",
+        "SuspendedState": {
+            "DynamicScalingInSuspended": suspended,
+            "DynamicScalingOutSuspended": suspended,
+            "ScheduledScalingSuspended": suspended,
+        },
+        "CreationTime": T0,
+    }
+
+
+def _scaling_policy() -> dict[str, Any]:
+    return {
+        "PolicyARN": f"arn:aws:autoscaling:us-east-1:1234:scalingPolicy:abc:resource/{RID}",
+        "PolicyName": "TrackConcurrency",
+        "ServiceNamespace": "sagemaker",
+        "ResourceId": RID,
+        "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+        "PolicyType": "TargetTrackingScaling",
+        "CreationTime": T0,
+    }
+
+
+def _stub_capture(aas_stub: Stubber, sm_stub: Stubber, *, suspended: bool) -> None:
+    """Queue the three calls one ``fixture.capture()`` makes, in order."""
+    aas_stub.add_response(
+        "describe_scalable_targets", {"ScalableTargets": [_scalable_target(suspended=suspended)]}
+    )
+    aas_stub.add_response("describe_scaling_policies", {"ScalingPolicies": [_scaling_policy()]})
+    sm_stub.add_response("describe_endpoint", _variant(desired=1, current=1))
+
+
+def _record_calls(client: Any, name: str, calls: list[tuple[str, str]]) -> None:
+    """Append ``(client_name, operation)`` for every call this client makes.
+
+    The Stubbers still validate each request and response; this only records the
+    *interleaving across two clients*, which is the claim being made — suspension before
+    the capacity change, and both restores after the failure. Two separate response
+    queues cannot express an ordering between them.
+    """
+    client.meta.events.register(
+        "before-parameter-build.*.*",
+        lambda **kwargs: calls.append((name, kwargs["model"].name)),
+    )
+
+
+class TestMeasureFreezesBeforeItRaisesCapacity:
+    """The ordering that keeps a second cause out of the measurement.
+
+    Application Auto Scaling suspension does not block our own
+    ``UpdateEndpointWeightsAndCapacities``, so the freeze can come first and the trigger
+    still works. If it did not, the probe's own load would fire the live policy — the
+    deployed alarm reads ``ConcurrentRequestsPerModel``/``Maximum`` against 0.713, which
+    any probe clears tenfold, and target tracking then jumps straight to ``max_capacity``.
+    Instances arriving from two causes inside one measurement is the best explanation for
+    the 1->4 jump observed on 2026-07-31, and it is invisible in the resulting number.
+    """
+
+    def _run(self, aas: Any, sm: Any, lg: Any, **overrides: Any) -> Any:
+        kwargs: dict[str, Any] = {
+            "model_name": "kokoro-82m",
+            "endpoint": ENDPOINT,
+            "variant": VARIANT,
+            "ladder_p95_ms": LADDER,
+            "texts": ["The birch canoe slid on the smooth planks."],
+            "voice": "af_heart",
+            "probe_concurrency": 10,
+            # No warm-up and a token settle: the waits are this module's own choices, and
+            # a test that slept through them would only be measuring time.sleep.
+            "warmup_s": 0.0,
+            "settle_s": 0.01,
+            "poll_interval_s": 0.0,
+            "appscaling": aas,
+            "sagemaker": sm,
+            "logs": lg,
+        }
+        kwargs.update(overrides)
+        return measure(**kwargs)
+
+    @pytest.fixture
+    def no_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace the probe with a thread that exits at once, so no traffic is issued.
+
+        `measure` joins whatever it is handed, so this has to be a started thread rather
+        than a stand-in object.
+        """
+
+        def fake_start_probe(**_: Any) -> tuple[threading.Thread, datetime]:
+            thread = threading.Thread(target=lambda: None, name="ttotal-probe-stub", daemon=True)
+            thread.start()
+            return thread, T0
+
+        monkeypatch.setattr(ttotal_mod, "_start_probe", fake_start_probe)
+
+    @pytest.fixture
+    def no_scalable_precondition(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Make a ``require_scalable`` call fail the test rather than reach AWS.
+
+        That precondition demands a *live* policy with headroom, which is exactly what
+        this mode suspends. Calling it would both refuse a run that can work and reopen
+        the mid-run scale-out this freeze exists to lock out.
+        """
+        called: list[str] = []
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            called.append("require_scalable")
+            raise AssertionError("require_scalable has no place under a freeze")
+
+        monkeypatch.setattr(fixture_mod, "require_scalable", refuse)
+        return called
+
+    def _queue_the_run(self, aas_stub: Stubber, sm_stub: Stubber, logs_stub: Stubber) -> None:
+        """Queue every call of one run that fails while polling for the new instance.
+
+        The failure is injected at the poll, which is the earliest point after the
+        capacity change — so the restores below are exercised on the exception path
+        rather than on a clean exit.
+        """
+        # fingerprint_or_registry: the configuration is read before anything is frozen,
+        # because most of T_total is container start and a redeploy mid-run would
+        # otherwise be attributed to whichever image replaced the one under test.
+        sm_stub.add_response("describe_endpoint", _variant(desired=1, current=1))
+        sm_stub.add_response("describe_endpoint_config", _endpoint_config())
+        sm_stub.add_response("describe_model", _model())
+
+        # freeze(): capture, suspend, pin (already at 1), verify.
+        _stub_capture(aas_stub, sm_stub, suspended=False)
+        aas_stub.add_response(
+            "register_scalable_target",
+            {},
+            {
+                "ServiceNamespace": "sagemaker",
+                "ResourceId": RID,
+                "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+                "SuspendedState": SUSPEND_ALL,
+            },
+        )
+        sm_stub.add_response("describe_endpoint", _variant(desired=1, current=1))
+        _stub_capture(aas_stub, sm_stub, suspended=True)
+        # require_frozen(): the enforcement point, and a third capture.
+        _stub_capture(aas_stub, sm_stub, suspended=True)
+        # read_capacity() for the starting count, then the streams to diff against.
+        sm_stub.add_response("describe_endpoint", _variant(desired=1, current=1))
+        logs_stub.add_response("describe_log_streams", {"logStreams": []})
+
+        # The trigger.
+        sm_stub.add_response(
+            "update_endpoint_weights_and_capacities",
+            {"EndpointArn": f"arn:aws:sagemaker:us-east-1:1234:endpoint/{ENDPOINT}"},
+            {
+                "EndpointName": ENDPOINT,
+                "DesiredWeightsAndCapacities": [
+                    {"VariantName": VARIANT, "DesiredInstanceCount": 2}
+                ],
+            },
+        )
+        sm_stub.add_client_error("describe_endpoint", service_error_code="ThrottlingException")
+
+        # restore_desired_count(), from the finally.
+        sm_stub.add_response("describe_endpoint", _variant(desired=2, current=1))
+        sm_stub.add_response(
+            "update_endpoint_weights_and_capacities",
+            {"EndpointArn": f"arn:aws:sagemaker:us-east-1:1234:endpoint/{ENDPOINT}"},
+            {
+                "EndpointName": ENDPOINT,
+                "DesiredWeightsAndCapacities": [
+                    {"VariantName": VARIANT, "DesiredInstanceCount": 1}
+                ],
+            },
+        )
+        # thaw(), from frozen.__exit__: the captured state, not a blanket resume.
+        aas_stub.add_response(
+            "register_scalable_target",
+            {},
+            {
+                "ServiceNamespace": "sagemaker",
+                "ResourceId": RID,
+                "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+                "SuspendedState": {
+                    "DynamicScalingInSuspended": False,
+                    "DynamicScalingOutSuspended": False,
+                    "ScheduledScalingSuspended": False,
+                },
+            },
+        )
+
+    def test_it_suspends_scaling_before_it_raises_the_count_and_restores_both_after(
+        self,
+        appscaling: Any,
+        sagemaker: Any,
+        logs: Any,
+        no_probe: None,
+        no_scalable_precondition: list[str],
+    ) -> None:
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        lg, logs_stub = logs
+        calls: list[tuple[str, str]] = []
+        _record_calls(aas, "appscaling", calls)
+        _record_calls(sm, "sagemaker", calls)
+        self._queue_the_run(aas_stub, sm_stub, logs_stub)
+
+        with pytest.raises(botocore.exceptions.ClientError):
+            self._run(aas, sm, lg)
+
+        suspended_at = calls.index(("appscaling", "RegisterScalableTarget"))
+        raised_at = calls.index(("sagemaker", "UpdateEndpointWeightsAndCapacities"))
+        assert suspended_at < raised_at
+        # Both restores run on the way out of a failure, capacity first: it has to wait out
+        # an `Updating` endpoint, which thaw's own unconditional restore does not.
+        assert calls[-2:] == [
+            ("sagemaker", "UpdateEndpointWeightsAndCapacities"),
+            ("appscaling", "RegisterScalableTarget"),
+        ]
+        aas_stub.assert_no_pending_responses()
+        sm_stub.assert_no_pending_responses()
+        assert no_scalable_precondition == []
+
+    def test_a_ladder_without_the_halving_rungs_is_refused_before_anything_is_touched(
+        self,
+        appscaling: Any,
+        sagemaker: Any,
+        logs: Any,
+        no_probe: None,
+        no_scalable_precondition: list[str],
+    ) -> None:
+        # Checked first because finding out afterwards costs the whole run: a real
+        # scale-out, a fleet briefly parked at a raised count, and the probe's traffic.
+        # No response is queued on any stub, so any AWS call fails this test.
+        aas, aas_stub = appscaling
+        sm, sm_stub = sagemaker
+        lg, _ = logs
+
+        with pytest.raises(TTotalError, match="no usable p95 at concurrency"):
+            self._run(aas, sm, lg, ladder_p95_ms={1: 92.0, 10: 667.0})
+
+        aas_stub.assert_no_pending_responses()
+        sm_stub.assert_no_pending_responses()
+
+    def test_another_trigger_is_refused(self, appscaling: Any, sagemaker: Any, logs: Any) -> None:
+        # There is one trigger. Driving load past the deployed policy was removed because
+        # it let the policy add instances during the measurement; accepting the string
+        # again would silently restore that.
+        aas, _ = appscaling
+        sm, _ = sagemaker
+        lg, _ = logs
+
+        with pytest.raises(ValueError, match="trigger must be 'force-desired'"):
+            self._run(aas, sm, lg, trigger="drive-load")

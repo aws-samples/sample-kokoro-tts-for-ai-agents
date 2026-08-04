@@ -795,6 +795,35 @@ class TestExitStatusGatesADeploy:
         assert result.exit_code == 1
         assert "past the 2s SageMaker invocation ceiling" in result.output
 
+    def test_a_moved_ceiling_is_the_one_the_config_block_names(self, runner: CliRunner) -> None:
+        # 30s still clears a 3.0s deadline, so this is the *passing* branch -- the one that
+        # read the module constant and so asserted a fit against 60s, a limit this run
+        # never tested. The block is pasted into config.py verbatim, so its comment has to
+        # name the ceiling the invocation_ceiling finding above it actually judged.
+        result = _run(runner, "--peak-rps", "450", "--ceiling-s", "30")
+        assert result.exit_code == 0
+        assert "fits the 30s invocation ceiling" in result.output
+        assert "fits the 60s invocation ceiling" not in result.output
+
+    def test_an_unmoved_ceiling_still_names_sixty(self, runner: CliRunner) -> None:
+        # The constant is the default, so an ordinary run reads exactly as it did before
+        # the ceiling started travelling on the plan.
+        result = _run(runner, "--peak-rps", "450")
+        assert result.exit_code == 0
+        assert "fits the 60s invocation ceiling" in result.output
+
+    def test_a_moved_ceiling_that_stops_the_plan_claims_no_fit_at_all(
+        self, runner: CliRunner
+    ) -> None:
+        # Both halves at once, which is the shape of a real --ceiling-s run that fails:
+        # the verdict comes off the finding so nothing claims a fit, and the 2s that was
+        # judged does not turn into a printed 60s on the way out either.
+        result = _run(runner, "--peak-rps", "450", "--ceiling-s", "2")
+        assert result.exit_code == 1
+        assert "EXCEEDS the invocation ceiling" in result.output
+        assert "fits the 2s invocation ceiling" not in result.output
+        assert "fits the 60s invocation ceiling" not in result.output
+
     def test_the_worst_verdict_is_printed_first(self, runner: CliRunner) -> None:
         # A STOP must not scroll off the top behind six OK lines -- that ordering is the
         # whole reason the ceiling is a verdict rather than a log line.
