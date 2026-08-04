@@ -33,12 +33,29 @@ VOICES_NAME = os.environ.get("VOICES_NAME", "voices-v1.0.bin")
 MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "56"))
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = "af_heart"
+WARMUP_TEXT = os.environ.get("WARMUP_TEXT", "Warming up.")
 
 _logger = logging.getLogger("kokoro_serve")
 
 _kokoro = None
 _g2p = None
 _inference_lock: asyncio.Lock | None = None
+
+#: See the identical block in ../kokoro/serve.py. Each container is its own
+#: Docker build context, so this cannot be imported from a shared module until
+#: the DockerImageAsset context changes.
+_STAGE_EPOCH = float(os.environ.get("CONTAINER_START_EPOCH") or time.time())
+
+
+def _stage(name: str) -> None:
+    """Emit a startup-stage marker, parsed by `tts-bench ttotal`."""
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+    print(
+        f"=== STAGE {name} t={stamp}.{int(now % 1 * 1000):03d}Z "
+        f"elapsed_s={now - _STAGE_EPOCH:.3f} ===",
+        flush=True,
+    )
 
 
 def _get_model():
@@ -96,13 +113,39 @@ def _samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     return header + pcm
 
 
+def _warmup() -> int:
+    """Run one discarded synthesis, exercising both G2P and the ONNX session.
+
+    Both are lazily initialized, so without this the first real caller pays for
+    espeak dictionary loading and the ONNX provider's first-run graph
+    optimization. Returns samples generated; see ../kokoro/serve.py:_warmup for
+    why a failure here is not fatal.
+    """
+    model = _get_model()
+    phonemes = _phonemize(WARMUP_TEXT)
+    samples, _ = _synthesize(model, phonemes, DEFAULT_VOICE, 1.0)
+    return int(np.asarray(samples).size)
+
+
 @asynccontextmanager
 async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     global _inference_lock
     _inference_lock = asyncio.Lock()
+
+    _stage("framework_init")
     _get_model()
     _get_g2p()
+    _stage("weights_ready")
+
+    try:
+        count = _warmup()
+        _logger.info("Warm-up complete, %d samples discarded", count)
+    except Exception:
+        _logger.exception("Warm-up inference failed; serving anyway")
+    _stage("warmup_done")
+
     _logger.info("Model and G2P loaded, ready to serve")
+    _stage("ready")
     yield
 
 
@@ -125,13 +168,18 @@ async def invocations(request: Request) -> Response:
         return JSONResponse(status_code=400, content={"error": "text is required"})
 
     t0 = time.perf_counter()
-    phonemes = _phonemize(text)
+    loop = asyncio.get_event_loop()
+
+    # G2P is synchronous CPU work (espeak shells out), so running it inline would
+    # block the event loop for every concurrent request - including /ping, which
+    # SageMaker reads as an unhealthy instance. It is deliberately outside the
+    # inference lock: phonemization is stateless, so it can overlap other requests'
+    # synthesis and only the ONNX session needs serializing.
+    phonemes = await loop.run_in_executor(None, _phonemize, text)
 
     model = _get_model()
     async with _inference_lock:
-        samples, sr = await asyncio.get_event_loop().run_in_executor(
-            None, _synthesize, model, phonemes, voice, speed
-        )
+        samples, sr = await loop.run_in_executor(None, _synthesize, model, phonemes, voice, speed)
 
     wav_bytes = _samples_to_wav(samples, sr)
     elapsed = time.perf_counter() - t0
@@ -149,13 +197,31 @@ async def invocations(request: Request) -> Response:
     )
 
 
+async def _receive_message(websocket: WebSocket) -> str:
+    """Read one client frame as text, whatever frame type it arrived as.
+
+    SageMaker's bidirectional transport forwards ``RequestPayloadPart`` as a
+    *binary* WebSocket frame, so ``receive_text()`` raises ``KeyError: 'text'``
+    on every request from ``invoke_endpoint_with_bidirectional_stream`` — the
+    only way this endpoint is invoked in production. Browsers and the local
+    test client send text frames. Accept both rather than picking one.
+    """
+    message = await websocket.receive()
+    if message["type"] == "websocket.disconnect":
+        raise WebSocketDisconnect(message.get("code", 1000))
+    payload = message.get("text")
+    if payload is None:
+        payload = message.get("bytes", b"").decode("utf-8")
+    return payload
+
+
 async def bidirectional_stream(websocket: WebSocket) -> None:
     """WebSocket handler for streaming TTS."""
     await websocket.accept()
 
     try:
         while True:
-            raw = await websocket.receive_text()
+            raw = await _receive_message(websocket)
             msg = json.loads(raw)
 
             if msg.get("type") == "close":
@@ -179,11 +245,14 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
             )
 
             t0 = time.monotonic()
-            phonemes = _phonemize(text)
+            loop = asyncio.get_event_loop()
+
+            # Off the event loop for the same reason as the /invocations path.
+            phonemes = await loop.run_in_executor(None, _phonemize, text)
 
             model = _get_model()
             async with _inference_lock:
-                samples, sr = await asyncio.get_event_loop().run_in_executor(
+                samples, sr = await loop.run_in_executor(
                     None, _synthesize, model, phonemes, voice, speed
                 )
 

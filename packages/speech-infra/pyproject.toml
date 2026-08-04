@@ -9,7 +9,14 @@ dependencies = [
     "constructs>=10.0.0",
     "loguru>=0.7.0",
     "click>=8.1.0",
+    # For shared.stages, the startup-marker format contract the container images
+    # emit against. The containers themselves cannot import it (each is its own
+    # Docker build context), so the tests are what hold emitter and parser together.
+    "shared",
 ]
+
+[tool.uv.sources]
+shared = { workspace = true }
 
 [project.scripts]
 speech-infra = "speech_infra.cli:cli"

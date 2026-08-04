@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import aws_cdk as cdk
 import aws_cdk.aws_ecr_assets as ecr_assets
 import aws_cdk.aws_iam as iam
 from constructs import Construct
 
+from speech_infra import measurements
 from speech_infra.config import ModelEndpointConfig
+from speech_infra.constructs.observability import EndpointObservability
 from speech_infra.constructs.scaling import EndpointAutoscaling
 from speech_infra.constructs.vllm_endpoint import VllmStreamingEndpoint
 
@@ -25,6 +29,7 @@ class SpeechEndpointStack(cdk.Stack):
         container_dir: str,
         image_uri_override: str | None = None,
         model_bucket_name: str | None = None,
+        artifact_dir: Path | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -45,6 +50,9 @@ class SpeechEndpointStack(cdk.Stack):
         env_overrides["AWS_REGION"] = self.region
         env_overrides["AWS_DEFAULT_REGION"] = self.region
 
+        if model_config.queue_max_depth > 0:
+            env_overrides["MAX_QUEUE_DEPTH"] = str(model_config.queue_max_depth)
+
         if model_bucket_name:
             s3_uri = f"s3://{model_bucket_name}/models/{model_config.hf_model_id}/"
             env_overrides["MODEL_S3_URI"] = s3_uri
@@ -62,7 +70,18 @@ class SpeechEndpointStack(cdk.Stack):
             env_overrides=env_overrides,
         )
 
-        if model_config.scaling_enabled:
+        # scaling_enabled alone is a static config property (max_instances >
+        # min_instances) — it says nothing about whether the thresholds inside are
+        # measured. scaling_target_value is a plain float, so a hand-set number and a
+        # `plan`-computed one are indistinguishable by type; that indistinguishability
+        # is how 0.713 -- a client occupancy deployed against a server statistic,
+        # satisfiable by no positive arrival rate -- reached this endpoint without
+        # anything refusing to synth it. scaling_thresholds_measured reads the actual
+        # `plan` artifact, mirroring the "no measurement, no alarm" rule
+        # EndpointObservability's own ttfab_alarm already applies.
+        if model_config.scaling_enabled and measurements.scaling_thresholds_measured(
+            model_config.model_name, artifact_dir=artifact_dir
+        ):
             autoscaling = EndpointAutoscaling(
                 self,
                 "Autoscaling",
@@ -70,3 +89,16 @@ class SpeechEndpointStack(cdk.Stack):
                 endpoint_name=model_config.endpoint_name,
             )
             autoscaling.node.add_dependency(endpoint)
+
+            # Gated on the same condition as scaling, not added unconditionally: the
+            # alarms are all about whether scaling is keeping up, and the dashboard
+            # annotates the two scaling thresholds, which a non-scaling model has no
+            # measured values for.
+            observability = EndpointObservability(
+                self,
+                "Observability",
+                model_config=model_config,
+                endpoint_name=model_config.endpoint_name,
+                artifact_dir=artifact_dir,
+            )
+            observability.node.add_dependency(endpoint)

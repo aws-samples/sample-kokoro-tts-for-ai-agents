@@ -2,12 +2,15 @@
 
 Provides:
 - GET /ping: health check
-- POST /invocations: streaming TTS inference (per KPipeline segment)
+- POST /invocations: streaming TTS inference (per-sentence chunks)
 - WS /invocations-bidirectional-stream: streaming TTS over WebSocket
 
 Uses the PyTorch `kokoro` package with KPipeline for native CUDA
-inference on A10G GPU. Single model instance with asyncio.Lock
-serialization — the model is fast enough (0.12s/inference) that
+inference. Runs on A10G (ml.g5, sm_86) and L4 (ml.g6, sm_89) off the same
+pinned cu124 wheel — its newest 8.x cubin is sm_86, which is forward
+compatible within the major arch — so this logs the GPU it actually found
+rather than assuming one. Single model instance with asyncio.Lock
+serialization; the model is fast enough (0.12s/inference on A10G) that
 multi-session adds negligible benefit.
 
 /invocations selects its wire shape from two body fields, both defaulting to
@@ -44,8 +47,10 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 MAX_REQUEST_AGE_S = float(os.environ.get("MAX_REQUEST_AGE_S", "56"))
+MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "0"))
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = "af_heart"
+WARMUP_TEXT = os.environ.get("WARMUP_TEXT", "Warming up.")
 MP3_BITRATE_KBPS = 48
 MP3_QUALITY = 2
 
@@ -56,10 +61,40 @@ TRANSPORT_SSE = "sse"
 
 _MEDIA_TYPES = {FORMAT_WAV: "audio/wav", FORMAT_MP3: "audio/mpeg"}
 
+_inflight: int = 0
+
 _logger = logging.getLogger("kokoro_serve")
 
 _pipeline: KPipeline | None = None
 _inference_lock: asyncio.Lock | None = None
+
+#: Container start, for `elapsed_s` on the stage markers below. Taken from the
+#: entrypoint via `CONTAINER_START_EPOCH` where one exists; this container is
+#: started directly by `CMD`, so process start is the earliest point observable
+#: from inside. Image pull is bounded externally by the log stream's first event.
+_STAGE_EPOCH = float(os.environ.get("CONTAINER_START_EPOCH") or time.time())
+
+
+def _stage(name: str) -> None:
+    """Emit a startup-stage marker, parsed by `tts-bench ttotal`.
+
+    T_total is the scaling lag the whole capacity plan is most sensitive to, and
+    it is only actionable when attributed to a stage. The format is
+    byte-identical across all four containers so a single parser reads them all;
+    `time.strftime` rather than `datetime.UTC` because this image and
+    chatterbox's are ubuntu22.04-based (Python 3.10, no `datetime.UTC`), and
+    the emitters must not diverge between containers.
+
+    `elapsed_s` runs from container start, so a log stream whose earlier lines
+    aged out is still partially usable.
+    """
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+    print(
+        f"=== STAGE {name} t={stamp}.{int(now % 1 * 1000):03d}Z "
+        f"elapsed_s={now - _STAGE_EPOCH:.3f} ===",
+        flush=True,
+    )
 
 
 def _load_pipeline() -> KPipeline:
@@ -109,11 +144,44 @@ def _samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     return header + pcm
 
 
+def _warmup() -> int:
+    """Run one discarded synthesis so the first real request does not pay for JIT.
+
+    The pipeline being loaded is not the same as it being ready: CUDA kernel
+    autotune happens on first inference, so without this the first caller after a
+    scale-out absorbs it. T_total should measure time-to-serving-*good*-traffic,
+    which makes paying that cost here — before uvicorn accepts connections — the
+    right trade.
+
+    Returns:
+        Samples generated, for the log line. Zero is not fatal: a container that
+        cannot warm up can still serve, and failing startup over it would turn a
+        latency problem into an outage.
+    """
+    samples = _synthesize_full(WARMUP_TEXT, DEFAULT_VOICE, 1.0)
+    return int(samples.size)
+
+
 @asynccontextmanager
 async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     global _inference_lock
     _inference_lock = asyncio.Lock()
+
+    _stage("framework_init")
     _load_pipeline()
+    _stage("weights_ready")
+
+    try:
+        count = _warmup()
+        print(f"[kokoro] Warm-up complete, {count} samples discarded", flush=True)
+    except Exception:
+        # Logged and swallowed: see _warmup. The marker is still emitted so
+        # ttotal's stage sequence stays complete and the warm-up cost is visible
+        # even when the warm-up itself failed.
+        _logger.exception("Warm-up inference failed; serving anyway")
+    _stage("warmup_done")
+
+    _stage("ready")
     yield
 
 
@@ -365,6 +433,23 @@ async def _invocations_sync(
 
 async def invocations(request: Request) -> Response:
     """TTS: accept text, return audio (chunked WAV by default)."""
+    global _inflight
+
+    # Admission gate: checked and incremented before any await so the asyncio
+    # event loop cannot interleave another request between the check and the
+    # increment. Streaming responses decrement via _inflight_wrap; the sync
+    # path decrements in a try/finally.
+    if MAX_QUEUE_DEPTH > 0 and _inflight >= MAX_QUEUE_DEPTH:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "queue_saturated",
+                "queue_depth": _inflight,
+                "max_queue_depth": MAX_QUEUE_DEPTH,
+            },
+        )
+    _inflight += 1
+
     body = json.loads(await request.body())
     text = body.get("text", "")
     voice = body.get("voice", DEFAULT_VOICE)
@@ -375,37 +460,72 @@ async def invocations(request: Request) -> Response:
 
     request_ts = body.get("request_timestamp")
     if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
+        _inflight -= 1
         return JSONResponse(status_code=408, content={"error": "request_stale"})
 
     if not text:
+        _inflight -= 1
         return JSONResponse(status_code=400, content={"error": "text is required"})
 
     if audio_format not in _MEDIA_TYPES:
+        _inflight -= 1
         return JSONResponse(
             status_code=400,
             content={"error": f"format must be one of {sorted(_MEDIA_TYPES)}"},
         )
 
     if transport not in (TRANSPORT_BINARY, TRANSPORT_SSE):
+        _inflight -= 1
         return JSONResponse(
             status_code=400,
             content={"error": f"transport must be '{TRANSPORT_BINARY}' or '{TRANSPORT_SSE}'"},
         )
 
+    async def _inflight_wrap(gen: AsyncGenerator[bytes, None]) -> AsyncGenerator[bytes, None]:
+        global _inflight
+        try:
+            async for chunk in gen:
+                yield chunk
+        finally:
+            _inflight -= 1
+
     if transport == TRANSPORT_SSE:
         return StreamingResponse(
-            _sse_generator(text, voice, speed, audio_format, body.get("request_id", "unknown")),
+            _inflight_wrap(
+                _sse_generator(text, voice, speed, audio_format, body.get("request_id", "unknown"))
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     if not use_stream:
-        return await _invocations_sync(text, voice, speed, audio_format)
+        try:
+            return await _invocations_sync(text, voice, speed, audio_format)
+        finally:
+            _inflight -= 1
 
     return StreamingResponse(
-        _stream_sentences_generator(text, voice, speed, audio_format),
+        _inflight_wrap(_stream_sentences_generator(text, voice, speed, audio_format)),
         media_type=_MEDIA_TYPES[audio_format],
     )
+
+
+async def _receive_message(websocket: WebSocket) -> str:
+    """Read one client frame as text, whatever frame type it arrived as.
+
+    SageMaker's bidirectional transport forwards ``RequestPayloadPart`` as a
+    *binary* WebSocket frame, so ``receive_text()`` raises ``KeyError: 'text'``
+    on every request from ``invoke_endpoint_with_bidirectional_stream`` — the
+    only way this endpoint is invoked in production. Browsers and the local
+    test client send text frames. Accept both rather than picking one.
+    """
+    message = await websocket.receive()
+    if message["type"] == "websocket.disconnect":
+        raise WebSocketDisconnect(message.get("code", 1000))
+    payload = message.get("text")
+    if payload is None:
+        payload = message.get("bytes", b"").decode("utf-8")
+    return payload
 
 
 async def bidirectional_stream(websocket: WebSocket) -> None:
@@ -413,7 +533,7 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
 
     try:
         while True:
-            raw = await websocket.receive_text()
+            raw = await _receive_message(websocket)
             msg = json.loads(raw)
 
             if msg.get("type") == "close":
