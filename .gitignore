@@ -71,3 +71,6 @@ packages/models/*/uv.lock
 # the small JSON summary next to them is the artifact worth keeping, since
 # `tts-bench plan --measured` reads that one.
 artifacts/*.jsonl
+
+# Result archive zips (large, transient, not tracked)
+*.zip
