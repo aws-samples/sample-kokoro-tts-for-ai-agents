@@ -692,7 +692,8 @@ def variant_instance_type(
 
     for entry in config.get("ProductionVariants", []):
         if entry.get("VariantName") == variant:
-            return entry.get("InstanceType")
+            instance_type: str | None = entry.get("InstanceType")
+            return instance_type
     return None
 
 

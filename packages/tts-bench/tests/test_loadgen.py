@@ -39,6 +39,7 @@ from tts_bench.loadgen import (
     LoadEvent,
     StepResult,
     build_text_pool,
+    event_sink,
     make_instance_count_fetcher,
     run_step,
     summarize_window,
@@ -1230,6 +1231,86 @@ class TestJsonlWriter:
                 invoke=FakeServer(service_time_s=0.01, slots=8),
             )
         assert len(path.read_text().splitlines()) == len(result.events)
+
+
+class TestEventSink:
+    """`--events` is optional, so the sink has to be jointly a writer and a no-op.
+
+    The CLI passes whatever `--events` held straight through, and click yields `None`
+    when the flag is absent. Both jobs sit behind one context manager so the calling
+    command needs no branch of its own.
+    """
+
+    def test_a_path_yields_a_writer_that_records_events(self, tmp_path) -> None:
+        path = tmp_path / "events.jsonl"
+        with event_sink(path) as writer:
+            assert isinstance(writer, JsonlWriter)
+            writer(_event(seq=0))
+        assert json.loads(path.read_text())["seq"] == 0
+
+    def test_a_string_path_is_accepted(self, tmp_path) -> None:
+        # click.Path() hands the CLI a str, not a Path.
+        path = tmp_path / "events.jsonl"
+        with event_sink(str(path)) as writer:
+            assert isinstance(writer, JsonlWriter)
+            writer(_event())
+        assert path.exists()
+
+    def test_none_yields_none_and_writes_nothing(self, tmp_path) -> None:
+        # `--events` omitted. The sink is jointly the flag's absence, so `run_step`
+        # receives `None` and skips per-event writing entirely.
+        before = set(tmp_path.iterdir())
+        with event_sink(None) as writer:
+            assert writer is None
+        assert set(tmp_path.iterdir()) == before
+
+    def test_an_empty_string_means_the_same_as_omitting_the_flag(self) -> None:
+        # `--events ""` is falsy but not None. Treating it as a path would resolve to
+        # the CWD and raise IsADirectoryError on enter.
+        with event_sink("") as writer:
+            assert writer is None
+
+    def test_closes_the_handle_on_exit(self, tmp_path) -> None:
+        with event_sink(tmp_path / "events.jsonl") as writer:
+            pass
+        assert writer is not None
+        with pytest.raises(RuntimeError, match="outside its context manager"):
+            writer(_event())
+
+    def test_is_usable_as_a_run_step_sink(self, tmp_path) -> None:
+        path = tmp_path / "events.jsonl"
+        with event_sink(path) as writer:
+            result = run_step(
+                client=None,
+                model="m",
+                endpoint="e",
+                voice="v",
+                texts=TEXTS,
+                concurrency=4,
+                duration_s=0.3,
+                monitor_interval_s=0.05,
+                event_sink=writer,
+                invoke=FakeServer(service_time_s=0.01, slots=4),
+            )
+        assert len(path.read_text().splitlines()) == len(result.events)
+
+    def test_run_step_accepts_the_none_sink_too(self, tmp_path) -> None:
+        # The whole point of the union type: both arms are valid `event_sink=` values.
+        with event_sink(None) as writer:
+            result = run_step(
+                client=None,
+                model="m",
+                endpoint="e",
+                voice="v",
+                texts=TEXTS,
+                concurrency=4,
+                duration_s=0.3,
+                monitor_interval_s=0.05,
+                event_sink=writer,
+                invoke=FakeServer(service_time_s=0.01, slots=4),
+            )
+        assert result.events
+        assert not list(tmp_path.iterdir())
 
 
 class TestLoadEvent:

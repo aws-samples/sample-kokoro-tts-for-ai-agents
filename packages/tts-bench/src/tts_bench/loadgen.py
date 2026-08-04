@@ -54,6 +54,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
@@ -464,6 +465,22 @@ class JsonlWriter:
         with self._lock:
             self._handle.write(line + "\n")
             self._handle.flush()
+
+
+def event_sink(path: Path | str | None) -> AbstractContextManager[JsonlWriter | None]:
+    """A per-event JSONL sink, or a no-op context yielding ``None`` when unwanted.
+
+    A function rather than a ``JsonlWriter(p) if p else nullcontext()`` expression at each
+    call site: the ternary's two arms have no common supertype but ``object``, which is
+    what mypy infers for it, and ``object`` has no ``__enter__``. The declared return type
+    here gives both arms one type to converge on.
+
+    Falsy rather than ``is None``, matching the ternary this replaced: ``--events ""``
+    means the same as omitting the flag, and would otherwise open the CWD as a file.
+    """
+    if not path:
+        return nullcontext()
+    return JsonlWriter(path)
 
 
 class _InFlight:

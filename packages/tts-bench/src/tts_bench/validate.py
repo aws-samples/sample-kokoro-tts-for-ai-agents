@@ -44,8 +44,9 @@ class ValidateFinding:
 
 def load_plan(path: str | Path) -> dict[str, Any]:
     """Read a plan artifact and return the inner ``plan`` dict."""
-    raw = json.loads(Path(path).read_text())
-    return raw["plan"]
+    raw: dict[str, Any] = json.loads(Path(path).read_text())
+    plan: dict[str, Any] = raw["plan"]
+    return plan
 
 
 def _check_scale_out(

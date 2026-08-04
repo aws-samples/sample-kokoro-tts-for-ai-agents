@@ -656,7 +656,11 @@ class QMaxReport(BaseModel):
         """
         return self.ladder_p95_ms.get(concurrency)
 
-    @computed_field  # type: ignore[prop-decorator]
+    # Bare ignore, not a coded one: mypy names this "misc" through 1.11 and
+    # "prop-decorator" from 1.12, so either code is unused on the other version and
+    # trips warn_unused_ignores. The @property must stay — without it mypy reads
+    # attribute access as a Callable.
+    @computed_field  # type: ignore
     @property
     def ttfab_p95_at_c1_ms(self) -> float | None:
         """p95 first-byte time with one request outstanding.

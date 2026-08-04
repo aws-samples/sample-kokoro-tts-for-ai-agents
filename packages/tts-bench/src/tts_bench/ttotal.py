@@ -344,7 +344,7 @@ class TTotalReport:
         Python lifespan.
         """
         observed = [e for e in self.timeline if e.at is not None]
-        return sorted(observed, key=lambda e: (e.at, e.stage))  # type: ignore[arg-type,return-value]
+        return sorted(observed, key=lambda e: (e.at, e.stage))
 
     @property
     def missing_stages(self) -> list[str]:

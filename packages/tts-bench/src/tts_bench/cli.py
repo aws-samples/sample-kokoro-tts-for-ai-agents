@@ -449,15 +449,13 @@ def qmax(
             "cannot be backfilled after the run."
         )
 
-    from contextlib import nullcontext
-
     from tts_bench.fixture import FixtureError
-    from tts_bench.loadgen import JsonlWriter
+    from tts_bench.loadgen import event_sink
 
     try:
-        # JsonlWriter opens on enter and flushes every event, so a run killed at
+        # The sink opens on enter and flushes every event, so a run killed at
         # the interesting moment has still written the interesting moment.
-        with JsonlWriter(events) if events else nullcontext() as writer:
+        with event_sink(events) as writer:
             report = qmax_mod.measure(
                 model=model,
                 texts=texts,
@@ -841,12 +839,10 @@ def ttotal(
         f"up to {max_wait_s / 60:.0f} min, then restore both."
     )
 
-    from contextlib import nullcontext
-
-    from tts_bench.loadgen import JsonlWriter
+    from tts_bench.loadgen import event_sink
 
     try:
-        with JsonlWriter(events) if events else nullcontext() as writer:
+        with event_sink(events) as writer:
             report = ttotal_mod.measure(
                 model_name=model,
                 endpoint=endpoint,

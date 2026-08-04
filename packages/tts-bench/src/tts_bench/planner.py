@@ -450,12 +450,16 @@ def _shed_probability(measured: Measured, c_scale_max: float, q_max: int) -> flo
     since a fabricated probability is worse than a missing one.
     """
     try:
-        return shed_probability(
+        # Annotated locals throughout this module: `shared` ships no py.typed, so under
+        # --ignore-missing-imports every capacity helper resolves to Any and returning
+        # one directly trips warn_return_any.
+        probability: float = shed_probability(
             c_scale_max,
             float(q_max),
             measured.t_total_s,
             measured.s_mean_s,
         )
+        return probability
     except ValueError as exc:
         logger.warning("Cannot simulate shedding at C_scale_max {}: {}", c_scale_max, exc)
         return None
@@ -474,9 +478,11 @@ def _fleet_for(
     traffic the inference is the weaker of the two.
     """
     if streams is not None:
-        return n_instances_from_streams(streams, target_concurrency)
+        from_streams: int = n_instances_from_streams(streams, target_concurrency)
+        return from_streams
     if rps is not None:
-        return n_instances(rps, s_mean_s, target_concurrency)
+        from_rps: int = n_instances(rps, s_mean_s, target_concurrency)
+        return from_rps
     return 0
 
 
