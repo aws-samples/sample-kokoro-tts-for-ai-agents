@@ -2,8 +2,8 @@
 
 Fakes mirror the patterns already proven in tts_eval/tests/test_synthesize.py
 (response-stream) and tts_bench/tests/test_bidi.py (bidi). The bidi
-fakes patch ``tts_client.client.SageMakerRuntimeHTTP2Client`` directly rather
-than injecting a client, because :meth:`TTSClient.synthesize_bidi`
+fakes patch ``tts_client._bidi_transport.SageMakerRuntimeHTTP2Client``
+directly rather than injecting a client, because :meth:`TTSClient.synthesize_bidi`
 deliberately builds its own client per call and accepts none — see the
 client module's docstring for why sharing one is unsafe with the installed
 SDK.
@@ -246,7 +246,7 @@ class TestSynthesizeBidi:
         events = [_payload_event(PCM_100MS), _control_frame(type="synthesis_complete")]
         fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             result = client.synthesize_bidi(
                 "speech-kokoro-82m", SynthesisRequest(text="hello", voice="af_heart")
@@ -261,7 +261,7 @@ class TestSynthesizeBidi:
         events = [_control_frame(type="error", message="queue_saturated: try later")]
         fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             with pytest.raises(QueueSaturatedError):
                 client.synthesize_bidi(
@@ -275,7 +275,7 @@ class TestSynthesizeBidi:
         ]
         fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             with pytest.raises(ServerError, match="boom"):
                 client.synthesize_bidi(
@@ -291,7 +291,7 @@ class TestSynthesizeBidi:
         ]
         fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             with pytest.raises(ServerError, match="infra blip"):
                 client.synthesize_bidi(
@@ -302,7 +302,7 @@ class TestSynthesizeBidi:
         events = [_control_frame(type="synthesis_complete")]
         fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             with pytest.raises(TTSClientError, match="no audio bytes"):
                 client.synthesize_bidi(
@@ -314,7 +314,7 @@ class TestSynthesizeBidi:
         stream = _FakeStream(events)
         fake_ctor = _FakeBidiClientCtor(stream)
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             client.synthesize_bidi(
                 "speech-kokoro-82m", SynthesisRequest(text="hello world", voice="af_bella")
@@ -343,7 +343,7 @@ class TestSynthesizeBidi:
 
         fake_ctor = _TrackingCtor(_FakeStream(events))
         # Reset the stream's consumed events between calls.
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             fake_ctor._stream = _FakeStream(events)
             client.synthesize_bidi(
@@ -372,7 +372,7 @@ class TestSynthesizeBidi:
         )
         fake_ctor = _FakeBidiClientCtor(stream)
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             client.synthesize_bidi(
                 "speech-kokoro-82m", SynthesisRequest(text="hello", voice="af_heart")
@@ -390,7 +390,7 @@ class TestSynthesizeBidi:
         stream = _FakeStream([_payload_event(PCM_100MS), _control_frame(type="synthesis_complete")])
         fake_ctor = _FakeBidiClientCtor(stream)
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             client.synthesize_bidi(
                 "speech-kokoro-82m", SynthesisRequest(text="hello", voice="af_heart")
@@ -407,7 +407,7 @@ class TestSynthesizeBidi:
         events = [_payload_event(pcm), _control_frame(type="synthesis_complete")]
         fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             result = client.synthesize_bidi(
                 "speech-kokoro-82m", SynthesisRequest(text="hello", voice="af_heart")
@@ -423,7 +423,7 @@ class TestSynthesizeBidi:
         events = [_payload_event(b'{"just": "text"}'), _control_frame(type="synthesis_complete")]
         fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
 
-        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
             client = TTSClient()
             with pytest.raises(TTSClientError, match="no audio bytes"):
                 client.synthesize_bidi(

@@ -39,7 +39,7 @@ from aws_sdk_sagemaker_runtime_http2.models import (
     RequestStreamEventPayloadPart,
 )
 
-from tts_client.client import (
+from tts_client._bidi_transport import (
     BIDI_SAMPLE_RATE,
     _build_bidi_message,
     _close_quietly,
