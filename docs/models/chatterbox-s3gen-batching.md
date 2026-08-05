@@ -41,7 +41,7 @@ Two explicit restrictions prevent batching:
 
 ## Why Batching Is Feasible (Unlike Kokoro)
 
-Unlike Kokoro-82M (see `docs/kokoro-batching-limitation.md`), where variable-length duration expansion makes batching architecturally impossible, Chatterbox's S3Gen uses standard transformer/U-Net components that natively support batched tensors:
+Unlike Kokoro-82M (see [`kokoro-batching-limitation.md`](kokoro-batching-limitation.md)), where variable-length duration expansion makes batching architecturally impossible, Chatterbox's S3Gen uses standard transformer/U-Net components that natively support batched tensors:
 
 | Component | Batch Support | Evidence |
 |-----------|:---:|---|

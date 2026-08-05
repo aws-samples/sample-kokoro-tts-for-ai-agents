@@ -115,7 +115,8 @@ newline-separated text.
 
 `ws://localhost:8080/invocations-bidirectional-stream` streams **raw PCM only** —
 no MP3, by design. See the bidirectional contract in
-`tts-architecture-reference.md`. Playback here is one-way (no barge-in).
+[`../historical/model-research-2026-05.md`](../historical/model-research-2026-05.md).
+Playback here is one-way (no barge-in).
 
 ## Verification
 
