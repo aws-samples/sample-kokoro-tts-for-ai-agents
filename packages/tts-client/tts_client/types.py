@@ -65,3 +65,22 @@ class SynthesisResult(BaseModel):
     ttfab_ms: float | None = None
     chars: int
     chunks: int = 0
+
+
+class SynthesisChunk(BaseModel):
+    """One text chunk's audio, from a :meth:`TTSClient.synthesize_bidi_stream` session.
+
+    ``audio_bytes`` is raw PCM, not WAV-wrapped: a caller consuming several
+    chunks concatenates them in ``seq`` order and wraps once at the end
+    (see ``streaming.concat_chunks_to_wav``), rather than paying a WAV header
+    per chunk. ``ttfab_ms`` is set only on the first chunk of a session,
+    measured from session-open — later chunks reuse the same connection, so
+    their first-byte time is not a meaningful "time to first audio" signal.
+    """
+
+    seq: int
+    text: str
+    audio_bytes: bytes
+    ttfab_ms: float | None = None
+    duration_s: float
+    sample_rate: int

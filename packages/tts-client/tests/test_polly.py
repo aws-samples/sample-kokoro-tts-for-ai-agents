@@ -109,7 +109,9 @@ class TestSynthesize:
     def test_custom_sample_rate_is_reflected_on_the_result(self) -> None:
         wav = _make_minimal_wav(sr=16000)
         client, _ = _client_with(wav)
-        result = client.synthesize(voice_id="Salli", engine="standard", text="hi", sample_rate=16000)
+        result = client.synthesize(
+            voice_id="Salli", engine="standard", text="hi", sample_rate=16000
+        )
         assert result.sample_rate == 16000
 
     def test_ttfab_reads_only_the_first_chunk_not_the_whole_stream(self) -> None:

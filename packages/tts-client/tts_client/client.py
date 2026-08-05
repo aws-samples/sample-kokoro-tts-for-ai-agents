@@ -28,7 +28,7 @@ import asyncio
 import json
 import struct
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import boto3
 import botocore.exceptions
@@ -55,6 +55,11 @@ from tts_client.errors import (
     raise_for_error_frame,
 )
 from tts_client.types import AudioFormat, SynthesisRequest, SynthesisResult
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from tts_client.streaming import BidiChunkStream
 
 #: Just above SageMaker's 60s invocation ceiling. A client timeout below the
 #: server's own limit would report a client timeout for requests the server
@@ -126,6 +131,117 @@ def _build_payload(request: SynthesisRequest) -> bytes:
         else time.time(),
     }
     return json.dumps(body).encode("utf-8")
+
+
+def _build_bidi_message(
+    text: str,
+    voice: str,
+    request_timestamp: float | None,
+    *,
+    speed: float | None = None,
+) -> bytes:
+    """Serialize one bidi text message.
+
+    ``speed`` is omitted unless explicitly passed, matching the wire shape
+    :meth:`TTSClient.synthesize_bidi` has always sent. Kokoro's bidi handler
+    defaults an absent ``speed`` to 1.0 server-side, so omitting it there is
+    not a behavior change; :meth:`TTSClient.synthesize_bidi_stream` passes it
+    explicitly so a non-default speed is honored per chunk.
+    """
+    body: dict[str, Any] = {
+        "text": text,
+        "voice": voice,
+        "request_timestamp": request_timestamp if request_timestamp is not None else time.time(),
+    }
+    if speed is not None:
+        body["speed"] = speed
+    return json.dumps(body).encode("utf-8")
+
+
+async def _open_bidi_stream(region: str, endpoint: str) -> Any:
+    """Open a fresh HTTP/2 bidirectional stream to ``endpoint``.
+
+    See the module docstring for why this builds a fresh client per call
+    rather than sharing one across ``TTSClient`` instances.
+    """
+    http2_config = Http2Config(
+        endpoint_uri=f"https://runtime.sagemaker.{region}.amazonaws.com:{BIDI_PORT}",
+        region=region,
+        aws_credentials_identity_resolver=Boto3CredentialsResolver(),
+        auth_scheme_resolver=HTTPAuthSchemeResolver(),
+        auth_schemes={"aws.auth#sigv4": SigV4AuthScheme(service="sagemaker")},
+    )
+    client = SageMakerRuntimeHTTP2Client(config=http2_config)
+    try:
+        return await client.invoke_endpoint_with_bidirectional_stream(
+            InvokeEndpointWithBidirectionalStreamInput(endpoint_name=endpoint)
+        )
+    except Exception as exc:  # noqa: BLE001 - the SDK's error taxonomy is open
+        raise_for_bidi_exception(exc)
+        raise AssertionError("unreachable") from exc
+
+
+class _DrainResult(NamedTuple):
+    """One message's worth of drained bidi output.
+
+    ``ended_cleanly`` is ``True`` only for an explicit ``synthesis_complete``
+    frame, ``False`` when the stream ended with ``event is None`` instead. A
+    single-message caller can ignore this (the "no audio bytes" check is its
+    safety net), but a multi-message session needs it: a connection dropped
+    between chunk 2 and chunk 3 must raise rather than be mistaken for "chunk
+    2 done, send chunk 3."
+    """
+
+    pcm_bytes: bytes
+    chunk_count: int
+    ttfab_ms: float | None
+    ended_cleanly: bool
+
+
+async def _drain_until_complete(output_stream: Any, t0: float) -> _DrainResult:
+    """Read one message's response frames until ``synthesis_complete`` or EOF."""
+    audio_chunks: list[bytes] = []
+    ttfab_ms: float | None = None
+    ended_cleanly = False
+
+    while True:
+        event = await output_stream.receive()
+        if event is None:
+            break
+        if isinstance(event, ResponseStreamEventModelStreamError):
+            raise ServerError(str(getattr(event.value, "message", "")))
+        if isinstance(event, ResponseStreamEventInternalStreamFailure):
+            raise ServerError(str(getattr(event.value, "message", "")))
+
+        payload = getattr(event, "value", None)
+        chunk = getattr(payload, "bytes_", None)
+        if not chunk:
+            continue
+
+        # The containers multiplex JSON control frames and raw PCM on one
+        # stream, distinguished only by whether the payload starts with `{`.
+        # A chunk that starts that way but does not decode is audio, not a
+        # malformed frame.
+        decoded = _decode_control_frame(chunk) if chunk[0:1] == b"{" else None
+        if decoded is not None:
+            frame_type = decoded.get("type")
+            if frame_type == "error":
+                raise_for_error_frame(str(decoded.get("message", "")))
+            if frame_type == "synthesis_complete":
+                ended_cleanly = True
+                break
+            continue
+
+        if ttfab_ms is None:
+            ttfab_ms = (time.perf_counter() - t0) * 1000.0
+        audio_chunks.append(chunk)
+
+    return _DrainResult(
+        pcm_bytes=b"".join(audio_chunks),
+        chunk_count=len(audio_chunks),
+        ttfab_ms=ttfab_ms,
+        ended_cleanly=ended_cleanly,
+    )
 
 
 class TTSClient:
@@ -252,34 +368,9 @@ class TTSClient:
     async def _synthesize_bidi_async(
         self, endpoint: str, request: SynthesisRequest
     ) -> SynthesisResult:
-        http2_config = Http2Config(
-            endpoint_uri=f"https://runtime.sagemaker.{self._region}.amazonaws.com:{BIDI_PORT}",
-            region=self._region,
-            aws_credentials_identity_resolver=Boto3CredentialsResolver(),
-            auth_scheme_resolver=HTTPAuthSchemeResolver(),
-            auth_schemes={"aws.auth#sigv4": SigV4AuthScheme(service="sagemaker")},
-        )
-        client = SageMakerRuntimeHTTP2Client(config=http2_config)
-
-        message = json.dumps(
-            {
-                "text": request.text,
-                "voice": request.voice,
-                "request_timestamp": request.request_timestamp
-                if request.request_timestamp is not None
-                else time.time(),
-            }
-        ).encode("utf-8")
-
+        message = _build_bidi_message(request.text, request.voice, request.request_timestamp)
         t0 = time.perf_counter()
-
-        try:
-            stream = await client.invoke_endpoint_with_bidirectional_stream(
-                InvokeEndpointWithBidirectionalStreamInput(endpoint_name=endpoint)
-            )
-        except Exception as exc:  # noqa: BLE001 - the SDK's error taxonomy is open
-            raise_for_bidi_exception(exc)
-            raise AssertionError("unreachable") from exc
+        stream = await _open_bidi_stream(self._region, endpoint)
 
         try:
             await stream.input_stream.send(
@@ -289,40 +380,7 @@ class TTSClient:
             # it right after send makes SageMaker tear the connection down
             # before the container reads the payload.
             _, output_stream = await stream.await_output()
-
-            audio_chunks: list[bytes] = []
-            ttfab_ms: float | None = None
-
-            while True:
-                event = await output_stream.receive()
-                if event is None:
-                    break
-                if isinstance(event, ResponseStreamEventModelStreamError):
-                    raise ServerError(str(getattr(event.value, "message", "")))
-                if isinstance(event, ResponseStreamEventInternalStreamFailure):
-                    raise ServerError(str(getattr(event.value, "message", "")))
-
-                payload = getattr(event, "value", None)
-                chunk = getattr(payload, "bytes_", None)
-                if not chunk:
-                    continue
-
-                # The containers multiplex JSON control frames and raw PCM on
-                # one stream, distinguished only by whether the payload
-                # starts with `{`. A chunk that starts that way but does not
-                # decode is audio, not a malformed frame.
-                decoded = _decode_control_frame(chunk) if chunk[0:1] == b"{" else None
-                if decoded is not None:
-                    frame_type = decoded.get("type")
-                    if frame_type == "error":
-                        raise_for_error_frame(str(decoded.get("message", "")))
-                    if frame_type == "synthesis_complete":
-                        break
-                    continue
-
-                if ttfab_ms is None:
-                    ttfab_ms = (time.perf_counter() - t0) * 1000.0
-                audio_chunks.append(chunk)
+            drained = await _drain_until_complete(output_stream, t0)
         except TTSClientError:
             # Already classified above (a control-frame error, or the
             # ModelStreamError/InternalStreamFailure cases) — reclassifying it
@@ -337,12 +395,11 @@ class TTSClient:
             await _close_quietly(stream)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        pcm_bytes = b"".join(audio_chunks)
-        if not pcm_bytes:
+        if not drained.pcm_bytes:
             raise TTSClientError("bidi stream completed with no audio bytes", http_status=200)
 
-        audio = _pcm_to_wav(pcm_bytes)
-        duration_s = len(pcm_bytes) / (BIDI_SAMPLE_RATE * 2)
+        audio = _pcm_to_wav(drained.pcm_bytes)
+        duration_s = len(drained.pcm_bytes) / (BIDI_SAMPLE_RATE * 2)
 
         return SynthesisResult(
             audio_bytes=audio,
@@ -350,10 +407,49 @@ class TTSClient:
             sample_rate=BIDI_SAMPLE_RATE,
             duration_s=duration_s,
             latency_ms=latency_ms,
-            ttfab_ms=ttfab_ms or latency_ms,
+            ttfab_ms=drained.ttfab_ms or latency_ms,
             chars=len(request.text),
-            chunks=len(audio_chunks),
+            chunks=drained.chunk_count,
         )
+
+    def synthesize_bidi_stream(
+        self,
+        endpoint: str,
+        voice: str,
+        text_source: str | Iterable[str],
+        *,
+        speed: float = 1.0,
+    ) -> BidiChunkStream:
+        """Stream text to ``endpoint`` as one message per sentence, on one bidi session.
+
+        ``text_source`` is either a complete string (split into sentences and
+        sent one at a time) or an iterable of fragments arriving over time
+        (e.g. an upstream LLM's token stream) -- see the ``streaming`` module
+        docstring for why one chunker handles both without two code paths.
+
+        Chunk N+1 is not sent until chunk N's audio has fully arrived: every
+        bidi container's handler is strictly sequential, so this does not
+        overlap synthesis across chunks. What it buys is not waiting for the
+        entire text to be assembled before sending anything -- chunk 1 starts
+        synthesizing as soon as it is available.
+
+        Returns:
+            A :class:`~tts_client.streaming.BidiChunkStream`: an iterator of
+            :class:`~tts_client.types.SynthesisChunk`. Use as a context
+            manager for deterministic cleanup on early exit::
+
+                with client.synthesize_bidi_stream(endpoint, voice, text) as stream:
+                    for chunk in stream:
+                        ...
+
+        Raises:
+            ValueError: if ``text_source`` produces no sentences to synthesize.
+            TTSClientError: or a subclass, for any modeled SDK error, an
+                in-band ``error`` frame, or the connection dropping mid-session.
+        """
+        from tts_client.streaming import BidiChunkStream
+
+        return BidiChunkStream(self._region, endpoint, voice, text_source, speed)
 
 
 def _decode_control_frame(chunk: bytes) -> dict[str, Any] | None:
