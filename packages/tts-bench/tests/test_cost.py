@@ -20,8 +20,21 @@ from tts_bench.cost import (
     hourly_rate,
     measure_sustained_throughput,
 )
+from tts_client.client import TTSClient
+from tts_client.types import AudioFormat, SynthesisResult
 from tts_eval.synthesize import ENDPOINT_MAP
 from tts_inference.types import TTSModelName
+
+
+def _result(latency_ms: float, chars: int) -> SynthesisResult:
+    return SynthesisResult(
+        audio_bytes=b"",
+        audio_format=AudioFormat.WAV,
+        sample_rate=24000,
+        duration_s=1.0,
+        latency_ms=latency_ms,
+        chars=chars,
+    )
 
 
 @pytest.fixture
@@ -184,28 +197,28 @@ class TestCostPerMChars:
 
 class TestFindSaturationConcurrency:
     def test_returns_last_good_level(self) -> None:
-        client = MagicMock()
-        client.synthesize_stream.return_value = {"chars": 40, "latency_ms": 1000}
+        client = MagicMock(spec=TTSClient)
+        client.synthesize.return_value = _result(1000, 40)
 
         result = find_saturation_concurrency(
-            client, TTSModelName.KOKORO_82M, "test", max_concurrency=8
+            client, "speech-kokoro-82m", "af_heart", "test", max_concurrency=8
         )
         assert result in SATURATION_LEVELS
 
     def test_handles_failures_at_high_concurrency(self) -> None:
-        client = MagicMock()
+        client = MagicMock(spec=TTSClient)
         call_count = {"n": 0}
 
         def _mock_stream(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] > 4:
                 raise RuntimeError("overloaded")
-            return {"chars": 40, "latency_ms": 1000}
+            return _result(1000, 40)
 
-        client.synthesize_stream.side_effect = _mock_stream
+        client.synthesize.side_effect = _mock_stream
 
         result = find_saturation_concurrency(
-            client, TTSModelName.KOKORO_82M, "test", max_concurrency=8
+            client, "speech-kokoro-82m", "af_heart", "test", max_concurrency=8
         )
         assert result >= 1
 
@@ -230,12 +243,13 @@ class TestPollyCost:
 
 class TestMeasureSustainedThroughput:
     def test_counts_completed_requests(self) -> None:
-        client = MagicMock()
-        client.synthesize_stream.return_value = {"chars": 40, "latency_ms": 100}
+        client = MagicMock(spec=TTSClient)
+        client.synthesize.return_value = _result(100, 40)
 
         result = measure_sustained_throughput(
             client,
-            TTSModelName.KOKORO_82M,
+            "speech-kokoro-82m",
+            "af_heart",
             ["hello world"],
             concurrency=2,
             window_s=1.0,

@@ -839,38 +839,49 @@ class TestTransportAgnosticism:
         assert all(e.outcome == InvokeOutcome.OK.value for e in result.events)
 
     def test_drives_the_real_bidi_transport_end_to_end(self) -> None:
-        # The bidi transport wraps each session in asyncio.run inside the worker
-        # thread it was called on. run_step gives each worker its own thread, so
-        # this is the test that the two actually compose — a shared or missing
-        # event loop fails here rather than mid-ladder.
-        from tests.test_bidi import PCM_100MS, FakeBidiClient, FakeStream, _payload_event
+        # invoke_bidi calls TTSClient.synthesize_bidi, which wraps each
+        # session in its own asyncio.run() inside the worker thread it was
+        # called on. run_step gives each worker its own thread, so this is
+        # the test that the two actually compose — a shared or missing event
+        # loop fails here rather than mid-ladder. TTSClient itself is built
+        # fresh per call (invoke_bidi ignores the `client` it's handed, per
+        # its docstring), so this patches TTSClient's construction rather
+        # than injecting a client the way the other tests in this class do.
+        from unittest.mock import patch
+
         from tts_bench.bidi import invoke_bidi
+        from tts_client.client import TTSClient
+        from tts_client.types import AudioFormat, SynthesisResult
 
-        class PerRequestClient:
-            """A fresh scripted session per request, as a real endpoint gives."""
+        sessions = {"n": 0}
+        lock = threading.Lock()
 
-            def __init__(self) -> None:
-                self.sessions = 0
-                self._lock = threading.Lock()
+        def _fake_synthesize_bidi(self, endpoint, request):
+            with lock:
+                sessions["n"] += 1
+            return SynthesisResult(
+                audio_bytes=b"\x00\x01" * 2400,
+                audio_format=AudioFormat.WAV,
+                sample_rate=24000,
+                duration_s=0.1,
+                latency_ms=1.0,
+                ttfab_ms=0.5,
+                chars=len(request.text),
+                chunks=1,
+            )
 
-            async def invoke_endpoint_with_bidirectional_stream(self, input_):
-                with self._lock:
-                    self.sessions += 1
-                delegate = FakeBidiClient(FakeStream([_payload_event(PCM_100MS)]))
-                return await delegate.invoke_endpoint_with_bidirectional_stream(input_)
-
-        client = PerRequestClient()
-        result = run_step(
-            client=client,
-            model="kokoro-82m",
-            endpoint="speech-kokoro-82m",
-            voice="af_heart",
-            texts=TEXTS,
-            concurrency=4,
-            duration_s=0.3,
-            monitor_interval_s=0.05,
-            invoke=invoke_bidi,
-        )
+        with patch.object(TTSClient, "synthesize_bidi", _fake_synthesize_bidi):
+            result = run_step(
+                client=None,
+                model="kokoro-82m",
+                endpoint="speech-kokoro-82m",
+                voice="af_heart",
+                texts=TEXTS,
+                concurrency=4,
+                duration_s=0.3,
+                monitor_interval_s=0.05,
+                invoke=invoke_bidi,
+            )
 
         completed = [e for e in result.events if e.end_ts is not None]
         assert completed
@@ -878,7 +889,7 @@ class TestTransportAgnosticism:
         # The accounting the ladder reads is populated on this transport too.
         assert all(e.audio_duration_s > 0 for e in completed)
         assert all(e.ttfab_ms is not None for e in completed)
-        assert client.sessions == len(completed)
+        assert sessions["n"] == len(completed)
         assert result.worker_overlaps == 0
 
 

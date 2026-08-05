@@ -9,7 +9,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from loguru import logger
 
-from tts_eval.synthesize import SynthesisClient
+from tts_bench.invoke import resolve_endpoint, resolve_voice
+from tts_client.client import TTSClient
+from tts_client.types import SynthesisRequest
 from tts_inference.types import TTSModelName
 
 #: SageMaker real-time inference, us-east-1, on-demand. The g5 and g6 rows were read
@@ -116,8 +118,9 @@ def cost_per_m_chars(
 
 
 def find_saturation_concurrency(
-    client: SynthesisClient,
-    model: TTSModelName,
+    client: TTSClient,
+    endpoint: str,
+    voice: str,
     text: str,
     max_concurrency: int = 32,
 ) -> int:
@@ -150,8 +153,9 @@ def find_saturation_concurrency(
         successes = 0
         errors = 0
 
+        request = SynthesisRequest(text=text, voice=voice)
         with ThreadPoolExecutor(max_workers=level) as executor:
-            futures = [executor.submit(client.synthesize_stream, model, text) for _ in range(level)]
+            futures = [executor.submit(client.synthesize, endpoint, request) for _ in range(level)]
             for future in as_completed(futures):
                 try:
                     future.result()
@@ -195,8 +199,9 @@ def find_saturation_concurrency(
 
 
 def measure_sustained_throughput(
-    client: SynthesisClient,
-    model: TTSModelName,
+    client: TTSClient,
+    endpoint: str,
+    voice: str,
     texts: list[str],
     concurrency: int,
     window_s: float = 60.0,
@@ -216,9 +221,9 @@ def measure_sustained_throughput(
             with lock:
                 text = next(text_iter)
             try:
-                result = client.synthesize_stream(model, text)
+                result = client.synthesize(endpoint, SynthesisRequest(text=text, voice=voice))
                 with lock:
-                    counters["total_chars"] += result["chars"]
+                    counters["total_chars"] += result.chars
                     counters["total_requests"] += 1
             except Exception:
                 if stop_event.is_set():
@@ -265,7 +270,6 @@ def calculate_cost(
     2. Runs sustained load at that concurrency for window_s seconds
     3. Calculates: $/M chars = (instance_cost_per_hr / chars_per_hr) * 1_000_000
     """
-    client = SynthesisClient(region=region)
     model = TTSModelName(model)
 
     if model in POLLY_COST_PER_M_CHARS:
@@ -281,16 +285,20 @@ def calculate_cost(
             "window_s": 0,
         }
 
+    client = TTSClient(region=region)
+    endpoint = resolve_endpoint(model)
+    voice = resolve_voice(model)
+
     instance_type = MODEL_INSTANCE_TYPES.get(model, DEFAULT_INSTANCE_TYPE)
     instance_cost = hourly_rate(instance_type)
 
     probe_text = texts[0] if texts else "The birch canoe slid on the smooth planks."
     saturation = find_saturation_concurrency(
-        client, model, probe_text, max_concurrency=max_concurrency
+        client, endpoint, voice, probe_text, max_concurrency=max_concurrency
     )
 
     throughput = measure_sustained_throughput(
-        client, model, texts, concurrency=saturation, window_s=window_s
+        client, endpoint, voice, texts, concurrency=saturation, window_s=window_s
     )
 
     chars_per_hr = throughput["chars_per_hr"]

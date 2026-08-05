@@ -12,9 +12,11 @@ from pathlib import Path
 from loguru import logger
 
 from shared.types import TTSSample
+from tts_client.client import TTSClient
+from tts_client.types import SynthesisRequest
 from tts_eval.metrics.utmos import UTMOSScorer
 from tts_eval.metrics.wer import WERScorer
-from tts_eval.synthesize import SynthesisClient
+from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP, SynthesisClient
 from tts_inference.types import TTSModelName
 
 
@@ -85,8 +87,8 @@ class EvalRunner:
         self._max_workers = max_workers
         self._streaming_mode = streaming_mode
 
-        self._client = SynthesisClient(region=region)
-        self._region = region
+        self._client = TTSClient(region=region)
+        self._polly_client = SynthesisClient(region=region)
         self._utmos = UTMOSScorer()
         self._wer = WERScorer(region=region) if not skip_wer else None
 
@@ -143,17 +145,33 @@ class EvalRunner:
         self, model: TTSModelName, sample: TTSSample, model_dir: Path
     ) -> EvalResult:
         """Evaluate a single model x sample pair."""
+        is_polly = model in (
+            TTSModelName.POLLY_STANDARD,
+            TTSModelName.POLLY_NEURAL,
+            TTSModelName.POLLY_GENERATIVE,
+        )
         try:
-            if self._streaming_mode == "bidirectional" and model not in (
-                TTSModelName.POLLY_STANDARD,
-                TTSModelName.POLLY_NEURAL,
-                TTSModelName.POLLY_GENERATIVE,
-            ):
-                from tts_eval.bidi_client import synthesize_bidirectional
-
-                synthesis = synthesize_bidirectional(model, sample.text, region=self._region)
+            if is_polly:
+                polly_result = self._polly_client.synthesize(model, sample.text)
+                audio_bytes = polly_result["audio_bytes"]
+                audio_format = polly_result["audio_format"]
+                latency_ms = polly_result["latency_ms"]
+                duration_s = polly_result["duration_s"]
+                ttfab_ms = polly_result.get("ttfab_ms")
+                sample_rate = polly_result["sample_rate"]
             else:
-                synthesis = self._client.synthesize_stream(model, sample.text)
+                endpoint = ENDPOINT_MAP[model]
+                request = SynthesisRequest(text=sample.text, voice=DEFAULT_VOICES[model])
+                if self._streaming_mode == "bidirectional":
+                    result = self._client.synthesize_bidi(endpoint, request)
+                else:
+                    result = self._client.synthesize(endpoint, request)
+                audio_bytes = result.audio_bytes
+                audio_format = result.audio_format.value
+                latency_ms = result.latency_ms
+                duration_s = result.duration_s
+                ttfab_ms = result.ttfab_ms
+                sample_rate = result.sample_rate
         except Exception as e:
             return EvalResult(
                 model=model.value,
@@ -162,20 +180,14 @@ class EvalRunner:
                 error=f"Synthesis failed: {e}",
             )
 
-        audio_format = synthesis.get("audio_format", "wav")
         audio_path = model_dir / f"{sample.id}.{audio_format}"
-        audio_path.write_bytes(synthesis["audio_bytes"])
+        audio_path.write_bytes(audio_bytes)
 
-        latency_ms = synthesis["latency_ms"]
-        duration_s = synthesis["duration_s"]
-        ttfab_ms = synthesis.get("ttfab_ms")
         rtf = (latency_ms / 1000) / duration_s if duration_s and duration_s > 0 else None
 
         utmos_score = None
         try:
-            utmos_score = self._utmos.score_bytes(
-                synthesis["audio_bytes"], synthesis["sample_rate"]
-            )
+            utmos_score = self._utmos.score_bytes(audio_bytes, sample_rate)
         except Exception as e:
             logger.warning("UTMOS scoring failed for {}/{}: {}", model.value, sample.id, e)
 
@@ -185,8 +197,8 @@ class EvalRunner:
             try:
                 wer_result = self._wer.score(
                     reference_text=sample.text,
-                    audio_bytes=synthesis["audio_bytes"],
-                    sample_rate=synthesis["sample_rate"],
+                    audio_bytes=audio_bytes,
+                    sample_rate=sample_rate,
                     audio_format=audio_format,
                 )
                 wer_score = float(wer_result["wer"])

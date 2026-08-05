@@ -1,16 +1,12 @@
 """Invocation path for capacity benchmarking.
 
-Separate from :class:`tts_eval.synthesize.SynthesisClient` for two reasons that
-both distort measurements:
-
-1. That client builds boto3 clients with no ``botocore.Config``, so
-   ``max_pool_connections`` defaults to 10. Above ten in-flight streams urllib3
-   silently queues connections, and the benchmark measures the client's
-   connection pool instead of the server's queue.
-2. boto3 retries by default. A retry turns one measured request into several
-   attempts under one latency, and hides the failure behind an eventual success
-   — so a saturating endpoint reports as slow rather than as saturated, which is
-   the distinction the whole measurement rests on.
+Calls :class:`tts_client.client.TTSClient` with ``retries=False`` — a retry
+turns one measured request into several attempts under one latency, hiding
+the failure behind an eventual success, so a saturating endpoint would report
+as slow rather than as saturated, which is the distinction the whole
+measurement rests on. ``TTSClient`` exists precisely so this benchmark and
+every other caller share one wire implementation instead of each building
+its own boto3 client.
 
 Nothing here is swallowed: every request resolves to exactly one
 :class:`InvokeOutcome`, so a run's totals always reconcile against the requests
@@ -19,26 +15,23 @@ it dispatched.
 
 from __future__ import annotations
 
-import json
-import struct
 import time
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
 
-import botocore.exceptions
-from botocore.client import BaseClient
-from botocore.config import Config
-
-from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP, wav_duration
+from tts_client.client import TTSClient
+from tts_client.errors import (
+    ModelError,
+    QueueSaturatedError,
+    RequestStaleError,
+    ServerError,
+    ThrottledError,
+    TTSClientError,
+    TTSTimeoutError,
+)
+from tts_client.types import SynthesisRequest
+from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP
 from tts_inference.types import TTSModelName
-
-#: Just above SageMaker's 60s invocation ceiling. A client timeout below the
-#: server's own limit would report client_timeout for requests the server was
-#: still entitled to finish, misattributing the failure.
-DEFAULT_READ_TIMEOUT_S = 65.0
-
-DEFAULT_CONNECT_TIMEOUT_S = 5.0
 
 
 class InvokeOutcome(StrEnum):
@@ -71,14 +64,6 @@ class InvokeOutcome(StrEnum):
 
     ERROR = "error"
     """Unclassified. Investigate rather than aggregate."""
-
-
-#: Container status codes mapped through SageMaker's ``ModelError`` wrapper.
-_ORIGINAL_STATUS_OUTCOMES: dict[int, InvokeOutcome] = {
-    408: InvokeOutcome.STALE_408,
-    429: InvokeOutcome.THROTTLED_429,
-    503: InvokeOutcome.SATURATED_503,
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,112 +108,38 @@ class InvokeResult:
         return (self.latency_ms / 1000.0) / self.audio_duration_s
 
 
-def make_runtime_client(
-    region: str,
-    *,
-    max_pool: int,
-    read_timeout: float = DEFAULT_READ_TIMEOUT_S,
-    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_S,
-) -> BaseClient:
-    """Build a ``sagemaker-runtime`` client that will not throttle the benchmark.
+#: Maps each TTSClientError subclass onto the InvokeOutcome it corresponds to.
+#: Built to mirror tts_client.errors's classification one-to-one, since that
+#: module already does the SageMaker-ModelError-unwrapping/status-code work
+#: this benchmark used to do itself. All of tts_client's exceptions are flat
+#: subclasses of TTSClientError (no further hierarchy), so an exact type
+#: lookup is enough -- a caught exception whose exact class is not here (only
+#: the base TTSClientError itself) falls through to InvokeOutcome.ERROR.
+_ERROR_OUTCOMES: dict[type[TTSClientError], InvokeOutcome] = {
+    RequestStaleError: InvokeOutcome.STALE_408,
+    QueueSaturatedError: InvokeOutcome.SATURATED_503,
+    ThrottledError: InvokeOutcome.THROTTLED_429,
+    ServerError: InvokeOutcome.SERVER_5XX,
+    ModelError: InvokeOutcome.MODEL_ERROR,
+    TTSTimeoutError: InvokeOutcome.CLIENT_TIMEOUT,
+}
 
-    Args:
-        region: AWS region.
-        max_pool: Connection pool size. Must exceed the highest concurrency the
-            run will reach, or urllib3 queues connections and the measured knee
-            is the pool's, not the model's. Callers should pass their peak
-            in-flight bound with headroom.
-        read_timeout: Per-read timeout. Defaults just above SageMaker's 60s
-            ceiling so the server's limit is always the binding one.
-        connect_timeout: TCP connect timeout.
 
-    Returns:
-        A configured client. **Retries are disabled** (``max_attempts=0``).
+def _outcome_for(exc: TTSClientError) -> InvokeOutcome:
+    """The InvokeOutcome for a raised TTSClientError.
+
+    A bare ``TTSClientError`` (none of the coded subclasses) with
+    ``http_status=200`` is ``TTSClient``'s "stream completed with no audio
+    bytes" case — an HTTP 200 the endpoint answered but produced nothing
+    useful from, which is a model failure, not an unclassified one.
     """
-    config = Config(
-        region_name=region,
-        max_pool_connections=max_pool,
-        read_timeout=read_timeout,
-        connect_timeout=connect_timeout,
-        retries={"max_attempts": 0},
-        tcp_keepalive=True,
-    )
-    import boto3
-
-    return boto3.client("sagemaker-runtime", config=config)
-
-
-def classify_client_error(exc: botocore.exceptions.ClientError) -> tuple[InvokeOutcome, int | None]:
-    """Map a botocore ``ClientError`` to an outcome and the meaningful status.
-
-    SageMaker wraps any container non-2xx in ``ModelError`` (HTTP 424) and puts
-    the container's real status in ``OriginalStatusCode``. Classifying on the
-    outer 424 would collapse "queue full", "request too old", and "model
-    crashed" into one bucket, so the wrapper is unwrapped first.
-
-    Returns:
-        ``(outcome, status)`` where ``status`` is the container's original status
-        when SageMaker supplied one, otherwise the HTTP status of the response.
-    """
-    response: dict[str, Any] = getattr(exc, "response", {}) or {}
-    error = response.get("Error", {})
-    code = error.get("Code", "")
-    metadata = response.get("ResponseMetadata", {})
-    http_status = metadata.get("HTTPStatusCode")
-
-    original = response.get("OriginalStatusCode")
-    if original is not None:
-        try:
-            original_int = int(original)
-        except (TypeError, ValueError):
-            original_int = None
-        if original_int is not None:
-            mapped = _ORIGINAL_STATUS_OUTCOMES.get(original_int)
-            if mapped is not None:
-                return mapped, original_int
-            if 500 <= original_int < 600:
-                return InvokeOutcome.SERVER_5XX, original_int
-            return InvokeOutcome.MODEL_ERROR, original_int
-
-    if code in ("ThrottlingException", "TooManyRequestsException"):
-        return InvokeOutcome.THROTTLED_429, http_status or 429
-    if code == "ServiceUnavailable":
-        return InvokeOutcome.SATURATED_503, http_status or 503
-    if code in ("InternalFailure", "InternalServerError", "InternalStreamFailure"):
-        return InvokeOutcome.SERVER_5XX, http_status or 500
-    if code == "ModelError":
-        return InvokeOutcome.MODEL_ERROR, http_status
-    if code in ("ValidationError", "ValidationException"):
-        # A malformed payload is a benchmark bug, not a capacity finding. It
-        # stays distinct from model_error so it cannot be read as saturation.
-        return InvokeOutcome.ERROR, http_status or 400
-
-    if isinstance(http_status, int):
-        mapped = _ORIGINAL_STATUS_OUTCOMES.get(http_status)
-        if mapped is not None:
-            return mapped, http_status
-        if 500 <= http_status < 600:
-            return InvokeOutcome.SERVER_5XX, http_status
-
-    return InvokeOutcome.ERROR, http_status
-
-
-def build_payload(text: str, voice: str, *, request_ts: float) -> bytes:
-    """Serialize the invocation body.
-
-    ``request_timestamp`` is the **actual send time**, which is what the
-    containers subtract from ``time.time()`` to decide whether a request has
-    aged past ``MAX_REQUEST_AGE_S`` (``kokoro/serve.py:215`` and equivalents).
-    Sending anything else — a deadline, say — would make that age negative and
-    silently disable the server-side staleness check we want exercised.
-    """
-    return json.dumps({"text": text, "voice": voice, "request_timestamp": request_ts}).encode(
-        "utf-8"
-    )
+    if type(exc) is TTSClientError and exc.http_status == 200:
+        return InvokeOutcome.MODEL_ERROR
+    return _ERROR_OUTCOMES.get(type(exc), InvokeOutcome.ERROR)
 
 
 def invoke_stream(
-    client: BaseClient,
+    client: TTSClient,
     endpoint: str,
     text: str,
     voice: str,
@@ -238,15 +149,16 @@ def invoke_stream(
     """Stream one synthesis and classify the result. Never raises.
 
     Args:
-        client: A client from :func:`make_runtime_client`.
+        client: A :class:`TTSClient`, built with ``retries=False``.
         endpoint: SageMaker endpoint name.
         text: Text to synthesize.
         voice: Voice id.
-        deadline_ts: Optional epoch time after which the client abandons the
-            stream, reporting ``CLIENT_TIMEOUT``. Independent of the server's
-            own staleness check: this bounds how long *we* wait, while
-            ``request_timestamp`` in the payload lets the *container* decide the
-            request is too old to be worth serving.
+        deadline_ts: Unused. ``TTSClient.synthesize`` has no mid-stream hook to
+            abandon a request early, so the read timeout it already builds
+            in (just above SageMaker's 60s ceiling) is the only backstop now.
+            Kept as a parameter so this still matches
+            :func:`tts_bench.bidi.invoke_bidi`'s signature for
+            ``loadgen.run_step(invoke=...)``.
 
     Returns:
         An :class:`InvokeResult`. Every failure path is classified rather than
@@ -254,150 +166,43 @@ def invoke_stream(
     """
     dispatch_ts = time.time()
     t0 = time.perf_counter()
-    payload = build_payload(text, voice, request_ts=dispatch_ts)
+    request = SynthesisRequest(text=text, voice=voice, request_timestamp=dispatch_ts)
 
-    def _elapsed_ms() -> float:
-        return (time.perf_counter() - t0) * 1000.0
-
-    def _failure(
-        outcome: InvokeOutcome,
-        *,
-        status: int | None = None,
-        exc: BaseException | None = None,
-    ) -> InvokeResult:
+    try:
+        result = client.synthesize(endpoint, request)
+    except TTSClientError as exc:
+        # TTSClient raises the bare base class, not a coded subclass, for a
+        # 200 that produced no audio -- name it EmptyResponse to match what
+        # this benchmark called that case before the client existed.
+        is_empty = type(exc) is TTSClientError and exc.http_status == 200
         return InvokeResult(
-            outcome=outcome,
+            outcome=_outcome_for(exc),
             dispatch_ts=dispatch_ts,
             end_ts=time.time(),
-            latency_ms=_elapsed_ms(),
+            latency_ms=(time.perf_counter() - t0) * 1000.0,
             chars=len(text),
-            http_status=status,
-            error_class=type(exc).__name__ if exc is not None else None,
-            error_message=str(exc)[:500] if exc is not None else None,
+            http_status=exc.http_status,
+            error_class="EmptyResponse" if is_empty else type(exc).__name__,
+            error_message=str(exc)[:500],
         )
 
-    try:
-        response = client.invoke_endpoint_with_response_stream(
-            EndpointName=endpoint,
-            ContentType="application/json",
-            Accept="audio/wav",
-            Body=payload,
-        )
-    except botocore.exceptions.ReadTimeoutError as exc:
-        return _failure(InvokeOutcome.CLIENT_TIMEOUT, exc=exc)
-    except botocore.exceptions.ConnectTimeoutError as exc:
-        return _failure(InvokeOutcome.CLIENT_TIMEOUT, exc=exc)
-    except botocore.exceptions.ClientError as exc:
-        outcome, status = classify_client_error(exc)
-        return _failure(outcome, status=status, exc=exc)
-    except botocore.exceptions.BotoCoreError as exc:
-        # Covers connection-pool exhaustion and endpoint resolution problems:
-        # client-side faults that must not be counted as server saturation.
-        return _failure(InvokeOutcome.ERROR, exc=exc)
-
-    chunks: list[bytes] = []
-    ttfab_ms: float | None = None
-    first_byte_ts: float | None = None
-
-    try:
-        for event in response["Body"]:
-            if "PayloadPart" in event:
-                chunk = event["PayloadPart"]["Bytes"]
-                if not chunk:
-                    continue
-                if ttfab_ms is None:
-                    ttfab_ms = _elapsed_ms()
-                    first_byte_ts = time.time()
-                chunks.append(chunk)
-                if deadline_ts is not None and time.time() > deadline_ts:
-                    # Abandon mid-stream. Reported as our timeout, not a server
-                    # failure, and the partial audio is discarded.
-                    return _failure(InvokeOutcome.CLIENT_TIMEOUT)
-                continue
-
-            # Mid-stream faults arrive as events on a response that already
-            # returned HTTP 200 — the failure mode behind the torch.Tensor
-            # regression in commit caa4dcf.
-            if "ModelStreamError" in event:
-                detail = event["ModelStreamError"]
-                return InvokeResult(
-                    outcome=InvokeOutcome.SERVER_5XX,
-                    dispatch_ts=dispatch_ts,
-                    end_ts=time.time(),
-                    latency_ms=_elapsed_ms(),
-                    first_byte_ts=first_byte_ts,
-                    ttfab_ms=ttfab_ms,
-                    chars=len(text),
-                    audio_bytes=sum(len(c) for c in chunks),
-                    chunks=len(chunks),
-                    error_class="ModelStreamError",
-                    error_message=str(detail.get("Message", ""))[:500],
-                )
-            if "InternalStreamFailure" in event:
-                detail = event["InternalStreamFailure"]
-                return InvokeResult(
-                    outcome=InvokeOutcome.SERVER_5XX,
-                    dispatch_ts=dispatch_ts,
-                    end_ts=time.time(),
-                    latency_ms=_elapsed_ms(),
-                    first_byte_ts=first_byte_ts,
-                    ttfab_ms=ttfab_ms,
-                    chars=len(text),
-                    audio_bytes=sum(len(c) for c in chunks),
-                    chunks=len(chunks),
-                    error_class="InternalStreamFailure",
-                    error_message=str(detail.get("Message", ""))[:500],
-                )
-    except botocore.exceptions.ReadTimeoutError as exc:
-        return _failure(InvokeOutcome.CLIENT_TIMEOUT, exc=exc)
-    except botocore.exceptions.ClientError as exc:
-        outcome, status = classify_client_error(exc)
-        return _failure(outcome, status=status, exc=exc)
-    except botocore.exceptions.BotoCoreError as exc:
-        return _failure(InvokeOutcome.ERROR, exc=exc)
-
-    latency_ms = _elapsed_ms()
     end_ts = time.time()
-    audio = b"".join(chunks)
-
-    if not audio:
-        # HTTP 200 with an empty body. Distinct from a rejection: the endpoint
-        # accepted the work and produced nothing.
-        return InvokeResult(
-            outcome=InvokeOutcome.MODEL_ERROR,
-            dispatch_ts=dispatch_ts,
-            end_ts=end_ts,
-            latency_ms=latency_ms,
-            chars=len(text),
-            http_status=200,
-            error_class="EmptyResponse",
-            error_message="stream completed with no audio bytes",
-        )
+    first_byte_ts = dispatch_ts + result.ttfab_ms / 1000.0 if result.ttfab_ms is not None else None
 
     return InvokeResult(
         outcome=InvokeOutcome.OK,
         dispatch_ts=dispatch_ts,
         end_ts=end_ts,
-        latency_ms=latency_ms,
+        latency_ms=result.latency_ms,
         first_byte_ts=first_byte_ts,
-        ttfab_ms=ttfab_ms,
-        chars=len(text),
-        audio_bytes=len(audio),
-        audio_duration_s=wav_duration(audio),
-        sample_rate=_sample_rate(audio),
+        ttfab_ms=result.ttfab_ms,
+        chars=result.chars,
+        audio_bytes=len(result.audio_bytes),
+        audio_duration_s=result.duration_s,
+        sample_rate=result.sample_rate,
         http_status=200,
-        chunks=len(chunks),
+        chunks=result.chunks,
     )
-
-
-def _sample_rate(audio: bytes) -> int:
-    """Read the sample rate from a RIFF header, 0 if unreadable."""
-    if len(audio) < 28 or audio[:4] != b"RIFF":
-        return 0
-    try:
-        return int(struct.unpack_from("<I", audio, 24)[0])
-    except struct.error:
-        return 0
 
 
 def resolve_endpoint(model: str | TTSModelName) -> str:
@@ -414,7 +219,7 @@ def resolve_endpoint(model: str | TTSModelName) -> str:
             f"{model.value} has no SageMaker endpoint; capacity planning "
             "applies to self-hosted endpoints only"
         )
-    return endpoint
+    return str(endpoint)
 
 
 def resolve_voice(model: str | TTSModelName, voice: str | None = None) -> str:

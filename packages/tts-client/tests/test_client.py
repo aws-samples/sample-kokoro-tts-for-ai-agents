@@ -189,34 +189,41 @@ def _control_frame(**fields):
 class _FakeInputStream:
     def __init__(self) -> None:
         self.sent: list = []
+        self.closed = False
 
     async def send(self, event) -> None:
         self.sent.append(event)
 
     async def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class _FakeOutputStream:
-    def __init__(self, events: list) -> None:
+    def __init__(self, events: list, *, on_receive=None) -> None:
         self._events = list(events)
+        self._on_receive = on_receive
+        self.receives = 0
 
     async def receive(self):
+        self.receives += 1
+        if self._on_receive is not None:
+            self._on_receive(self.receives)
         if not self._events:
             return None
         return self._events.pop(0)
 
 
 class _FakeStream:
-    def __init__(self, events: list) -> None:
+    def __init__(self, events: list, *, on_receive=None) -> None:
         self.input_stream = _FakeInputStream()
-        self.output_stream = _FakeOutputStream(events)
+        self.output_stream = _FakeOutputStream(events, on_receive=on_receive)
+        self.closed = False
 
     async def await_output(self):
         return (object(), self.output_stream)
 
     async def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class _FakeBidiClientCtor:
@@ -348,6 +355,80 @@ class TestSynthesizeBidi:
             )
 
         assert len(seen_instances) == 2, "each call must construct its own HTTP/2 client"
+
+    def test_input_stream_is_not_closed_before_the_output_is_read(self) -> None:
+        """Closing the input right after send loses the whole request.
+
+        SageMaker tears the WebSocket down when the input half closes, and it
+        does so before the container reads the payload -- verified live:
+        closing early gave 0 bytes, holding the input open gave a full
+        synthesis for the same request. So the close must happen in
+        teardown, after the audio is drained, not right after send.
+        """
+        closed_at_first_receive: list[bool] = []
+        stream = _FakeStream(
+            [_payload_event(PCM_100MS), _control_frame(type="synthesis_complete")],
+            on_receive=lambda _n: closed_at_first_receive.append(stream.input_stream.closed),
+        )
+        fake_ctor = _FakeBidiClientCtor(stream)
+
+        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+            client = TTSClient()
+            client.synthesize_bidi(
+                "speech-kokoro-82m", SynthesisRequest(text="hello", voice="af_heart")
+            )
+
+        assert closed_at_first_receive, "the output stream was never read"
+        assert not closed_at_first_receive[0], (
+            "the input half was closed before the first output read; SageMaker "
+            "drops the session before the container reads the payload"
+        )
+
+    def test_input_stream_is_closed_by_the_time_the_call_returns(self) -> None:
+        # A ladder that leaks a half-open input per request runs out of
+        # connections before its highest step.
+        stream = _FakeStream([_payload_event(PCM_100MS), _control_frame(type="synthesis_complete")])
+        fake_ctor = _FakeBidiClientCtor(stream)
+
+        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+            client = TTSClient()
+            client.synthesize_bidi(
+                "speech-kokoro-82m", SynthesisRequest(text="hello", voice="af_heart")
+            )
+
+        assert stream.input_stream.closed
+
+    def test_undecodable_chunk_starting_with_a_brace_is_treated_as_audio(self) -> None:
+        # PCM can legitimately start with byte 0x7b ('{'). Treating such a
+        # chunk as a control frame would silently drop real audio and
+        # understate throughput at exactly the rates where every sample
+        # matters.
+        pcm = b"{" + b"\xff\xfe" * 100
+        events = [_payload_event(pcm), _control_frame(type="synthesis_complete")]
+        fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
+
+        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+            client = TTSClient()
+            result = client.synthesize_bidi(
+                "speech-kokoro-82m", SynthesisRequest(text="hello", voice="af_heart")
+            )
+
+        assert result.chunks == 1
+        assert len(result.audio_bytes) == len(pcm) + 44  # WAV header
+
+    def test_decodable_dict_without_a_known_type_is_a_control_frame_not_audio(self) -> None:
+        # A decodable dict starting with `{` is treated as a control frame
+        # even without a recognized `type` -- it's silently skipped (the
+        # `continue` after the frame_type checks), not counted as audio.
+        events = [_payload_event(b'{"just": "text"}'), _control_frame(type="synthesis_complete")]
+        fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
+
+        with patch("tts_client.client.SageMakerRuntimeHTTP2Client", fake_ctor):
+            client = TTSClient()
+            with pytest.raises(TTSClientError, match="no audio bytes"):
+                client.synthesize_bidi(
+                    "speech-kokoro-82m", SynthesisRequest(text="hello", voice="af_heart")
+                )
 
 
 # --------------------------------------------------------------------------- #

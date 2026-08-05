@@ -9,8 +9,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from loguru import logger
 
+from tts_bench.invoke import resolve_endpoint, resolve_voice
+from tts_client.client import TTSClient
+from tts_client.types import SynthesisRequest
 from tts_eval.synthesize import SynthesisClient
 from tts_inference.types import TTSModelName
+
+_POLLY_MODELS = (
+    TTSModelName.POLLY_STANDARD,
+    TTSModelName.POLLY_NEURAL,
+    TTSModelName.POLLY_GENERATIVE,
+)
 
 
 def measure_scalability(
@@ -49,13 +58,22 @@ def measure_scalability(
         Kept as-is because ``tts_eval.cli._run_benchmarks`` wires its untyped
         dict contract into the eval report.
     """
-    client = SynthesisClient(region=region)
     model = TTSModelName(model)
+    is_polly = model in _POLLY_MODELS
+    client: TTSClient | SynthesisClient
+    endpoint = ""
+    voice = ""
+    if is_polly:
+        client = SynthesisClient(region=region)
+    else:
+        client = TTSClient(region=region)
+        endpoint = resolve_endpoint(model)
+        voice = resolve_voice(model)
     results = []
 
     for concurrency in concurrency_levels:
         logger.info("Testing {} at concurrency={} for {:.0f}s", model.value, concurrency, window_s)
-        level_result = _run_concurrent(client, model, text, concurrency, window_s)
+        level_result = _run_concurrent(client, model, endpoint, voice, text, concurrency, window_s)
         level_result["model"] = model.value
         level_result["concurrency"] = concurrency
         results.append(level_result)
@@ -64,8 +82,10 @@ def measure_scalability(
 
 
 def _run_concurrent(
-    client: SynthesisClient,
+    client: TTSClient | SynthesisClient,
     model: TTSModelName,
+    endpoint: str,
+    voice: str,
     text: str,
     concurrency: int,
     window_s: float,
@@ -81,13 +101,21 @@ def _run_concurrent(
         nonlocal total_chars
         while not stop_event.is_set():
             try:
-                result = client.synthesize_stream(model, text)
-                lat = float(result["latency_ms"])
-                ttfab = float(result["ttfab_ms"])
+                if isinstance(client, SynthesisClient):
+                    result = client.synthesize(model, text)
+                    lat = float(result["latency_ms"])
+                    ttfab = float(result["ttfab_ms"])
+                    chars = int(result["chars"])
+                else:
+                    request = SynthesisRequest(text=text, voice=voice)
+                    synth_result = client.synthesize(endpoint, request)
+                    lat = synth_result.latency_ms
+                    ttfab = synth_result.ttfab_ms or lat
+                    chars = synth_result.chars
                 with lock:
                     latencies.append(lat)
                     ttfab_values.append(ttfab)
-                    total_chars += result["chars"]
+                    total_chars += chars
             except Exception:
                 if stop_event.is_set():
                     break

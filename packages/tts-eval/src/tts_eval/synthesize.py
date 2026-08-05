@@ -1,7 +1,10 @@
-"""SageMaker endpoint synthesis client for TTS evaluation.
+"""Model catalog and Polly synthesis for TTS evaluation.
 
-Provides a unified interface to invoke any TTS model endpoint and get
-back WAV or MP3 audio bytes with timing information.
+SageMaker-endpoint synthesis (response-stream, bidirectional) goes through
+``tts_client.client.TTSClient``. What's left here is the model-to-endpoint/
+voice catalog those callers resolve against, a plain non-streaming
+``invoke_endpoint`` path, and Amazon Polly support — Polly is a managed API
+with no SageMaker endpoint, so it is out of ``tts_client``'s scope.
 """
 
 from __future__ import annotations
@@ -54,19 +57,18 @@ def wav_duration(data: bytes) -> float:
 
 
 class SynthesisClient:
-    """Client for invoking TTS SageMaker endpoints."""
+    """Plain (non-streaming) SageMaker invocation, and the Amazon Polly path.
+
+    Streaming and bidirectional SageMaker synthesis go through
+    ``tts_client.client.TTSClient`` instead — this class is what's left after
+    that split: a synchronous fallback plus everything Polly-specific.
+    """
 
     _thread_local = threading.local()
 
     def __init__(self, region: str = "us-east-1") -> None:
         self._client = boto3.client("sagemaker-runtime", region_name=region)
         self._region = region
-
-    def _get_thread_client(self):
-        """Get a thread-local boto3 client for concurrent use."""
-        if not hasattr(self._thread_local, "client"):
-            self._thread_local.client = boto3.client("sagemaker-runtime", region_name=self._region)
-        return self._thread_local.client
 
     def synthesize(
         self,
@@ -121,73 +123,6 @@ class SynthesisClient:
             "model": model,
         }
 
-    def synthesize_stream(
-        self,
-        model: str | TTSModelName,
-        text: str,
-        voice: str | None = None,
-    ) -> dict:
-        """Streaming synthesis via invoke_endpoint_with_response_stream.
-
-        No fixed timeout — stream stays open until server finishes.
-        Thread-safe: uses thread-local boto3 clients for concurrent usage.
-
-        Returns:
-            Dict with keys: audio_bytes, duration_s, ttfab_ms, latency_ms,
-            chars, sample_rate, voice, model.
-        """
-        model = TTSModelName(model)
-        if model in POLLY_VOICES:
-            return self._synthesize_polly(model, text)
-        endpoint = ENDPOINT_MAP[model]
-        voice = voice or DEFAULT_VOICES[model]
-
-        payload = json.dumps(
-            {
-                "text": text,
-                "voice": voice,
-                "request_timestamp": time.time(),
-            }
-        )
-
-        client = self._get_thread_client()
-        t0 = time.perf_counter()
-        resp = client.invoke_endpoint_with_response_stream(
-            EndpointName=endpoint,
-            ContentType="application/json",
-            Accept="audio/wav",
-            Body=payload.encode("utf-8"),
-        )
-
-        chunks: list[bytes] = []
-        ttfab_ms: float | None = None
-        for event in resp["Body"]:
-            if "PayloadPart" in event:
-                chunk = event["PayloadPart"]["Bytes"]
-                if ttfab_ms is None:
-                    ttfab_ms = (time.perf_counter() - t0) * 1000
-                chunks.append(chunk)
-
-        latency_ms = (time.perf_counter() - t0) * 1000
-        audio_bytes = b"".join(chunks)
-        duration = wav_duration(audio_bytes)
-
-        if not audio_bytes or audio_bytes[:4] != b"RIFF":
-            logger.warning("Invalid WAV response from {} ({}B)", endpoint, len(audio_bytes))
-
-        return {
-            "audio_bytes": audio_bytes,
-            "duration_s": duration,
-            "ttfab_ms": ttfab_ms or latency_ms,
-            "latency_ms": latency_ms,
-            "chars": len(text),
-            "sample_rate": struct.unpack_from("<I", audio_bytes, 24)[0]
-            if len(audio_bytes) >= 28
-            else 24000,
-            "voice": voice,
-            "model": model,
-        }
-
     def _get_polly_client(self):
         """Get a thread-local boto3 Polly client."""
         if not hasattr(self._thread_local, "polly_client"):
@@ -231,41 +166,3 @@ class SynthesisClient:
             "voice": voice_id,
             "model": model,
         }
-
-
-def synthesize_bidirectional(
-    model: str | TTSModelName,
-    text: str,
-    voice: str | None = None,
-    region: str = "us-east-1",
-) -> dict:
-    """Bidirectional streaming synthesis via SageMaker HTTP/2.
-
-    Convenience re-export from bidi_client module.
-    Returns same dict shape as SynthesisClient.synthesize_stream().
-    """
-    from tts_eval.bidi_client import synthesize_bidirectional as _bidi
-
-    return _bidi(model, text, voice, region)
-
-
-def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
-    """Wrap raw 16-bit mono PCM in a WAV header."""
-    data_size = len(pcm_bytes)
-    header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",
-        36 + data_size,
-        b"WAVE",
-        b"fmt ",
-        16,
-        1,
-        1,
-        sample_rate,
-        sample_rate * 2,
-        2,
-        16,
-        b"data",
-        data_size,
-    )
-    return header + pcm_bytes
