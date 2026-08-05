@@ -8,8 +8,9 @@ from loguru import logger
 from tts_bench.invoke import resolve_endpoint, resolve_voice
 from tts_bench.types import LatencyStats
 from tts_client.client import TTSClient
+from tts_client.polly import PollyClient
 from tts_client.types import SynthesisRequest
-from tts_eval.synthesize import SynthesisClient
+from tts_eval.synthesize import POLLY_VOICES
 from tts_inference.types import TTSModelName
 
 _POLLY_MODELS = (
@@ -41,17 +42,24 @@ def measure_latency(
     latencies: list[float] = []
 
     # Polly is a managed API, not a SageMaker endpoint -- resolve_endpoint has
-    # nothing to resolve for it, so it keeps going through SynthesisClient.
-    # Split into two loops (rather than a client: TTSClient | SynthesisClient
+    # nothing to resolve for it, so it keeps going through PollyClient.
+    # Split into two loops (rather than a client: TTSClient | PollyClient
     # union used from one) because the two clients' synthesize() signatures
-    # are unrelated -- (model, text) -> dict vs (endpoint, request) -> result
-    # -- and mypy cannot narrow which one applies from a runtime bool.
+    # are unrelated -- (voice_id, engine, text) -> result vs (endpoint,
+    # request) -> result -- and mypy cannot narrow which one applies from a
+    # runtime bool.
     if model in _POLLY_MODELS:
-        polly_client = SynthesisClient(region=region)
+        polly_client = PollyClient(region=region)
+        voice_config = POLLY_VOICES[model]
         for i, text in enumerate(texts):
             for run in range(runs_per_text):
                 try:
-                    latencies.append(polly_client.synthesize(model, text)["latency_ms"])
+                    result = polly_client.synthesize(
+                        voice_id=voice_config["voice_id"],
+                        engine=voice_config["engine"],
+                        text=text,
+                    )
+                    latencies.append(result.latency_ms)
                 except Exception as e:
                     logger.warning(
                         "Latency run failed ({}/{}): {}", i * runs_per_text + run + 1, total, e

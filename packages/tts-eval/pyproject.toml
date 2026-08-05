@@ -7,6 +7,7 @@ dependencies = [
     "click>=8.1.0",
     "pydantic>=2.5.0",
     "tts-inference",
+    "tts-client[polly]",
     "shared",
     "loguru>=0.7.0",
     "numpy>=1.26.0",
@@ -25,6 +26,7 @@ tts-eval = "tts_eval.cli:main"
 
 [tool.uv.sources]
 tts-inference = { workspace = true }
+tts-client = { workspace = true }
 shared = { workspace = true }
 
 [build-system]

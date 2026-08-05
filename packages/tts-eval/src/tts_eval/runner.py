@@ -13,10 +13,11 @@ from loguru import logger
 
 from shared.types import TTSSample
 from tts_client.client import TTSClient
+from tts_client.polly import PollyClient
 from tts_client.types import SynthesisRequest
 from tts_eval.metrics.utmos import UTMOSScorer
 from tts_eval.metrics.wer import WERScorer
-from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP, SynthesisClient
+from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP, POLLY_VOICES
 from tts_inference.types import TTSModelName
 
 
@@ -88,7 +89,7 @@ class EvalRunner:
         self._streaming_mode = streaming_mode
 
         self._client = TTSClient(region=region)
-        self._polly_client = SynthesisClient(region=region)
+        self._polly_client = PollyClient(region=region)
         self._utmos = UTMOSScorer()
         self._wer = WERScorer(region=region) if not skip_wer else None
 
@@ -152,13 +153,18 @@ class EvalRunner:
         )
         try:
             if is_polly:
-                polly_result = self._polly_client.synthesize(model, sample.text)
-                audio_bytes = polly_result["audio_bytes"]
-                audio_format = polly_result["audio_format"]
-                latency_ms = polly_result["latency_ms"]
-                duration_s = polly_result["duration_s"]
-                ttfab_ms = polly_result.get("ttfab_ms")
-                sample_rate = polly_result["sample_rate"]
+                voice_config = POLLY_VOICES[model]
+                polly_result = self._polly_client.synthesize(
+                    voice_id=voice_config["voice_id"],
+                    engine=voice_config["engine"],
+                    text=sample.text,
+                )
+                audio_bytes = polly_result.audio_bytes
+                audio_format = polly_result.audio_format.value
+                latency_ms = polly_result.latency_ms
+                duration_s = polly_result.duration_s
+                ttfab_ms = polly_result.ttfab_ms
+                sample_rate = polly_result.sample_rate
             else:
                 endpoint = ENDPOINT_MAP[model]
                 request = SynthesisRequest(text=sample.text, voice=DEFAULT_VOICES[model])

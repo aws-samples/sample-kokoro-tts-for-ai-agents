@@ -11,8 +11,9 @@ from loguru import logger
 
 from tts_bench.invoke import resolve_endpoint, resolve_voice
 from tts_client.client import TTSClient
+from tts_client.polly import PollyClient
 from tts_client.types import SynthesisRequest
-from tts_eval.synthesize import SynthesisClient
+from tts_eval.synthesize import POLLY_VOICES
 from tts_inference.types import TTSModelName
 
 _POLLY_MODELS = (
@@ -60,11 +61,16 @@ def measure_scalability(
     """
     model = TTSModelName(model)
     is_polly = model in _POLLY_MODELS
-    client: TTSClient | SynthesisClient
+    client: TTSClient | PollyClient
     endpoint = ""
     voice = ""
+    voice_id = ""
+    engine = ""
     if is_polly:
-        client = SynthesisClient(region=region)
+        client = PollyClient(region=region)
+        voice_config = POLLY_VOICES[model]
+        voice_id = voice_config["voice_id"]
+        engine = voice_config["engine"]
     else:
         client = TTSClient(region=region)
         endpoint = resolve_endpoint(model)
@@ -73,7 +79,9 @@ def measure_scalability(
 
     for concurrency in concurrency_levels:
         logger.info("Testing {} at concurrency={} for {:.0f}s", model.value, concurrency, window_s)
-        level_result = _run_concurrent(client, model, endpoint, voice, text, concurrency, window_s)
+        level_result = _run_concurrent(
+            client, endpoint, voice, voice_id, engine, text, concurrency, window_s
+        )
         level_result["model"] = model.value
         level_result["concurrency"] = concurrency
         results.append(level_result)
@@ -82,10 +90,11 @@ def measure_scalability(
 
 
 def _run_concurrent(
-    client: TTSClient | SynthesisClient,
-    model: TTSModelName,
+    client: TTSClient | PollyClient,
     endpoint: str,
     voice: str,
+    voice_id: str,
+    engine: str,
     text: str,
     concurrency: int,
     window_s: float,
@@ -101,17 +110,14 @@ def _run_concurrent(
         nonlocal total_chars
         while not stop_event.is_set():
             try:
-                if isinstance(client, SynthesisClient):
-                    result = client.synthesize(model, text)
-                    lat = float(result["latency_ms"])
-                    ttfab = float(result["ttfab_ms"])
-                    chars = int(result["chars"])
+                if isinstance(client, PollyClient):
+                    result = client.synthesize(voice_id=voice_id, engine=engine, text=text)
                 else:
                     request = SynthesisRequest(text=text, voice=voice)
-                    synth_result = client.synthesize(endpoint, request)
-                    lat = synth_result.latency_ms
-                    ttfab = synth_result.ttfab_ms or lat
-                    chars = synth_result.chars
+                    result = client.synthesize(endpoint, request)
+                lat = result.latency_ms
+                ttfab = result.ttfab_ms or lat
+                chars = result.chars
                 with lock:
                     latencies.append(lat)
                     ttfab_values.append(ttfab)

@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 from tts_bench.scalability import _run_concurrent, measure_scalability
 from tts_client.client import TTSClient
 from tts_client.types import AudioFormat, SynthesisResult
-from tts_inference.types import TTSModelName
 
 
 def _result(latency_ms: float, ttfab_ms: float, chars: int) -> SynthesisResult:
@@ -29,9 +28,10 @@ class TestRunConcurrent:
 
         result = _run_concurrent(
             client,
-            TTSModelName.KOKORO_82M,
             "speech-kokoro-82m",
             "af_heart",
+            "",
+            "",
             "test text of forty two chars length!!",
             2,
             0.5,
@@ -52,7 +52,7 @@ class TestRunConcurrent:
         client.synthesize.side_effect = RuntimeError("endpoint down")
 
         result = _run_concurrent(
-            client, TTSModelName.KOKORO_82M, "speech-kokoro-82m", "af_heart", "test text", 2, 0.3
+            client, "speech-kokoro-82m", "af_heart", "", "", "test text", 2, 0.3
         )
 
         assert result["throughput_chars_per_s"] == 0.0
@@ -72,7 +72,7 @@ class TestRunConcurrent:
         client.synthesize.side_effect = _side_effect
 
         result = _run_concurrent(
-            client, TTSModelName.KOKORO_82M, "speech-kokoro-82m", "af_heart", "test text", 2, 0.5
+            client, "speech-kokoro-82m", "af_heart", "", "", "test text", 2, 0.5
         )
 
         assert result["total_requests"] > 0

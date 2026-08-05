@@ -3,7 +3,7 @@
 Wire contract for `speech-kokoro-82m`.
 
 Implementation: `packages/speech-infra/containers/kokoro/serve.py`.
-Client: `SynthesisClient.synthesize_stream()` in `packages/tts-eval/src/tts_eval/synthesize.py`.
+Client: `TTSClient.synthesize()` in `packages/tts-client/tts_client/client.py`.
 
 All numbers below are measured against the live endpoint, not estimated.
 
@@ -20,7 +20,7 @@ All numbers below are measured against the live endpoint, not estimated.
 | `format` | `wav` \| `mp3` | `wav` | Raw PCM frames, or 48 kbps mono MP3 |
 
 Every field defaults to the pre-existing behaviour, so callers that send only
-`text`/`voice` are unaffected. That matters: `SynthesisClient.synthesize_stream()`
+`text`/`voice` are unaffected. That matters: `TTSClient.synthesize()`
 sends no `format` and asserts `RIFF` on the response, and the eval baseline
 depends on it. An invalid `format` returns 400.
 
@@ -122,7 +122,7 @@ no MP3, by design. See the bidirectional contract in
 | Script | Covers |
 |--------|--------|
 | `packages/speech-infra/tests/test_kokoro_serve.py` | Server: flush tail, encoder reuse, default-path regression |
-| `packages/tts-eval/tests/test_synthesize.py` | Client: streaming WAV baseline |
+| `packages/tts-client/tests/test_client.py` | Client: streaming WAV baseline |
 
 Live results on 4 verified clips: WER 0.000, default no-flag call still returns
 96044 B of `RIFF`.
