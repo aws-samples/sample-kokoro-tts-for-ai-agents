@@ -41,6 +41,7 @@ class SpeechEndpointStack(cdk.Stack):
                 self,
                 "VllmImage",
                 directory=container_dir,
+                platform=ecr_assets.Platform.LINUX_AMD64,
             )
             image_uri = asset.image_uri
 
