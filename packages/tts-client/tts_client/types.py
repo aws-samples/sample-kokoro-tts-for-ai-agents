@@ -7,7 +7,7 @@ install just ``tts-client`` and get everything it needs from one import.
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,23 @@ class AudioFormat(StrEnum):
 
     WAV = "wav"
     MP3 = "mp3"
+
+
+class SampleRate(IntEnum):
+    """Output sample rate requested from the endpoint.
+
+    Matches the container's own ``SUPPORTED_SAMPLE_RATES`` (``kokoro/serve.py``).
+    ``HZ_24000`` (Kokoro's native rate) is the ceiling, not one option among
+    several: producing a higher rate from a 24kHz source would be pure
+    interpolation with no added fidelity, so nothing above it is offered.
+    Every other member is a real downsample, done server-side; requesting one
+    adds resampling latency over the native rate.
+    """
+
+    HZ_8000 = 8000
+    HZ_16000 = 16000
+    HZ_22050 = 22050
+    HZ_24000 = 24000
 
 
 class Transport(StrEnum):
@@ -46,6 +63,12 @@ class SynthesisRequest(BaseModel):
     voice: str
     speed: float = 1.0
     audio_format: AudioFormat = AudioFormat.WAV
+    sample_rate: SampleRate | None = Field(
+        default=None,
+        description="Output sample rate. Omitted (the default) requests the "
+        "endpoint's native rate with no resampling; the container 400s a "
+        "value it doesn't support.",
+    )
     request_timestamp: float | None = Field(
         default=None,
         description="Epoch seconds the request was sent. Stamped by the client "

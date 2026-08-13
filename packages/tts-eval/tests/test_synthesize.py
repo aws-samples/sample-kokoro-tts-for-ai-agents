@@ -9,7 +9,10 @@ data itself.
 
 from __future__ import annotations
 
-from tts_eval.synthesize import ENDPOINT_MAP, POLLY_VOICES
+import pytest
+from pydantic import ValidationError
+
+from tts_eval.synthesize import ENDPOINT_MAP, POLLY_VOICES, KokoroVoice, validate_kokoro_voice
 from tts_inference.types import TTSModelName
 
 
@@ -40,3 +43,34 @@ class TestPollyIntegration:
         for _model_name, config in POLLY_VOICES.items():
             assert config["engine"] in ("standard", "neural", "generative")
             assert config["voice_id"]
+
+
+class TestKokoroVoice:
+    def test_has_exactly_the_twenty_working_voices(self) -> None:
+        # The deployed container loads one KPipeline, for lang_code="a"
+        # (American English) only -- see serve.py's module docstring. Any
+        # other language's voices would not actually work against it.
+        assert len(KokoroVoice) == 20
+        assert all(v.value.startswith(("af_", "am_")) for v in KokoroVoice)
+
+    def test_default_voice_is_a_member(self) -> None:
+        assert KokoroVoice.AF_HEART in KokoroVoice
+        assert KokoroVoice.AF_HEART == "af_heart"
+
+
+class TestValidateKokoroVoice:
+    @pytest.mark.parametrize("voice", list(KokoroVoice))
+    def test_accepts_every_working_voice(self, voice: KokoroVoice) -> None:
+        assert validate_kokoro_voice(voice.value) == voice.value
+
+    def test_rejects_a_clearly_invalid_string(self) -> None:
+        with pytest.raises(ValidationError):
+            validate_kokoro_voice("not-a-real-voice")
+
+    def test_rejects_a_real_but_wrong_language_voice(self) -> None:
+        # bf_emma is a real Kokoro voice (British English), but the deployed
+        # container never loads a British pipeline -- this is the exact gap
+        # this validation closes: a voice that exists in Kokoro's model but
+        # not against this deployment must still be rejected.
+        with pytest.raises(ValidationError):
+            validate_kokoro_voice("bf_emma")

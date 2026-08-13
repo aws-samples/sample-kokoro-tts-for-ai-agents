@@ -25,6 +25,11 @@ result.duration_s     # float
 result.latency_ms     # float
 ```
 
+`SynthesisRequest.sample_rate` (optional, `tts_client.types.SampleRate`) requests a downsample
+from Kokoro's native 24kHz — omit it for the native rate at no resampling cost. `24000` is the
+ceiling, not a peer option: there's nothing above it, since upsampling a 24kHz source adds no
+real fidelity. Works on all three methods below too.
+
 ## `TTSClient.synthesize_bidi()` — bidirectional, one full text
 
 Same call shape, but over SageMaker's bidirectional-streaming (HTTP/2) transport instead of

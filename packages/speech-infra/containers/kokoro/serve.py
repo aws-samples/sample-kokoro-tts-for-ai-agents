@@ -13,12 +13,30 @@ rather than assuming one. Single model instance with asyncio.Lock
 serialization; the model is fast enough (0.12s/inference on A10G) that
 multi-session adds negligible benefit.
 
-/invocations selects its wire shape from one body field, defaulting to
-today's behaviour so existing callers are unaffected:
+/invocations selects its wire shape from body fields, defaulting to today's
+behaviour so existing callers are unaffected:
 - format: "wav" (raw PCM frames) | "mp3" (48 kbps mono)
+- sample_rate: one of SUPPORTED_SAMPLE_RATES (default: SAMPLE_RATE, no resampling)
+- voice: one of _VALID_VOICES (default: DEFAULT_VOICE)
 
 Every prefix of an MP3 frame stream is independently decodable, which is what
 lets the client start playing before synthesis finishes.
+
+sample_rate is a downsample-only knob: SAMPLE_RATE (24000, Kokoro's native
+rate) is the ceiling, not one option among several -- producing 32000+ from a
+24000 source would be pure interpolation with no added fidelity, so nothing
+above SAMPLE_RATE is offered. The buffered (non-streaming) path resamples the
+whole utterance in one soxr.resample() call; the two streaming paths use
+soxr.ResampleStream (stateful across segments) rather than independent
+per-segment calls -- proven in scratch/soxr_resample_probe/ that independent
+calls measurably degrade at segment boundaries versus the stateful streaming
+resampler, which reproduces the whole-buffer result exactly.
+
+voice is validated against _VALID_VOICES because the pipeline below is loaded
+once, for lang_code="a" (American English) only: a voice from any other
+language would either 404 deep in kokoro's own hf_hub_download, or -- worse
+-- silently load a wrong-language style vector into this English-only
+phonemization pipeline with no error at all.
 """
 
 import asyncio
@@ -32,6 +50,7 @@ from contextlib import asynccontextmanager
 
 import lameenc
 import numpy as np
+import soxr
 import torch
 import uvicorn
 from kokoro import KPipeline
@@ -53,6 +72,41 @@ FORMAT_WAV = "wav"
 FORMAT_MP3 = "mp3"
 
 _MEDIA_TYPES = {FORMAT_WAV: "audio/wav", FORMAT_MP3: "audio/mpeg"}
+
+#: SAMPLE_RATE (native) is the ceiling, not a peer option -- see the module
+#: docstring for why upsampling isn't offered.
+SUPPORTED_SAMPLE_RATES = frozenset({8000, 16000, 22050, SAMPLE_RATE})
+
+#: The 20 voices that actually work against the single lang_code="a" pipeline
+#: loaded below. Duplicated rather than imported from tts_eval.synthesize.
+#: KokoroVoice -- this container has no access to sibling monorepo packages
+#: at Docker build time (see tts_client/streaming.py's _SENTENCE_RE comment
+#: for the same convention elsewhere in this codebase). Keep the two lists in
+#: sync by hand if either changes.
+_VALID_VOICES = frozenset(
+    {
+        "af_heart",
+        "af_alloy",
+        "af_aoede",
+        "af_bella",
+        "af_jessica",
+        "af_kore",
+        "af_nicole",
+        "af_nova",
+        "af_river",
+        "af_sarah",
+        "af_sky",
+        "am_adam",
+        "am_echo",
+        "am_eric",
+        "am_fenrir",
+        "am_liam",
+        "am_michael",
+        "am_onyx",
+        "am_puck",
+        "am_santa",
+    }
+)
 
 _inflight: int = 0
 
@@ -213,6 +267,66 @@ def _samples_to_pcm(samples: np.ndarray) -> bytes:
     return (samples * 32767).astype(np.int16).tobytes()
 
 
+def _resample_buffer(samples: np.ndarray, target_rate: int) -> np.ndarray:
+    """Resample one complete buffer. No-op at the native rate.
+
+    For the buffered (non-streaming) path only -- one call over the whole
+    utterance, no segment-boundary concern. See _SegmentResampler for the
+    streaming paths, which see one short segment at a time.
+    """
+    if target_rate == SAMPLE_RATE:
+        return samples
+    return soxr.resample(samples, SAMPLE_RATE, target_rate)
+
+
+class _SegmentResampler:
+    """Resamples a sequence of independent segments as one continuous signal.
+
+    Wraps soxr.ResampleStream, which carries filter state across
+    resample_chunk() calls. Proven in scratch/soxr_resample_probe/: resampling
+    each KPipeline segment with an independent, stateless soxr.resample()
+    call measurably degrades at segment boundaries (max sample-to-sample jump
+    0.0904 vs. a clean 0.0867 baseline); this class reproduces the
+    whole-buffer result exactly (0.0867), because the filter never resets
+    between segments.
+
+    A no-op passthrough at the native rate, so the default (no resampling
+    requested) path allocates nothing extra and takes the exact code path it
+    did before this class existed.
+
+    The segment-fetch loops in this file only learn a segment was the last
+    one after already yielding it (_next_segment returns None on the
+    following call, not a flag on the current one). Restructuring those
+    loops to look ahead by one segment would be more invasive than needed:
+    every real segment goes through with last=False, and one trailing
+    resample_chunk(<empty array>, last=True) call after the loop ends flushes
+    the tail. Verified in scratch/soxr_resample_probe/: this produces output
+    bit-for-bit identical to resampling the whole buffer in one call.
+    """
+
+    def __init__(self, target_rate: int) -> None:
+        self._passthrough = target_rate == SAMPLE_RATE
+        self._stream = (
+            None
+            if self._passthrough
+            else soxr.ResampleStream(SAMPLE_RATE, target_rate, num_channels=1, dtype="float32")
+        )
+
+    def push(self, samples: np.ndarray) -> np.ndarray:
+        """Resample one segment. Call flush() once, after the last push()."""
+        if self._passthrough:
+            return samples
+        assert self._stream is not None
+        return self._stream.resample_chunk(samples, last=False)
+
+    def flush(self) -> np.ndarray:
+        """Drain the resampler's remaining buffered output. Call exactly once."""
+        if self._passthrough:
+            return np.array([], dtype=np.float32)
+        assert self._stream is not None
+        return self._stream.resample_chunk(np.array([], dtype=np.float32), last=True)
+
+
 class Mp3StreamEncoder:
     """Incremental MP3 encoder for one request.
 
@@ -253,13 +367,29 @@ class Mp3StreamEncoder:
         return bytes(self._encoder.flush())
 
 
-def _generate_sentences(text: str, voice: str, speed: float) -> list[np.ndarray]:
-    """Generate all sentence audio chunks (runs in executor)."""
+def _generate_sentences(
+    text: str, voice: str, speed: float, sample_rate: int = SAMPLE_RATE
+) -> list[np.ndarray]:
+    """Generate all sentence audio chunks, resampled to sample_rate (runs in executor).
+
+    Resampling happens here, inside the executor call, rather than in
+    bidirectional_stream's async send loop -- this function already exists
+    specifically to keep CPU-bound work off the event loop, and soxr's work
+    is exactly that. One _SegmentResampler for the whole call, same as the
+    HTTP streaming path, so the sequence of segments resamples as one
+    continuous signal rather than independently per segment.
+    """
     pipeline = _load_pipeline()
+    resampler = _SegmentResampler(sample_rate)
     results = []
     for _, _, audio in pipeline(text, voice=voice, speed=speed):
         if audio is not None:
-            results.append(_to_numpy(audio))
+            resampled = resampler.push(_to_numpy(audio))
+            if len(resampled) > 0:
+                results.append(resampled)
+    tail = resampler.flush()
+    if len(tail) > 0:
+        results.append(tail)
     return results
 
 
@@ -277,7 +407,12 @@ def _next_segment(segments: object) -> np.ndarray | None:
 
 
 async def _stream_sentences_generator(
-    text: str, voice: str, speed: float, audio_format: str = FORMAT_WAV, stats: dict | None = None
+    text: str,
+    voice: str,
+    speed: float,
+    audio_format: str = FORMAT_WAV,
+    sample_rate: int = SAMPLE_RATE,
+    stats: dict | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """Yield encoded audio chunks per KPipeline segment as they are produced.
 
@@ -295,10 +430,29 @@ async def _stream_sentences_generator(
     The inference lock is held for the whole stream: KPipeline is a single stateful
     instance, so two interleaved segment generators would corrupt each other. The
     model is fast enough that serializing whole requests costs nothing meaningful.
+
+    Each segment is resampled through one _SegmentResampler for the whole
+    request, not an independent call per segment -- see that class's
+    docstring for why (measurable degradation at segment boundaries
+    otherwise). sample_count and header_sent are tracked on the resampled
+    (output) stream, since that's what's actually sent over the wire.
     """
     header_sent = False
-    encoder = Mp3StreamEncoder() if audio_format == FORMAT_MP3 else None
+    encoder = Mp3StreamEncoder(sample_rate=sample_rate) if audio_format == FORMAT_MP3 else None
+    resampler = _SegmentResampler(sample_rate)
     sample_count = 0
+
+    def _encode(audio: np.ndarray) -> bytes | None:
+        nonlocal header_sent
+        if encoder is None:
+            pcm = _samples_to_pcm(audio)
+            if not header_sent:
+                header_sent = True
+                return _wav_header_placeholder(sample_rate) + pcm
+            return pcm
+        # Empty output is normal: LAME is still filling its frame buffer.
+        chunk = encoder.encode(audio)
+        return chunk or None
 
     loop = asyncio.get_event_loop()
     pipeline = _load_pipeline()
@@ -309,19 +463,19 @@ async def _stream_sentences_generator(
             audio = await loop.run_in_executor(None, _next_segment, segments)
             if audio is None:
                 break
+            audio = resampler.push(audio)
             sample_count += len(audio)
-            if encoder is None:
-                pcm = _samples_to_pcm(audio)
-                if not header_sent:
-                    yield _wav_header_placeholder() + pcm
-                    header_sent = True
-                else:
-                    yield pcm
-            else:
-                # Empty output is normal: LAME is still filling its frame buffer.
-                chunk = encoder.encode(audio)
+            if len(audio) > 0:
+                chunk = _encode(audio)
                 if chunk:
                     yield chunk
+
+        tail_samples = resampler.flush()
+        if len(tail_samples) > 0:
+            sample_count += len(tail_samples)
+            chunk = _encode(tail_samples)
+            if chunk:
+                yield chunk
 
         if encoder is not None:
             tail = encoder.flush()
@@ -332,13 +486,17 @@ async def _stream_sentences_generator(
         stats["samples"] = sample_count
 
 
-def _samples_to_mp3(samples: np.ndarray) -> bytes:
-    encoder = Mp3StreamEncoder()
+def _samples_to_mp3(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:
+    encoder = Mp3StreamEncoder(sample_rate=sample_rate)
     return encoder.encode(samples) + encoder.flush()
 
 
 async def _invocations_sync(
-    text: str, voice: str, speed: float, audio_format: str = FORMAT_WAV
+    text: str,
+    voice: str,
+    speed: float,
+    audio_format: str = FORMAT_WAV,
+    sample_rate: int = SAMPLE_RATE,
 ) -> Response:
     """Original synchronous path: complete audio file in one response."""
     t0 = time.perf_counter()
@@ -348,12 +506,14 @@ async def _invocations_sync(
             None, _synthesize_full, text, voice, speed
         )
 
+    samples = _resample_buffer(samples, sample_rate)
+
     if audio_format == FORMAT_MP3:
-        content = _samples_to_mp3(samples)
+        content = _samples_to_mp3(samples, sample_rate)
     else:
-        content = _samples_to_wav(samples, SAMPLE_RATE)
+        content = _samples_to_wav(samples, sample_rate)
     elapsed = time.perf_counter() - t0
-    audio_duration = len(samples) / SAMPLE_RATE
+    audio_duration = len(samples) / sample_rate
 
     return Response(
         content=content,
@@ -392,6 +552,7 @@ async def invocations(request: Request) -> Response:
     speed = body.get("speed", 1.0)
     use_stream = body.get("stream", True)
     audio_format = body.get("format", FORMAT_WAV)
+    sample_rate = body.get("sample_rate", SAMPLE_RATE)
 
     request_ts = body.get("request_timestamp")
     if request_ts is not None and time.time() - request_ts > MAX_REQUEST_AGE_S:
@@ -409,6 +570,20 @@ async def invocations(request: Request) -> Response:
             content={"error": f"format must be one of {sorted(_MEDIA_TYPES)}"},
         )
 
+    if voice not in _VALID_VOICES:
+        _inflight -= 1
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"voice must be one of {sorted(_VALID_VOICES)}"},
+        )
+
+    if sample_rate not in SUPPORTED_SAMPLE_RATES:
+        _inflight -= 1
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"sample_rate must be one of {sorted(SUPPORTED_SAMPLE_RATES)}"},
+        )
+
     async def _inflight_wrap(gen: AsyncGenerator[bytes, None]) -> AsyncGenerator[bytes, None]:
         global _inflight
         try:
@@ -419,12 +594,12 @@ async def invocations(request: Request) -> Response:
 
     if not use_stream:
         try:
-            return await _invocations_sync(text, voice, speed, audio_format)
+            return await _invocations_sync(text, voice, speed, audio_format, sample_rate)
         finally:
             _inflight -= 1
 
     return StreamingResponse(
-        _inflight_wrap(_stream_sentences_generator(text, voice, speed, audio_format)),
+        _inflight_wrap(_stream_sentences_generator(text, voice, speed, audio_format, sample_rate)),
         media_type=_MEDIA_TYPES[audio_format],
     )
 
@@ -462,11 +637,38 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
             voice = msg.get("voice", DEFAULT_VOICE)
             speed = msg.get("speed", 1.0)
             request_id = msg.get("request_id", "unknown")
+            sample_rate = msg.get("sample_rate", SAMPLE_RATE)
 
             if not text:
                 await websocket.send_text(
                     json.dumps(
                         {"type": "error", "request_id": request_id, "message": "text required"}
+                    )
+                )
+                continue
+
+            if voice not in _VALID_VOICES:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "request_id": request_id,
+                            "message": f"voice must be one of {sorted(_VALID_VOICES)}",
+                        }
+                    )
+                )
+                continue
+
+            if sample_rate not in SUPPORTED_SAMPLE_RATES:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "request_id": request_id,
+                            "message": (
+                                f"sample_rate must be one of {sorted(SUPPORTED_SAMPLE_RATES)}"
+                            ),
+                        }
                     )
                 )
                 continue
@@ -480,14 +682,14 @@ async def bidirectional_stream(websocket: WebSocket) -> None:
 
             async with _inference_lock:
                 sentence_audios = await loop.run_in_executor(
-                    None, _generate_sentences, text, voice, speed
+                    None, _generate_sentences, text, voice, speed, sample_rate
                 )
 
             cumulative_duration = 0.0
             for audio in sentence_audios:
                 pcm = (audio * 32767).astype(np.int16).tobytes()
                 await websocket.send_bytes(pcm)
-                segment_duration = len(audio) / SAMPLE_RATE
+                segment_duration = len(audio) / sample_rate
                 cumulative_duration += segment_duration
 
             elapsed = time.monotonic() - t0

@@ -26,7 +26,7 @@ from aws_sdk_sagemaker_runtime_http2.models import (
 
 from tts_client.client import TTSClient, _pcm_to_wav, wav_duration
 from tts_client.errors import QueueSaturatedError, ServerError, TTSClientError
-from tts_client.types import AudioFormat, SynthesisRequest
+from tts_client.types import AudioFormat, SampleRate, SynthesisRequest
 
 PCM_100MS = b"\x00\x01" * 2400
 
@@ -148,6 +148,27 @@ class TestSynthesizeResponseStream:
         client, _ = _client_with([])
         with pytest.raises(TTSClientError, match="no audio bytes"):
             client.synthesize("speech-kokoro-82m", SynthesisRequest(text="hi", voice="af_heart"))
+
+    def test_sample_rate_is_omitted_by_default(self) -> None:
+        """The default (no resampling requested) must produce the exact same
+        body as before this field existed -- the eval baseline depends on it."""
+        wav = _make_wav()
+        client, fake = _client_with([wav])
+        client.synthesize("speech-kokoro-82m", SynthesisRequest(text="hi", voice="af_heart"))
+
+        body = json.loads(fake.call_kwargs["Body"])
+        assert "sample_rate" not in body
+
+    def test_sample_rate_is_sent_when_set(self) -> None:
+        wav = _make_wav()
+        client, fake = _client_with([wav])
+        client.synthesize(
+            "speech-kokoro-82m",
+            SynthesisRequest(text="hi", voice="af_heart", sample_rate=SampleRate.HZ_16000),
+        )
+
+        body = json.loads(fake.call_kwargs["Body"])
+        assert body["sample_rate"] == 16000
 
     def test_model_stream_error_mid_stream_raises_server_error(self) -> None:
         """Mid-stream faults arrive as events on a response that already
@@ -326,6 +347,56 @@ class TestSynthesizeBidi:
         assert message["text"] == "hello world"
         assert message["voice"] == "af_bella"
         assert "request_timestamp" in message
+
+    def test_sample_rate_is_sent_in_the_bidi_message_when_set(self) -> None:
+        events = [_payload_event(PCM_100MS), _control_frame(type="synthesis_complete")]
+        stream = _FakeStream(events)
+        fake_ctor = _FakeBidiClientCtor(stream)
+
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
+            client = TTSClient()
+            client.synthesize_bidi(
+                "speech-kokoro-82m",
+                SynthesisRequest(text="hello", voice="af_heart", sample_rate=SampleRate.HZ_16000),
+            )
+
+        message = json.loads(stream.input_stream.sent[0].value.bytes_.decode("utf-8"))
+        assert message["sample_rate"] == 16000
+
+    def test_sample_rate_omitted_from_message_by_default(self) -> None:
+        events = [_payload_event(PCM_100MS), _control_frame(type="synthesis_complete")]
+        stream = _FakeStream(events)
+        fake_ctor = _FakeBidiClientCtor(stream)
+
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
+            client = TTSClient()
+            client.synthesize_bidi(
+                "speech-kokoro-82m", SynthesisRequest(text="hello", voice="af_heart")
+            )
+
+        message = json.loads(stream.input_stream.sent[0].value.bytes_.decode("utf-8"))
+        assert "sample_rate" not in message
+
+    def test_sample_rate_is_reflected_on_the_result_when_set(self) -> None:
+        # Raw PCM carries no self-describing rate, so the client reports back
+        # whatever it asked for -- there is nothing on the wire to read
+        # it from. duration_s must divide by the requested rate, not the
+        # BIDI_SAMPLE_RATE default, or a resampled response reports a wrong
+        # duration.
+        events = [_payload_event(PCM_100MS), _control_frame(type="synthesis_complete")]
+        fake_ctor = _FakeBidiClientCtor(_FakeStream(events))
+
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
+            client = TTSClient()
+            result = client.synthesize_bidi(
+                "speech-kokoro-82m",
+                SynthesisRequest(text="hello", voice="af_heart", sample_rate=SampleRate.HZ_16000),
+            )
+
+        assert result.sample_rate == 16000
+        assert abs(result.duration_s - len(PCM_100MS) / (16000 * 2)) < 1e-9
+        sr_in_header = struct.unpack_from("<I", result.audio_bytes, 24)[0]
+        assert sr_in_header == 16000
 
     def test_does_not_hold_a_client_on_self(self) -> None:
         """The whole point of this transport: two calls build two independent

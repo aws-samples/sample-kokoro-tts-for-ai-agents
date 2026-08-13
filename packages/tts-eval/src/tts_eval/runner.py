@@ -17,7 +17,7 @@ from tts_client.polly import PollyClient
 from tts_client.types import SynthesisRequest
 from tts_eval.metrics.utmos import UTMOSScorer
 from tts_eval.metrics.wer import WERScorer
-from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP, POLLY_VOICES
+from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP, POLLY_VOICES, validate_kokoro_voice
 from tts_inference.types import TTSModelName
 
 
@@ -167,7 +167,8 @@ class EvalRunner:
                 sample_rate = polly_result.sample_rate
             else:
                 endpoint = ENDPOINT_MAP[model]
-                request = SynthesisRequest(text=sample.text, voice=DEFAULT_VOICES[model])
+                voice = validate_kokoro_voice(DEFAULT_VOICES[model])
+                request = SynthesisRequest(text=sample.text, voice=voice)
                 if self._streaming_mode == "bidirectional":
                     result = self._client.synthesize_bidi(endpoint, request)
                 else:

@@ -114,8 +114,11 @@ async def _stream_chunks_async(
     text_source: str | Iterable[str],
     speed: float,
     t0: float,
+    sample_rate: int | None = None,
 ) -> AsyncGenerator[SynthesisChunk, None]:
     fragments: Iterable[str] = (text_source,) if isinstance(text_source, str) else text_source
+
+    resolved_rate = sample_rate if sample_rate is not None else BIDI_SAMPLE_RATE
 
     # Opened lazily, on the first sentence actually ready to send -- an empty
     # or all-whitespace source should raise without ever touching the network.
@@ -128,7 +131,7 @@ async def _stream_chunks_async(
         nonlocal stream, output_stream, seq
         if stream is None:
             stream = await _open_bidi_stream(region, endpoint)
-        message = _build_bidi_message(sentence, voice, None, speed=speed)
+        message = _build_bidi_message(sentence, voice, None, speed=speed, sample_rate=sample_rate)
         await stream.input_stream.send(
             RequestStreamEventPayloadPart(value=RequestPayloadPart(bytes_=message))
         )
@@ -144,8 +147,8 @@ async def _stream_chunks_async(
             text=sentence,
             audio_bytes=drained.pcm_bytes,
             ttfab_ms=drained.ttfab_ms if seq == 0 else None,
-            duration_s=len(drained.pcm_bytes) / (BIDI_SAMPLE_RATE * 2),
-            sample_rate=BIDI_SAMPLE_RATE,
+            duration_s=len(drained.pcm_bytes) / (resolved_rate * 2),
+            sample_rate=resolved_rate,
         )
         seq += 1
         return chunk
@@ -196,12 +199,14 @@ class BidiChunkStream:
         voice: str,
         text_source: str | Iterable[str],
         speed: float,
+        sample_rate: int | None = None,
     ) -> None:
         self._region = region
         self._endpoint = endpoint
         self._voice = voice
         self._text_source = text_source
         self._speed = speed
+        self._sample_rate = sample_rate
         self._loop = asyncio.new_event_loop()
         self._agen: AsyncGenerator[SynthesisChunk, None] | None = None
         self._closed = False
@@ -215,7 +220,13 @@ class BidiChunkStream:
         if self._agen is None:
             t0 = time.perf_counter()
             self._agen = _stream_chunks_async(
-                self._region, self._endpoint, self._voice, self._text_source, self._speed, t0
+                self._region,
+                self._endpoint,
+                self._voice,
+                self._text_source,
+                self._speed,
+                t0,
+                self._sample_rate,
             )
         try:
             return self._loop.run_until_complete(self._agen.__anext__())

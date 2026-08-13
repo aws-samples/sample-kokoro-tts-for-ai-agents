@@ -125,26 +125,70 @@ def make_serve_module():
             _unload_serve()
 
 
-def _expected_mp3_bytes(segment_samples: int, segment_count: int) -> int:
+def _fake_segments(segment_samples: int, segment_count: int):
+    """The exact float32 arrays _FakePipeline yields, independent of serve.py."""
+    import numpy as np
+
+    return [
+        np.linspace(-0.1, 0.1, segment_samples).astype(np.float32) for _ in range(segment_count)
+    ]
+
+
+def _resampled_segments(segment_samples: int, segment_count: int, target_rate: int):
+    """The same fake segments, run through a real soxr.ResampleStream.
+
+    Independent of serve.py's own _SegmentResampler -- this calls soxr
+    directly, so a test asserting equality against this is a genuine check
+    against an independently reasoned expectation, not a self-comparison.
+    """
+    import numpy as np
+    import soxr
+
+    segments = _fake_segments(segment_samples, segment_count)
+    if target_rate == SAMPLE_RATE:
+        return segments
+
+    stream = soxr.ResampleStream(SAMPLE_RATE, target_rate, num_channels=1, dtype="float32")
+    out = [stream.resample_chunk(seg, last=False) for seg in segments]
+    out.append(stream.resample_chunk(np.array([], dtype=np.float32), last=True))
+    return out
+
+
+def _expected_mp3_bytes(
+    segment_samples: int, segment_count: int, sample_rate: int = SAMPLE_RATE
+) -> int:
     """Encode the same audio the fake pipeline yields, to get an exact byte target.
 
     Asserting on exact length is what catches a dropped flush tail: the tail is
     real audio (512-590 B here), and a "len > 100" assertion passes without it.
+
+    ``sample_rate`` != native resamples the segments the same way serve.py
+    does (via _resampled_segments) before encoding at that rate, so the
+    target reflects the whole resample-then-encode pipeline, not just encoding.
     """
     import lameenc
-    import numpy as np
 
     encoder = lameenc.Encoder()
     encoder.set_bit_rate(48)
-    encoder.set_in_sample_rate(SAMPLE_RATE)
+    encoder.set_in_sample_rate(sample_rate)
     encoder.set_channels(1)
     encoder.set_quality(2)
     encoder.silence()
 
-    segment = np.linspace(-0.1, 0.1, segment_samples).astype(np.float32)
-    pcm = (segment * 32767).astype(np.int16).tobytes()
-    body = b"".join(bytes(encoder.encode(pcm)) for _ in range(segment_count))
+    segments = _resampled_segments(segment_samples, segment_count, sample_rate)
+    body = b"".join(
+        bytes(encoder.encode((seg * 32767).astype("int16").tobytes()))
+        for seg in segments
+        if len(seg) > 0
+    )
     return len(body) + len(bytes(encoder.flush()))
+
+
+def _expected_resampled_sample_count(
+    segment_samples: int, segment_count: int, target_rate: int
+) -> int:
+    """Total sample count after resampling, via the same independent soxr path."""
+    return sum(len(seg) for seg in _resampled_segments(segment_samples, segment_count, target_rate))
 
 
 def test_streaming_invocations_returns_full_wav(serve_module) -> None:
@@ -280,6 +324,8 @@ def test_mp3_flush_tail_carries_audio(serve_module) -> None:
     [
         ({"text": "One.", "format": "flac"}, "format"),
         ({"text": ""}, "text"),
+        ({"text": "One.", "voice": "bf_emma"}, "voice"),
+        ({"text": "One.", "sample_rate": 44100}, "sample_rate"),
     ],
 )
 def test_invalid_requests_are_rejected(serve_module, payload, expected) -> None:
@@ -290,6 +336,87 @@ def test_invalid_requests_are_rejected(serve_module, payload, expected) -> None:
 
     assert resp.status_code == 400
     assert expected in resp.json()["error"]
+
+
+class TestSampleRateConversion:
+    """sample_rate is downsample-only: SUPPORTED_SAMPLE_RATES never exceeds
+    SAMPLE_RATE (the native rate), so every real request here is a real
+    downsample. Expected values come from _resampled_segments/_expected_mp3_bytes,
+    which call soxr/lameenc directly and independently of serve.py's own
+    resampling code -- an equality assertion against them is a genuine check,
+    not a self-comparison.
+    """
+
+    def test_omitted_sample_rate_is_byte_identical_to_before_this_feature(
+        self, serve_module
+    ) -> None:
+        """The eval baseline sends no sample_rate and must see no change at all."""
+        import struct
+
+        from starlette.testclient import TestClient
+
+        with TestClient(serve_module.app) as client:
+            resp = client.post("/invocations", json={"text": "One. Two. Three."})
+
+        assert resp.content[:4] == b"RIFF"
+        assert len(resp.content) == 44 + SEGMENT_COUNT * SEGMENT_SAMPLES * 2
+        sr = struct.unpack_from("<I", resp.content, 24)[0]
+        assert sr == SAMPLE_RATE
+
+    def test_streaming_wav_is_resampled_to_the_requested_rate(self, serve_module) -> None:
+        import struct
+
+        from starlette.testclient import TestClient
+
+        with TestClient(serve_module.app) as client:
+            resp = client.post(
+                "/invocations",
+                json={"text": "One. Two. Three.", "sample_rate": 16000},
+            )
+
+        assert resp.content[:4] == b"RIFF"
+        sr = struct.unpack_from("<I", resp.content, 24)[0]
+        assert sr == 16000
+        expected_samples = _expected_resampled_sample_count(SEGMENT_SAMPLES, SEGMENT_COUNT, 16000)
+        assert len(resp.content) == 44 + expected_samples * 2
+
+    def test_sync_wav_is_resampled_to_the_requested_rate(self, serve_module) -> None:
+        import struct
+
+        from starlette.testclient import TestClient
+
+        with TestClient(serve_module.app) as client:
+            resp = client.post(
+                "/invocations",
+                json={"text": "One.", "stream": False, "sample_rate": 8000},
+            )
+
+        sr = struct.unpack_from("<I", resp.content, 24)[0]
+        assert sr == 8000
+        # The sync path resamples the whole buffer in one soxr.resample() call,
+        # not the streaming per-segment path -- a different expected-value
+        # helper (soxr.resample, not ResampleStream) is the correct independent
+        # reference here.
+        import numpy as np
+        import soxr
+
+        whole = np.concatenate(_fake_segments(SEGMENT_SAMPLES, SEGMENT_COUNT))
+        expected_samples = len(soxr.resample(whole, SAMPLE_RATE, 8000))
+        assert len(resp.content) == 44 + expected_samples * 2
+
+    def test_mp3_is_resampled_to_the_requested_rate(self, serve_module) -> None:
+        from starlette.testclient import TestClient
+
+        with TestClient(serve_module.app) as client:
+            resp = client.post(
+                "/invocations",
+                json={"text": "One. Two. Three.", "format": "mp3", "sample_rate": 16000},
+            )
+
+        assert int.from_bytes(resp.content[:2], "big") & 0xFFE0 == 0xFFE0
+        assert len(resp.content) == _expected_mp3_bytes(SEGMENT_SAMPLES, SEGMENT_COUNT, 16000)
+        # A real downsample, not a no-op: must differ from the native-rate MP3.
+        assert len(resp.content) != _expected_mp3_bytes(SEGMENT_SAMPLES, SEGMENT_COUNT)
 
 
 class TestStartupWarmup:
@@ -466,6 +593,64 @@ class TestBidirectionalBinaryFrames:
         assert frame["type"] == "error"
         assert frame["message"] == "text required"
         assert frame["request_id"] == "r1"
+
+    def test_an_unrecognized_voice_is_rejected_as_an_error_frame(self, serve_module) -> None:
+        import json
+
+        from starlette.testclient import TestClient
+
+        with TestClient(serve_module.app) as client:
+            with client.websocket_connect("/invocations-bidirectional-stream") as ws:
+                ws.send_text(json.dumps({"text": "One.", "voice": "bf_emma", "request_id": "r1"}))
+                frame = json.loads(ws.receive_text())
+
+        assert frame["type"] == "error"
+        assert "voice" in frame["message"]
+
+    def test_an_unsupported_sample_rate_is_rejected_as_an_error_frame(self, serve_module) -> None:
+        import json
+
+        from starlette.testclient import TestClient
+
+        with TestClient(serve_module.app) as client:
+            with client.websocket_connect("/invocations-bidirectional-stream") as ws:
+                ws.send_text(json.dumps({"text": "One.", "sample_rate": 44100, "request_id": "r1"}))
+                frame = json.loads(ws.receive_text())
+
+        assert frame["type"] == "error"
+        assert "sample_rate" in frame["message"]
+
+    def test_audio_is_resampled_to_the_requested_rate(self, serve_module) -> None:
+        import json
+
+        from starlette.testclient import TestClient
+
+        frames: list[dict] = []
+        audio = 0
+        with TestClient(serve_module.app) as client:
+            with client.websocket_connect("/invocations-bidirectional-stream") as ws:
+                ws.send_text(
+                    json.dumps(
+                        {"text": "One. Two. Three.", "sample_rate": 16000, "request_id": "r1"}
+                    )
+                )
+                while True:
+                    received = ws.receive()
+                    if received["type"] == "websocket.close":
+                        break
+                    if received.get("text") is not None:
+                        frame = json.loads(received["text"])
+                        frames.append(frame)
+                        if frame["type"] in ("synthesis_complete", "error"):
+                            break
+                    elif received.get("bytes"):
+                        audio += len(received["bytes"])
+
+        assert [f["type"] for f in frames] == ["synthesis_start", "synthesis_complete"]
+        expected_samples = _expected_resampled_sample_count(SEGMENT_SAMPLES, SEGMENT_COUNT, 16000)
+        assert audio == expected_samples * 2
+        # A real downsample, not a no-op.
+        assert audio != SEGMENT_COUNT * SEGMENT_SAMPLES * 2
 
     def test_client_disconnect_closes_cleanly(self, serve_module) -> None:
         # _receive_message translates a disconnect into WebSocketDisconnect, which

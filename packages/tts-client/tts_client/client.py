@@ -56,7 +56,7 @@ from tts_client.errors import (
     raise_for_client_error,
 )
 from tts_client.streaming import BidiChunkStream
-from tts_client.types import AudioFormat, SynthesisRequest, SynthesisResult
+from tts_client.types import AudioFormat, SampleRate, SynthesisRequest, SynthesisResult
 
 #: Just above SageMaker's 60s invocation ceiling. A client timeout below the
 #: server's own limit would report a client timeout for requests the server
@@ -87,6 +87,8 @@ def _build_payload(request: SynthesisRequest) -> bytes:
         if request.request_timestamp is not None
         else time.time(),
     }
+    if request.sample_rate is not None:
+        body["sample_rate"] = request.sample_rate.value
     return json.dumps(body).encode("utf-8")
 
 
@@ -214,7 +216,15 @@ class TTSClient:
     async def _synthesize_bidi_async(
         self, endpoint: str, request: SynthesisRequest
     ) -> SynthesisResult:
-        message = _build_bidi_message(request.text, request.voice, request.request_timestamp)
+        resolved_rate = (
+            request.sample_rate.value if request.sample_rate is not None else BIDI_SAMPLE_RATE
+        )
+        message = _build_bidi_message(
+            request.text,
+            request.voice,
+            request.request_timestamp,
+            sample_rate=request.sample_rate.value if request.sample_rate is not None else None,
+        )
         t0 = time.perf_counter()
         stream = await _open_bidi_stream(self._region, endpoint)
 
@@ -244,13 +254,13 @@ class TTSClient:
         if not drained.pcm_bytes:
             raise TTSClientError("bidi stream completed with no audio bytes", http_status=200)
 
-        audio = _pcm_to_wav(drained.pcm_bytes)
-        duration_s = len(drained.pcm_bytes) / (BIDI_SAMPLE_RATE * 2)
+        audio = _pcm_to_wav(drained.pcm_bytes, sample_rate=resolved_rate)
+        duration_s = len(drained.pcm_bytes) / (resolved_rate * 2)
 
         return SynthesisResult(
             audio_bytes=audio,
             audio_format=AudioFormat.WAV,
-            sample_rate=BIDI_SAMPLE_RATE,
+            sample_rate=resolved_rate,
             duration_s=duration_s,
             latency_ms=latency_ms,
             ttfab_ms=drained.ttfab_ms or latency_ms,
@@ -265,6 +275,7 @@ class TTSClient:
         text_source: str | Iterable[str],
         *,
         speed: float = 1.0,
+        sample_rate: SampleRate | None = None,
     ) -> BidiChunkStream:
         """Stream text to ``endpoint`` as one message per sentence, on one bidi session.
 
@@ -293,4 +304,11 @@ class TTSClient:
             TTSClientError: or a subclass, for any modeled SDK error, an
                 in-band ``error`` frame, or the connection dropping mid-session.
         """
-        return BidiChunkStream(self._region, endpoint, voice, text_source, speed)
+        return BidiChunkStream(
+            self._region,
+            endpoint,
+            voice,
+            text_source,
+            speed,
+            sample_rate.value if sample_rate is not None else None,
+        )

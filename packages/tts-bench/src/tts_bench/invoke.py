@@ -30,7 +30,7 @@ from tts_client.errors import (
     TTSTimeoutError,
 )
 from tts_client.types import SynthesisRequest
-from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP
+from tts_eval.synthesize import DEFAULT_VOICES, ENDPOINT_MAP, validate_kokoro_voice
 from tts_inference.types import TTSModelName
 
 
@@ -223,6 +223,13 @@ def resolve_endpoint(model: str | TTSModelName) -> str:
 
 
 def resolve_voice(model: str | TTSModelName, voice: str | None = None) -> str:
-    """Voice for a model, defaulting to ``tts_eval``'s per-model choice."""
+    """Voice for a model, defaulting to ``tts_eval``'s per-model choice.
+
+    Validated against :class:`tts_eval.synthesize.KokoroVoice` before
+    returning -- every real caller of this function calls
+    :func:`resolve_endpoint` on the same model first (which raises for a
+    Polly model), so by the time a voice is resolved here, it is a
+    SageMaker-backed model, i.e. Kokoro in this repo's current catalog.
+    """
     model = TTSModelName(model)
-    return voice or DEFAULT_VOICES[model]
+    return validate_kokoro_voice(voice or DEFAULT_VOICES[model])

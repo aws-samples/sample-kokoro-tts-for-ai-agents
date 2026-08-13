@@ -14,15 +14,46 @@ All numbers below are measured against the live endpoint, not estimated.
 | Field | Values | Default | Effect |
 |-------|--------|---------|--------|
 | `text` | string | required | 400 if empty |
-| `voice` | string | `af_heart` | Kokoro voice id |
+| `voice` | one of 20 (see below) | `af_heart` | Kokoro voice id |
 | `speed` | float | `1.0` | Playback rate |
 | `stream` | bool | `true` | `false` returns one complete response |
 | `format` | `wav` \| `mp3` | `wav` | Raw PCM frames, or 48 kbps mono MP3 |
+| `sample_rate` | `8000` \| `16000` \| `22050` \| `24000` | `24000` | Output rate; see below |
 
 Every field defaults to the pre-existing behaviour, so callers that send only
 `text`/`voice` are unaffected. That matters: `TTSClient.synthesize()`
 sends no `format` and asserts `RIFF` on the response, and the eval baseline
-depends on it. An invalid `format` returns 400.
+depends on it. An invalid `format`, `voice`, or `sample_rate` returns 400.
+
+### Voice
+
+The container loads one `KPipeline`, for `lang_code="a"` (American English)
+only — see `_load_pipeline()`. Kokoro's model supports 54 voices across 9
+languages, but only the 20 `af_*`/`am_*` voices actually work against this
+deployment; the rest were never a validation gap so much as an unenforced
+one — a wrong-language voice would either 404 deep in `kokoro`'s own
+`hf_hub_download`, or silently load a wrong-language style vector into this
+English-only phonemization pipeline with no error at all. `_VALID_VOICES`
+enforces the boundary explicitly now. The same 20-voice enum is available
+client-side as `tts_eval.synthesize.KokoroVoice`.
+
+### Sample rate
+
+`24000` (Kokoro's native rate) is the ceiling, not one option among several:
+producing a higher rate from a 24kHz source would be pure interpolation with
+no added fidelity, so nothing above it is offered. Every other value is a
+real downsample, via `soxr` — proven in `scratch/soxr_resample_probe/` before
+this shipped: the buffered (`stream: false`) path resamples the whole
+utterance in one `soxr.resample()` call, and the two streaming paths
+(`stream: true`, and the WebSocket path) use `soxr.ResampleStream`, which
+carries filter state across segments — proven necessary, not just nicer,
+since independent per-segment `soxr.resample()` calls measurably degrade at
+segment boundaries.
+
+Requesting a downsample adds real resampling latency over the native rate.
+Client-side, `tts_client.types.SampleRate` mirrors `SUPPORTED_SAMPLE_RATES`
+as an enum, so an unsupported value is rejected at request-construction
+time, before any network call.
 
 | `format` | Response `ContentType` |
 |----------|------------------------|
@@ -114,7 +145,10 @@ newline-separated text.
 ## WebSocket
 
 `ws://localhost:8080/invocations-bidirectional-stream` streams **raw PCM only** —
-no MP3, by design. Playback here is one-way (no barge-in).
+no MP3, by design. Playback here is one-way (no barge-in). Each message
+accepts `voice`/`sample_rate` with the same validation and resampling as
+`/invocations` — an unrecognized value gets an `error` frame instead of a
+400, since there is no HTTP status code on this transport.
 
 The bidirectional-streaming contract itself:
 
@@ -129,8 +163,9 @@ The bidirectional-streaming contract itself:
 
 | Script | Covers |
 |--------|--------|
-| `packages/speech-infra/tests/test_kokoro_serve.py` | Server: flush tail, encoder reuse, default-path regression |
-| `packages/tts-client/tests/test_client.py` | Client: streaming WAV baseline |
+| `packages/speech-infra/tests/test_kokoro_serve.py` | Server: flush tail, encoder reuse, default-path regression, voice/sample_rate validation, resampled WAV/MP3/WebSocket output |
+| `packages/tts-client/tests/test_client.py`, `test_streaming.py` | Client: streaming WAV baseline, sample_rate request/response threading on both transports |
+| `packages/tts-eval/tests/test_synthesize.py` | `KokoroVoice` catalog, `validate_kokoro_voice` accept/reject cases |
 
 Live results on 4 verified clips: WER 0.000, default no-flag call still returns
 96044 B of `RIFF`.

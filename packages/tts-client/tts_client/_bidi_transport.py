@@ -75,14 +75,17 @@ def _build_bidi_message(
     request_timestamp: float | None,
     *,
     speed: float | None = None,
+    sample_rate: int | None = None,
 ) -> bytes:
     """Serialize one bidi text message.
 
-    ``speed`` is omitted unless explicitly passed, matching the wire shape
-    :meth:`TTSClient.synthesize_bidi` has always sent. Kokoro's bidi handler
-    defaults an absent ``speed`` to 1.0 server-side, so omitting it there is
-    not a behavior change; :meth:`TTSClient.synthesize_bidi_stream` passes it
-    explicitly so a non-default speed is honored per chunk.
+    ``speed``/``sample_rate`` are omitted unless explicitly passed, matching
+    the wire shape :meth:`TTSClient.synthesize_bidi` has always sent. Kokoro's
+    bidi handler defaults an absent ``speed`` to 1.0 and an absent
+    ``sample_rate`` to its native rate server-side, so omitting either is not
+    a behavior change. Plain ``int``, not :class:`tts_client.types.SampleRate`
+    -- this is a leaf module with no dependency on that higher-level type;
+    callers pass the already-validated ``.value``.
     """
     body: dict[str, Any] = {
         "text": text,
@@ -91,6 +94,8 @@ def _build_bidi_message(
     }
     if speed is not None:
         body["speed"] = speed
+    if sample_rate is not None:
+        body["sample_rate"] = sample_rate
     return json.dumps(body).encode("utf-8")
 
 

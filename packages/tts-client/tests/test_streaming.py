@@ -24,6 +24,7 @@ from aws_sdk_sagemaker_runtime_http2.models import (
 from tts_client.client import TTSClient
 from tts_client.errors import ServerError, TTSClientError
 from tts_client.streaming import IncrementalSentenceChunker, split_sentences
+from tts_client.types import SampleRate
 
 PCM_100MS = b"\x00\x01" * 2400
 
@@ -395,6 +396,46 @@ class TestSynthesizeBidiStream:
             if json.loads(event.value.bytes_.decode("utf-8")).get("type") != "close"
         ]
         assert speeds == [1.5, 1.5]
+
+    def test_sample_rate_is_sent_on_every_chunk_when_set(self) -> None:
+        events = _sentence_events(PCM_100MS, PCM_100MS)
+        stream = _FakeStream(events)
+        fake_ctor = _FakeBidiClientCtor(stream)
+
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
+            client = TTSClient()
+            with client.synthesize_bidi_stream(
+                "speech-kokoro-82m", "af_heart", "One. Two.", sample_rate=SampleRate.HZ_16000
+            ) as bidi_stream:
+                chunks = list(bidi_stream)
+
+        rates = [
+            json.loads(event.value.bytes_.decode("utf-8")).get("sample_rate")
+            for event in stream.input_stream.sent
+            if json.loads(event.value.bytes_.decode("utf-8")).get("type") != "close"
+        ]
+        assert rates == [16000, 16000]
+        assert [c.sample_rate for c in chunks] == [16000, 16000]
+
+    def test_sample_rate_omitted_from_every_chunk_by_default(self) -> None:
+        events = _sentence_events(PCM_100MS, PCM_100MS)
+        stream = _FakeStream(events)
+        fake_ctor = _FakeBidiClientCtor(stream)
+
+        with patch("tts_client._bidi_transport.SageMakerRuntimeHTTP2Client", fake_ctor):
+            client = TTSClient()
+            with client.synthesize_bidi_stream(
+                "speech-kokoro-82m", "af_heart", "One. Two."
+            ) as bidi_stream:
+                chunks = list(bidi_stream)
+
+        sent_messages = [
+            json.loads(event.value.bytes_.decode("utf-8"))
+            for event in stream.input_stream.sent
+            if json.loads(event.value.bytes_.decode("utf-8")).get("type") != "close"
+        ]
+        assert all("sample_rate" not in m for m in sent_messages)
+        assert [c.sample_rate for c in chunks] == [24000, 24000]
 
     def test_mid_session_internal_stream_failure_raises_server_error(self) -> None:
         events = [
