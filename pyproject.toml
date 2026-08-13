@@ -18,6 +18,7 @@ tts-client = { workspace = true }
 tts-eval = { workspace = true }
 tts-bench = { workspace = true }
 speech-infra = { workspace = true }
+agent-infra = { workspace = true }
 
 [tool.uv.workspace]
 members = [
@@ -27,6 +28,7 @@ members = [
     "packages/tts-eval",
     "packages/tts-bench",
     "packages/speech-infra",
+    "packages/agent-infra",
 ]
 
 [dependency-groups]
@@ -41,6 +43,7 @@ dev = [
     "tts-eval",
     "tts-bench",
     "speech-infra",
+    "agent-infra",
 ]
 
 [tool.ruff]
@@ -70,6 +73,7 @@ known-first-party = [
     "tts_eval",
     "tts_bench",
     "speech_infra",
+    "agent_infra",
 ]
 
 [tool.mypy]
@@ -82,7 +86,7 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 warn_no_return = true
 strict_equality = true
-exclude = ["packages/speech-infra/containers/", "packages/models/"]
+exclude = ["packages/speech-infra/containers/", "packages/models/", "packages/agent-infra/container/"]
 
 [tool.pytest.ini_options]
 testpaths = [
@@ -92,6 +96,7 @@ testpaths = [
     "packages/tts-eval/tests",
     "packages/tts-bench/tests",
     "packages/speech-infra/tests",
+    "packages/agent-infra/tests",
 ]
 python_files = "test_*.py"
 python_classes = "Test*"
