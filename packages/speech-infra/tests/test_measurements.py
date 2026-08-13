@@ -68,22 +68,22 @@ class TestTtfabP95AtC1Ms:
         # Service time is a property of a model on an instance type, so another
         # model's number is not a worse threshold — it is a threshold for something
         # that was never deployed here.
-        _artifact(tmp_path, model_name="chatterbox-turbo")
+        _artifact(tmp_path, model_name="other-model")
         assert measurements.ttfab_p95_at_c1_ms(MODEL, artifact_dir=tmp_path) is None
 
     def test_a_filename_prefix_match_is_not_a_model_match(self, tmp_path: Path) -> None:
-        # kokoro-82m-cpu is a real config on an ml.c5.2xlarge, and its filename matches
-        # a glob for kokoro-82m. Deciding on the filename would threshold the GPU
-        # model's alarm with a CPU model's service time, which is why the document's
+        # A hypothetical kokoro-82m-v2 config would have a filename that matches a
+        # glob for kokoro-82m. Deciding on the filename would threshold this model's
+        # alarm with a different model's service time, which is why the document's
         # own model_name is what decides.
-        _artifact(tmp_path, model_name="kokoro-82m-cpu", c1_ms=900.0, slug="c52xlarge-139b9068")
+        _artifact(tmp_path, model_name="kokoro-82m-v2", c1_ms=900.0, slug="g5xlarge-abcdef01")
         assert measurements.ttfab_p95_at_c1_ms(MODEL, artifact_dir=tmp_path) is None
 
     def test_a_renamed_file_still_reads_its_own_model(self, tmp_path: Path) -> None:
         # The other direction of the same rule: --output takes any path, so the
         # filename is a convention and the document is the fact. A file named for
         # kokoro-82m that records having measured something else is not usable here.
-        _artifact(tmp_path, model_name="chatterbox-turbo", filename_model=MODEL)
+        _artifact(tmp_path, model_name="other-model", filename_model=MODEL)
         assert measurements.ttfab_p95_at_c1_ms(MODEL, artifact_dir=tmp_path) is None
 
     def test_a_document_without_a_model_name_is_rejected(self, tmp_path: Path) -> None:
@@ -111,11 +111,11 @@ class TestTtfabP95AtC1Ms:
         assert measurements.ttfab_p95_at_c1_ms(MODEL, artifact_dir=tmp_path) == 500.0
 
     def test_falls_through_past_another_models_artifact(self, tmp_path: Path) -> None:
-        # Same fall-through, but for the prefix collision: kokoro-82m-cpu's artifact
-        # being the newest must not hide kokoro-82m's own.
+        # Same fall-through, but for the prefix collision: a hypothetical
+        # kokoro-82m-v2's artifact being the newest must not hide kokoro-82m's own.
         mine = _artifact(tmp_path, c1_ms=164.5)
         theirs = _artifact(
-            tmp_path, model_name="kokoro-82m-cpu", c1_ms=900.0, slug="c52xlarge-139b9068"
+            tmp_path, model_name="kokoro-82m-v2", c1_ms=900.0, slug="g5xlarge-abcdef01"
         )
         os.utime(mine, (1_000_000, 1_000_000))
         os.utime(theirs, (2_000_000, 2_000_000))
@@ -226,7 +226,7 @@ class TestScalingThresholdsMeasured:
     def test_the_filename_is_not_the_convention_the_document_is(self, tmp_path: Path) -> None:
         # plan --output takes any path. A file named for one model whose document
         # measured another is not usable for the named one.
-        _plan(tmp_path, model_name="chatterbox-turbo", filename="plan-kokoro-82m.json")
+        _plan(tmp_path, model_name="other-model", filename="plan-kokoro-82m.json")
         assert measurements.scaling_thresholds_measured(MODEL, artifact_dir=tmp_path) is False
 
     def test_a_renamed_file_still_reads_its_own_model(self, tmp_path: Path) -> None:
@@ -254,7 +254,7 @@ class TestScalingThresholdsMeasured:
         assert measurements.scaling_thresholds_measured(MODEL, artifact_dir=tmp_path) is False
 
     def test_another_models_plan_does_not_apply(self, tmp_path: Path) -> None:
-        _plan(tmp_path, model_name="chatterbox-turbo", filename="plan-chatterbox-turbo.json")
+        _plan(tmp_path, model_name="other-model", filename="plan-other-model.json")
         assert measurements.scaling_thresholds_measured(MODEL, artifact_dir=tmp_path) is False
 
     def test_an_unreadable_plan_falls_through(self, tmp_path: Path) -> None:

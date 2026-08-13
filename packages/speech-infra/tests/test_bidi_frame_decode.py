@@ -1,20 +1,17 @@
-"""Every container must accept the frame type SageMaker actually sends.
+"""Every bidi container must accept the frame type SageMaker actually sends.
 
 ``invoke_endpoint_with_bidirectional_stream`` forwards each ``RequestPayloadPart``
 as a *binary* WebSocket frame. Starlette's ``receive_text()`` reads
-``message["text"]`` unconditionally, so all four containers raised
-``KeyError: 'text'`` on every production bidi request. The generic handler then
-forwarded ``str(e)``, making the reply an error frame whose message was the
-literal string ``'text'`` — which reads as a complaint about the payload rather
-than a transport mismatch, and is why it went unnoticed while every endpoint
-reported InService.
+``message["text"]`` unconditionally, which once raised ``KeyError: 'text'`` on
+every production bidi request. The generic handler then forwarded ``str(e)``,
+making the reply an error frame whose message was the literal string ``'text'``
+— which reads as a complaint about the payload rather than a transport
+mismatch, and is why it went unnoticed while the endpoint reported InService.
 
-The per-container test modules (``test_kokoro_serve.py`` and friends) skip
-outside the container images, and ``vllm`` has no test module at all. This one
-runs everywhere: it extracts ``_receive_message`` from each file's source and
-exercises it against fake ASGI messages, so a container whose deps or model
-assets are absent here is still covered. That makes it the file that stops one
-of the four from drifting back to ``receive_text``.
+``test_kokoro_serve.py`` skips outside the container image. This one runs
+everywhere: it extracts ``_receive_message`` from the source and exercises it
+against fake ASGI messages, so it is still covered when torch and the model
+assets that only exist inside the image are absent.
 """
 
 from __future__ import annotations
@@ -31,9 +28,6 @@ _CONTAINERS = Path(__file__).resolve().parents[1] / "containers"
 # Every container exposing a bidirectional WebSocket route.
 HANDLERS = {
     "kokoro": "kokoro/serve.py",
-    "kokoro-cpu": "kokoro-cpu/serve.py",
-    "chatterbox": "chatterbox/streaming_proxy.py",
-    "vllm": "vllm/streaming_proxy.py",
 }
 
 

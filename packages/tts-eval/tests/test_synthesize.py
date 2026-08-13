@@ -16,9 +16,7 @@ from tts_inference.types import TTSModelName
 class TestEndpointMap:
     def test_deployed_models_have_endpoints(self) -> None:
         deployed = [
-            TTSModelName.ORPHEUS_3B,
             TTSModelName.KOKORO_82M,
-            TTSModelName.CHATTERBOX_TURBO,
         ]
         for model in deployed:
             assert model in ENDPOINT_MAP, f"Missing endpoint for {model.value}"

@@ -110,26 +110,6 @@ VOICE_CUSTOMIZATION: dict[str, dict[str, str]] = {
         "effort": "None",
         "notes": "30+ built-in voices, no cloning support",
     },
-    "kokoro-82m-cpu": {
-        "method": "Pre-trained voices",
-        "effort": "None",
-        "notes": "Same as kokoro-82m (CPU inference)",
-    },
-    "orpheus-3b": {
-        "method": "Pre-trained voices",
-        "effort": "None",
-        "notes": "Multiple speaker styles, no cloning",
-    },
-    "chatterbox-turbo": {
-        "method": "Reference audio cloning",
-        "effort": "Low (5s sample)",
-        "notes": "Zero-shot voice cloning from short reference audio",
-    },
-    "maya-veena": {
-        "method": "Pre-trained voices",
-        "effort": "None",
-        "notes": "Single voice model",
-    },
     "polly-standard": {
         "method": "Managed service",
         "effort": "None",

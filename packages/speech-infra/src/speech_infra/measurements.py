@@ -64,10 +64,11 @@ def _candidate_paths(model_name: str, *, artifact_dir: Path | None = None) -> li
     a threshold from the previous image is a stale alarm rather than a wrong policy.
     ``tts-bench plan`` is where a fingerprint mismatch is a hard refusal.
 
-    A prefilter only, and deliberately loose: the glob cannot separate ``kokoro-82m`` from
-    ``kokoro-82m-cpu``, which are different models on different instance families. See
-    :func:`_load`, which reads the model name out of the document and is what actually
-    decides.
+    A prefilter only, and deliberately loose: the glob cannot separate a model name from
+    another model name it happens to be a prefix of (e.g. ``kokoro-82m`` vs. a
+    hypothetical ``kokoro-82m-v2``), which could be different models on different
+    instance families. See :func:`_load`, which reads the model name out of the document
+    and is what actually decides.
     """
     directory = artifact_dir or ARTIFACT_DIR
     if not directory.is_dir():
@@ -86,11 +87,11 @@ def _load(path: Path, model_name: str) -> dict[str, Any] | None:
     and the failure mode should be "no alarm" rather than "no deploy".
 
     The model check is on the document rather than the filename because the filename
-    cannot be trusted to disambiguate: ``qmax-kokoro-82m-cpu-...json`` matches a glob for
-    ``kokoro-82m``, and reading it would threshold the GPU model's alarm with a service
-    time measured on an ``ml.c5.2xlarge``. ``model_name`` is a required field on every
-    report the tool writes, so requiring it here rejects only documents that were never
-    one.
+    cannot be trusted to disambiguate: a hypothetical ``qmax-kokoro-82m-v2-...json``
+    would match a glob for ``kokoro-82m``, and reading it would threshold this model's
+    alarm with a service time measured on a different one entirely. ``model_name`` is a
+    required field on every report the tool writes, so requiring it here rejects only
+    documents that were never one.
     """
     try:
         raw = json.loads(path.read_text())

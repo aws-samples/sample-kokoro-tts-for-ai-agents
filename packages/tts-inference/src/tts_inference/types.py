@@ -12,10 +12,6 @@ class TTSModelName(StrEnum):
     """Supported TTS model identifiers."""
 
     KOKORO_82M = "kokoro-82m"
-    KOKORO_82M_CPU = "kokoro-82m-cpu"
-    MAYA_VEENA = "maya-veena"
-    CHATTERBOX_TURBO = "chatterbox-turbo"
-    ORPHEUS_3B = "orpheus-3b"
     POLLY_STANDARD = "polly-standard"
     POLLY_NEURAL = "polly-neural"
     POLLY_GENERATIVE = "polly-generative"
@@ -46,7 +42,7 @@ class VoiceConfig(BaseModel):
     speed: float = Field(default=1.0, ge=0.5, le=3.0)
     reference_audio_path: str | None = Field(
         default=None,
-        description="Path to reference audio for voice cloning (Chatterbox)",
+        description="Path to reference audio for voice cloning",
     )
 
 

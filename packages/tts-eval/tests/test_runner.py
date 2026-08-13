@@ -27,7 +27,7 @@ class TestEvalResult:
 
     def test_to_dict_with_error(self) -> None:
         result = EvalResult(
-            model="orpheus-3b",
+            model="kokoro-82m",
             sample_id="s1",
             text="Test",
             error="Synthesis failed: timeout",
@@ -39,7 +39,7 @@ class TestEvalResult:
 
     def test_to_dict_partial_scores(self) -> None:
         result = EvalResult(
-            model="chatterbox-turbo",
+            model="kokoro-82m",
             sample_id="s1",
             text="Test",
             utmos=3.2,

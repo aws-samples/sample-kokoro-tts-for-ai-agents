@@ -21,7 +21,7 @@ import aws_cdk.aws_iam as iam
 import pytest
 from aws_cdk.assertions import Match, Template
 
-from speech_infra.config import TTS_MODEL_CONFIGS, ModelEndpointConfig
+from speech_infra.config import TTS_MODEL_CONFIGS, ContainerType, ModelEndpointConfig
 from speech_infra.stacks.endpoint import SpeechEndpointStack
 
 FAKE_IMAGE_URI = "111111111111.dkr.ecr.us-east-1.amazonaws.com/fake:latest"
@@ -393,7 +393,7 @@ class TestObservability:
     def test_another_models_artifact_does_not_apply(self, tmp_path: Path) -> None:
         # Reading a different model's service time would threshold kokoro's alarm on
         # hardware and code it never ran on.
-        _write_qmax_artifact(tmp_path, "chatterbox-turbo", ttfab_p95_at_c1_ms=164.5)
+        _write_qmax_artifact(tmp_path, "other-model", ttfab_p95_at_c1_ms=164.5)
         _write_plan_artifact(tmp_path, "kokoro-82m")
         template = _template(TTS_MODEL_CONFIGS["kokoro-82m"], artifact_dir=tmp_path)
         assert (
@@ -417,16 +417,19 @@ class TestObservability:
 
 
 class TestNonScalingModels:
-    @pytest.mark.parametrize(
-        "model_name",
-        ["kokoro-82m-cpu", "chatterbox-turbo", "orpheus-3b", "maya-veena"],
-    )
-    def test_no_scaling_resources_without_measured_thresholds(self, model_name: str) -> None:
+    def test_no_scaling_resources_without_measured_thresholds(self) -> None:
         # The rule this guards: no model gets scaling until its own Q_max and T_total
-        # are measured. maya-veena is here because inheriting the class defaults (1-4)
-        # once made scaling_enabled true for a model with no endpoint at all, which
-        # is what `tts-bench drift` reported as a missing scalable target.
-        config = TTS_MODEL_CONFIGS[model_name]
+        # are measured. Constructed directly rather than read from TTS_MODEL_CONFIGS:
+        # the point is the invariant on any model with min_instances == max_instances,
+        # not a property of which specific models happen to be configured today.
+        config = ModelEndpointConfig(
+            model_name="non-scaling-model",
+            hf_model_id="org/non-scaling-model",
+            instance_type="ml.g5.xlarge",
+            container_type=ContainerType.PYTORCH_CUSTOM,
+            min_instances=1,
+            max_instances=1,
+        )
         assert not config.scaling_enabled
 
         template = _template(config)

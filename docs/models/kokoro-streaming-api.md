@@ -114,9 +114,16 @@ newline-separated text.
 ## WebSocket
 
 `ws://localhost:8080/invocations-bidirectional-stream` streams **raw PCM only** —
-no MP3, by design. See the bidirectional contract in
-[`../historical/model-research-2026-05.md`](../historical/model-research-2026-05.md).
-Playback here is one-way (no barge-in).
+no MP3, by design. Playback here is one-way (no barge-in).
+
+The bidirectional-streaming contract itself:
+
+- Implement a WebSocket endpoint at `ws://localhost:8080/invocations-bidirectional-stream`.
+- Docker label: `com.amazonaws.sagemaker.capabilities.bidirectional-streaming=true`.
+- Client side uses the `InvokeEndpointWithBidirectionalStream` API — see
+  `packages/tts-client/tts_client/client.py`'s `synthesize_bidi()`.
+- SageMaker does **not** batch across WebSocket sessions — each client gets its own. Batching
+  across concurrent sessions, if needed, is the container's own job.
 
 ## Verification
 

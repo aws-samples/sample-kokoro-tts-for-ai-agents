@@ -9,15 +9,12 @@ from pathlib import Path
 import click
 
 from speech_infra.config import (
-    STT_MODEL_CONFIGS,
     TTS_MODEL_CONFIGS,
     ModelEndpointConfig,
     get_model_config,
 )
 
 CDK_APP_DIR = Path(__file__).resolve().parent.parent.parent
-
-ALL_CONFIGS = {**STT_MODEL_CONFIGS, **TTS_MODEL_CONFIGS}
 
 
 @click.group()
@@ -110,7 +107,7 @@ def list_models() -> None:
     """List all configured models and their endpoint names."""
     click.echo(f"{'Model':<20} {'Endpoint':<28} {'Instance':<16} {'Container'}")
     click.echo("-" * 80)
-    for name, config in ALL_CONFIGS.items():
+    for name, config in TTS_MODEL_CONFIGS.items():
         click.echo(
             f"{name:<20} {config.endpoint_name:<28} "
             f"{config.instance_type:<16} {config.container_type.value}"
@@ -124,7 +121,7 @@ def status(model: str | None) -> None:
     if model:
         configs = [get_model_config(model)]
     else:
-        configs = list(ALL_CONFIGS.values())
+        configs = list(TTS_MODEL_CONFIGS.values())
 
     for config in configs:
         click.echo(f"{config.stack_id}: checking...")
@@ -136,7 +133,7 @@ def _resolve_targets(
 ) -> list[ModelEndpointConfig]:
     """Resolve CLI arguments into model configs."""
     if all_models:
-        return list(ALL_CONFIGS.values())
+        return list(TTS_MODEL_CONFIGS.values())
 
     model_configs: list[ModelEndpointConfig] = []
     for m in models:

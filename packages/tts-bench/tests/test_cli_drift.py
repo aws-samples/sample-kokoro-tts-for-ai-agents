@@ -27,14 +27,14 @@ import pytest
 from click.testing import CliRunner
 
 from tts_bench.cli import _expected_scaling, main
-from tts_bench.observe import SCALABLE_DIMENSION, resource_id
+from tts_bench.observe import SCALABLE_DIMENSION, ExpectedScaling, resource_id
 
 T0 = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
 ROLE_ARN = "arn:aws:iam::1234:role/aws-service-role/sagemaker.application-autoscaling"
 
-#: An endpoint no config describes — the orphan case, and the live state of
-#: `speech-orpheus-3b` today (max_capacity=4 with `max_instances=1` in config).
-ORPHAN = "speech-orpheus-3b"
+#: An endpoint no config describes at all — the orphan case: a scalable target
+#: or policy that exists live with nothing in TTS_MODEL_CONFIGS to justify it.
+ORPHAN = "speech-other-model-a"
 
 
 @pytest.fixture
@@ -139,26 +139,27 @@ class TestExpectedScaling:
         assert len(_expected_scaling()) == len(TTS_MODEL_CONFIGS)
 
     def test_carries_the_scaling_enabled_gate(self) -> None:
-        # A model pinned to one instance gets no synthesized policy, which is
-        # exactly what makes a live policy on it an orphan. Asserted against a
-        # pinned model rather than a named one so it keeps testing the gate as
-        # models gain measured C_max values and start scaling.
+        # _expected_scaling() has no gate logic of its own -- it copies
+        # config.scaling_enabled straight through. The gate itself (a model
+        # pinned to one instance gets no synthesized policy) is unit-tested
+        # directly against ModelEndpointConfig in test_config.py; this just
+        # confirms the copy is not lossy for the one model actually configured.
         expected = _expected_scaling()
-        pinned = {name for name, e in expected.items() if e.max_instances <= e.effective_min}
-        assert pinned, "no pinned model left to check the gate against"
-        assert all(not expected[name].scaling_enabled for name in pinned)
         assert expected["speech-kokoro-82m"].scaling_enabled
 
     def test_coerces_min_zero_the_way_cdk_does(self) -> None:
-        # Several configs say min_instances=0; both CDK constructs wrap it in
-        # max(..., 1). Comparing against the raw 0 would report a capacity
-        # mismatch on every one of those endpoints.
-        from speech_infra.config import TTS_MODEL_CONFIGS
-
-        zeroed = [c for c in TTS_MODEL_CONFIGS.values() if c.min_instances == 0]
-        assert zeroed, "no min_instances=0 config left to check coercion against"
-        expected = _expected_scaling()
-        assert all(expected[c.endpoint_name].effective_min == 1 for c in zeroed)
+        # Both CDK constructs wrap min_instances=0 in max(..., 1). Comparing
+        # against the raw 0 would report a capacity mismatch on any endpoint
+        # configured that way. Constructed directly rather than read off
+        # TTS_MODEL_CONFIGS: effective_min's coercion is a property of
+        # ExpectedScaling itself, not of which models happen to be configured.
+        expected = ExpectedScaling(
+            endpoint="speech-test-model",
+            min_instances=0,
+            max_instances=4,
+            scaling_enabled=True,
+        )
+        assert expected.effective_min == 1
 
 
 class TestDriftCommand:
@@ -347,9 +348,13 @@ class TestDriftCommand:
         assert "No drift" in result.output
 
     def test_leftover_freeze_is_an_error_pointing_at_thaw(self, runner: CliRunner) -> None:
-        # An aborted cmax run leaves scale-out suspended, which looks healthy in
-        # the console and cannot scale under load. The fix is one command.
-        frozen = _raw_target(ORPHAN, max_capacity=4)
+        # An aborted qmax/ttotal run leaves scale-out suspended, which looks
+        # healthy in the console and cannot scale under load. The fix is one
+        # command. Frozen at kokoro-82m's own configured capacity, so this is
+        # the suspension finding on its own, not tangled up with an orphan or
+        # a capacity mismatch.
+        endpoint = "speech-kokoro-82m"
+        frozen = _raw_target(endpoint, min_capacity=1, max_capacity=9)
         frozen["SuspendedState"] = {
             "DynamicScalingInSuspended": True,
             "DynamicScalingOutSuspended": True,
@@ -357,12 +362,12 @@ class TestDriftCommand:
         }
         result = _run_drift(
             runner,
-            _fake_appscaling(targets=[*_baseline_targets(), frozen], policies=[]),
+            _fake_appscaling(targets=[frozen], policies=[]),
             _fake_cloudwatch(metrics=[], alarms=[]),
             "--no-fail-on-error",
         )
         assert "suspended" in result.output
-        assert f"tts-bench thaw --endpoint {ORPHAN}" in result.output
+        assert f"tts-bench thaw --endpoint {endpoint}" in result.output
 
 
 class TestThawCommand:
@@ -486,7 +491,7 @@ class TestThawCommand:
         ]
 
     def test_no_scalable_target_is_a_clean_no_op(self, runner: CliRunner) -> None:
-        # True for speech-kokoro-82m and speech-chatterbox-turbo today. Nothing
+        # True for speech-kokoro-82m and speech-other-model-b today. Nothing
         # to resume is a success: the endpoint already cannot scale, and
         # creating a target here would leave config CDK does not describe.
         appscaling, sagemaker = self._fake_clients(before=None)

@@ -13,15 +13,11 @@ from tts_inference.types import (
 class TestTTSModelName:
     def test_enum_values(self) -> None:
         assert TTSModelName.KOKORO_82M == "kokoro-82m"
-        assert TTSModelName.MAYA_VEENA == "maya-veena"
-        assert TTSModelName.CHATTERBOX_TURBO == "chatterbox-turbo"
-        assert TTSModelName.ORPHEUS_3B == "orpheus-3b"
+        assert TTSModelName.POLLY_STANDARD == "polly-standard"
 
     def test_from_string(self) -> None:
         assert TTSModelName("kokoro-82m") == TTSModelName.KOKORO_82M
-        assert TTSModelName("maya-veena") == TTSModelName.MAYA_VEENA
-        assert TTSModelName("chatterbox-turbo") == TTSModelName.CHATTERBOX_TURBO
-        assert TTSModelName("orpheus-3b") == TTSModelName.ORPHEUS_3B
+        assert TTSModelName("polly-standard") == TTSModelName.POLLY_STANDARD
 
 
 class TestExecutionMode:
@@ -111,7 +107,7 @@ class TestSynthesisResult:
     def test_json_serialization(self) -> None:
         result = SynthesisResult(
             source_text="test",
-            model_name=TTSModelName.MAYA_VEENA,
+            model_name=TTSModelName.POLLY_STANDARD,
             audio_bytes=b"\x00\x01\x02",
             sample_rate=24000,
             duration_seconds=0.5,
@@ -120,5 +116,5 @@ class TestSynthesisResult:
         json_str = result.model_dump_json()
         restored = SynthesisResult.model_validate_json(json_str)
         assert restored.source_text == "test"
-        assert restored.model_name == TTSModelName.MAYA_VEENA
+        assert restored.model_name == TTSModelName.POLLY_STANDARD
         assert restored.audio_bytes == b"\x00\x01\x02"

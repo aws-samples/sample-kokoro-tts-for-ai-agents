@@ -1,20 +1,20 @@
 # STT-TTS-Model-Eval
 
-Evaluation and SageMaker deployment of speech-to-text and text-to-speech models: model
-catalogs, benchmarking tools to turn a live endpoint's measured behavior into an autoscaling
-config, and the CDK stacks that deploy them.
+Deploying and autoscaling the Kokoro-82M text-to-speech model on Amazon SageMaker: a client
+library for the deployed endpoint, benchmarking tools that turn a live endpoint's measured
+behavior into an autoscaling config, and the CDK stack that deploys it.
 
 ## Layout
 
 | Package | What it's for |
 |---|---|
-| `tts-client` | Blocking client for our deployed TTS endpoints, plus Amazon Polly |
-| `tts-eval` / `stt-eval` | Quality evaluation — UTMOS/WER for TTS, WER/CER/alignment for STT |
-| `tts-bench` / `stt-bench` | Performance benchmarking — latency, scalability, cost, and the `qmax`/`ttotal`/`plan` autoscaling chain |
-| `speech-infra` | CDK stacks and the `speech-infra` CLI that deploy/manage the SageMaker endpoints |
-| `tts-inference` / `stt-inference` | Model catalog types and local/SageMaker inference backends |
+| `tts-client` | Blocking client for the deployed Kokoro endpoint, plus Amazon Polly |
+| `tts-eval` | Quality evaluation — UTMOS/WER |
+| `tts-bench` | Performance benchmarking — latency, scalability, cost, and the `qmax`/`ttotal`/`plan` autoscaling chain |
+| `speech-infra` | CDK stack and the `speech-infra` CLI that deploy/manage the SageMaker endpoint |
+| `tts-inference` | Model catalog types and local/SageMaker inference backends |
 | `shared` | Shared types and data loaders used across the above |
-| `models/*` | Per-model isolated venvs for local inference outside the shared workspace |
+| `models/tts-kokoro` | Isolated venv for local Kokoro inference outside the shared workspace |
 
 ## Setup
 

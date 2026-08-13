@@ -8,7 +8,6 @@ import aws_cdk as cdk
 
 from speech_infra.config import (
     TTS_MODEL_CONFIGS,
-    ContainerType,
     ModelEndpointConfig,
 )
 from speech_infra.stacks.endpoint import SpeechEndpointStack
@@ -18,19 +17,13 @@ from speech_infra.stacks.model_cache import SpeechModelCacheStack
 CONTAINERS_ROOT = Path(__file__).resolve().parent.parent.parent / "containers"
 
 CONTAINER_DIR_MAP: dict[str, str] = {
-    "orpheus-3b": str(CONTAINERS_ROOT / "vllm"),
-    "maya-veena": str(CONTAINERS_ROOT / "vllm"),
     "kokoro-82m": str(CONTAINERS_ROOT / "kokoro"),
-    "kokoro-82m-cpu": str(CONTAINERS_ROOT / "kokoro-cpu"),
-    "chatterbox-turbo": str(CONTAINERS_ROOT / "chatterbox"),
 }
 
 
 def _get_container_dir(config: ModelEndpointConfig) -> str:
     if config.model_name in CONTAINER_DIR_MAP:
         return CONTAINER_DIR_MAP[config.model_name]
-    if config.container_type == ContainerType.VLLM:
-        return str(CONTAINERS_ROOT / "vllm")
     return str(CONTAINERS_ROOT / config.model_name)
 
 

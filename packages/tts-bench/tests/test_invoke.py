@@ -224,7 +224,7 @@ class TestOutcomeEnum:
 class TestResolvers:
     def test_resolves_deployed_endpoints(self) -> None:
         assert resolve_endpoint(TTSModelName.KOKORO_82M) == "speech-kokoro-82m"
-        assert resolve_endpoint("kokoro-82m-cpu") == "speech-kokoro-82m-cpu"
+        assert resolve_endpoint("kokoro-82m") == "speech-kokoro-82m"
 
     def test_rejects_managed_polly(self) -> None:
         # There is no instance to size, so capacity planning does not apply.

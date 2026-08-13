@@ -1,6 +1,0 @@
-chatterbox-tts>=0.1.7
-torch>=2.1.0
-torchaudio>=2.1.0
-numpy<2.0
-starlette>=0.37.0
-uvicorn[standard]>=0.27.0

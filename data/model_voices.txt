@@ -1,8 +1,6 @@
 Model                Voice ID
 ---                  ---
 kokoro-82m           af_heart
-chatterbox-turbo     ENG_US_F_KimW
-orpheus-3b           tara
 polly-standard       Salli
 polly-neural         Joanna
 polly-generative     Ruth

@@ -151,35 +151,11 @@ class ModelEndpointConfig(BaseModel):
 
 def get_model_config(name: str) -> ModelEndpointConfig:
     """Look up a model config by name from all registries."""
-    all_configs = {**STT_MODEL_CONFIGS, **TTS_MODEL_CONFIGS}
-    if name not in all_configs:
-        available = ", ".join(sorted(all_configs.keys()))
+    if name not in TTS_MODEL_CONFIGS:
+        available = ", ".join(sorted(TTS_MODEL_CONFIGS.keys()))
         raise KeyError(f"Unknown model '{name}'. Available: {available}")
-    return all_configs[name]
+    return TTS_MODEL_CONFIGS[name]
 
-
-STT_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
-    "whisper-large-v3": ModelEndpointConfig(
-        model_name="whisper-large-v3",
-        hf_model_id="openai/whisper-large-v3",
-        instance_type="ml.g5.2xlarge",
-        container_type=ContainerType.PYTORCH_CUSTOM,
-        streaming_mode=StreamingMode.NONE,
-        min_instances=0,
-        max_instances=2,
-        scaling_target_value=4,
-    ),
-    "qwen3-asr": ModelEndpointConfig(
-        model_name="qwen3-asr",
-        hf_model_id="Qwen/Qwen3-ASR-1.7B",
-        instance_type="ml.g5.xlarge",
-        container_type=ContainerType.PYTORCH_CUSTOM,
-        streaming_mode=StreamingMode.NONE,
-        min_instances=0,
-        max_instances=2,
-        scaling_target_value=4,
-    ),
-}
 
 TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
     # The one model whose Q_max and T_total are measured, so the one model configured to
@@ -204,70 +180,5 @@ TTS_MODEL_CONFIGS: dict[str, ModelEndpointConfig] = {
         queue_max_depth=50,  # = Q_max: past it a request cannot reach first byte inside the 3.0s SLO
         scale_out_cooldown_s=30,  # short: target tracking adds one instance at a time
         scale_in_cooldown_s=960,  # long: removed capacity costs a full 320s to replace
-    ),
-    "kokoro-82m-cpu": ModelEndpointConfig(
-        model_name="kokoro-82m-cpu",
-        hf_model_id="hexgrad/Kokoro-82M",
-        instance_type="ml.c5.2xlarge",
-        container_type=ContainerType.PYTORCH_CUSTOM,
-        streaming_mode=StreamingMode.BIDIRECTIONAL,
-        min_instances=0,
-        max_instances=1,
-        scaling_target_value=4,
-    ),
-    # min/max stated explicitly rather than inherited. Taking the class defaults
-    # (1-4) made `scaling_enabled` true for a model with no endpoint and no stack,
-    # which is the whole reason `tts-bench drift` reported a missing_target for it.
-    # No model gets scaling until its own Q_max and T_total are measured.
-    "maya-veena": ModelEndpointConfig(
-        model_name="maya-veena",
-        hf_model_id="maya-research/veena-tts",
-        instance_type="ml.g5.xlarge",
-        container_type=ContainerType.VLLM,
-        streaming_mode=StreamingMode.BIDIRECTIONAL,
-        min_instances=1,
-        max_instances=1,
-        cache_model_weights=True,
-        codec_model_ids=["hubertsiuzdak/snac_24khz"],
-        container_env={
-            "SM_VLLM_PORT": "8000",
-            "SM_VLLM_MAX_MODEL_LEN": "2048",
-            "SM_VLLM_GPU_MEMORY_UTILIZATION": "0.85",
-            "MAX_QUEUE_DEPTH": "24",
-        },
-    ),
-    "chatterbox-turbo": ModelEndpointConfig(
-        model_name="chatterbox-turbo",
-        hf_model_id="ResembleAI/chatterbox-turbo",
-        instance_type="ml.g5.xlarge",
-        container_type=ContainerType.PYTORCH_CUSTOM,
-        streaming_mode=StreamingMode.BIDIRECTIONAL,
-        cache_model_weights=True,
-        min_instances=0,
-        max_instances=1,
-        scaling_target_value=4,
-        container_env={
-            "DEFAULT_VOICE": "ENG_US_F_KimW",
-        },
-    ),
-    "orpheus-3b": ModelEndpointConfig(
-        model_name="orpheus-3b",
-        hf_model_id="canopylabs/orpheus-3b-0.1-ft",
-        instance_type="ml.g5.xlarge",
-        container_type=ContainerType.VLLM,
-        streaming_mode=StreamingMode.BIDIRECTIONAL,
-        cache_model_weights=True,
-        min_instances=1,
-        max_instances=1,
-        scaling_target_value=8,
-        codec_model_ids=["hubertsiuzdak/snac_24khz"],
-        container_env={
-            "SM_VLLM_PORT": "8000",
-            "SM_VLLM_MAX_MODEL_LEN": "2048",
-            "SM_VLLM_MAX_NUM_SEQS": "16",
-            "SM_VLLM_GPU_MEMORY_UTILIZATION": "0.85",
-            "SM_VLLM_ENFORCE_EAGER": "true",
-            "MAX_QUEUE_DEPTH": "24",
-        },
     ),
 }

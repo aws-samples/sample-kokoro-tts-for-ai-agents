@@ -44,7 +44,7 @@ class TestGenerateReport:
     def test_json_structure(self, tmp_path: Path) -> None:
         results = [
             EvalResult(
-                model="orpheus-3b",
+                model="other-model",
                 sample_id="s1",
                 text="Test",
                 utmos=3.2,
@@ -58,7 +58,7 @@ class TestGenerateReport:
 
         assert "timestamp" in data
         assert "models" in data
-        assert "orpheus-3b" in data["models"]
+        assert "other-model" in data["models"]
         assert "summary" in data
 
     def test_markdown_contains_model_table(self, tmp_path: Path) -> None:
@@ -72,7 +72,7 @@ class TestGenerateReport:
                 audio_duration_s=1.0,
             ),
             EvalResult(
-                model="orpheus-3b",
+                model="other-model",
                 sample_id="s1",
                 text="Test",
                 utmos=3.3,
@@ -85,7 +85,7 @@ class TestGenerateReport:
         content = md_path.read_text()
 
         assert "kokoro-82m" in content
-        assert "orpheus-3b" in content
+        assert "other-model" in content
         assert "UTMOS" in content or "MOS" in content
 
     def test_handles_failed_results(self, tmp_path: Path) -> None:

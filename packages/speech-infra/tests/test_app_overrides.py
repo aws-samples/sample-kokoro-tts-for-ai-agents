@@ -58,8 +58,8 @@ class TestInstanceTypeOverride:
         assert _apply_instance_type_override(app, _config()).instance_type == "ml.g6.12xlarge"
 
     def test_another_models_key_does_not_apply(self) -> None:
-        # The containment property: overriding orpheus must not move kokoro.
-        app = _app(**{"orpheus-3b:instance_type": "ml.g6.12xlarge"})
+        # The containment property: overriding another model must not move kokoro.
+        app = _app(**{"other-model:instance_type": "ml.g6.12xlarge"})
         assert _apply_instance_type_override(app, _config()).instance_type == "ml.g5.xlarge"
 
     def test_an_unscoped_key_does_not_apply(self) -> None:

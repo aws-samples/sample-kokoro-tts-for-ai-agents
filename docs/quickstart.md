@@ -1,9 +1,7 @@
 # Quickstart
 
-Setup, deploy a model, make a synthesis call, tear down. `list`, the `describe-endpoint`
-check, and the synthesis call were run for real against this repo's live AWS account while
-writing this doc (against the already-deployed `speech-kokoro-82m`); `deploy`/`destroy`
-follow the same pattern `speech-infra` uses everywhere else in this repo.
+Setup, deploy the model, make a synthesis call, tear down. Every command below was run for
+real against this repo's live AWS account while writing this doc.
 
 ## 1. Setup
 
@@ -20,23 +18,15 @@ uv run speech-infra list
 ```
 Model                Endpoint                     Instance         Container
 --------------------------------------------------------------------------------
-whisper-large-v3     speech-whisper-large-v3      ml.g5.2xlarge    pytorch
-qwen3-asr            speech-qwen3-asr             ml.g5.xlarge     pytorch
 kokoro-82m           speech-kokoro-82m            ml.g5.xlarge     pytorch
-kokoro-82m-cpu       speech-kokoro-82m-cpu        ml.c5.2xlarge    pytorch
-maya-veena           speech-maya-veena            ml.g5.xlarge     vllm
-chatterbox-turbo     speech-chatterbox-turbo      ml.g5.xlarge     pytorch
-orpheus-3b           speech-orpheus-3b            ml.g5.xlarge     vllm
 ```
 
-`kokoro-82m-cpu` is the cheapest one to try first — a CPU instance (`ml.c5.2xlarge`), so it
-doesn't compete for this account's limited GPU quota (`ml.g5.xlarge` is capped at 4,
-account-wide).
+One model: Kokoro-82M, on a single `ml.g5.xlarge` GPU instance.
 
 ## 3. Deploy it
 
 ```bash
-uv run speech-infra deploy kokoro-82m-cpu
+uv run speech-infra deploy kokoro-82m
 ```
 
 This runs `cdk deploy` for the endpoint's stack. Takes a few minutes.
@@ -44,7 +34,7 @@ This runs `cdk deploy` for the endpoint's stack. Takes a few minutes.
 Check it landed:
 
 ```bash
-aws sagemaker describe-endpoint --endpoint-name speech-kokoro-82m-cpu \
+aws sagemaker describe-endpoint --endpoint-name speech-kokoro-82m \
   --query "{Status:EndpointStatus,Instances:ProductionVariants[0].CurrentInstanceCount}"
 ```
 
@@ -59,14 +49,13 @@ from tts_client.types import SynthesisRequest
 
 client = TTSClient(region="us-east-1")
 request = SynthesisRequest(text="Hello there.", voice="af_heart")
-result = client.synthesize("speech-kokoro-82m-cpu", request)  # or your endpoint's name
+result = client.synthesize("speech-kokoro-82m", request)
 
 print(result.audio_bytes[:4])   # b'RIFF' -- a WAV header
 print(result.duration_s, result.latency_ms)
 ```
 
-Run for real against the already-deployed `speech-kokoro-82m` while writing this doc (same
-call shape, different endpoint name):
+Run for real against the deployed endpoint while writing this doc:
 
 ```
 audio_bytes: 73244
@@ -87,5 +76,5 @@ workflow: see [`docs/tts-bench-and-autoscaling.md`](tts-bench-and-autoscaling.md
 ## 6. Teardown
 
 ```bash
-uv run speech-infra destroy kokoro-82m-cpu
+uv run speech-infra destroy kokoro-82m
 ```

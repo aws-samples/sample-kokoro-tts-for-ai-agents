@@ -55,9 +55,7 @@ def logged():
 class TestCostConfig:
     def test_deployed_models_have_instance_types(self) -> None:
         deployed = [
-            TTSModelName.ORPHEUS_3B,
             TTSModelName.KOKORO_82M,
-            TTSModelName.CHATTERBOX_TURBO,
         ]
         for model in deployed:
             assert model in MODEL_INSTANCE_TYPES
@@ -123,12 +121,10 @@ class TestRegistryConsistency:
             assert endpoint == config.endpoint_name
 
     def test_deployed_pytorch_models_are_all_priced(self) -> None:
-        # maya-veena is deliberately absent from both benchmark registries: it
-        # is deployed but has no eval/bench wiring. Asserting the exact gap
-        # means adding it to config.py without adding it here fails here,
-        # rather than silently falling back to DEFAULT_INSTANCE_TYPE.
+        # Every deployed model must have a cost entry, or the planner silently
+        # falls back to DEFAULT_INSTANCE_TYPE for it.
         unpriced = {name for name in TTS_MODEL_CONFIGS if name not in MODEL_INSTANCE_TYPES}
-        assert unpriced == {"maya-veena"}
+        assert unpriced == set()
 
 
 class TestHourlyRate:

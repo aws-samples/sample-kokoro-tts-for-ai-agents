@@ -8,7 +8,7 @@ with an illegal `Period`, fails here rather than in production.
 
 The scenario the drift tests are built around is the live one: two orphaned
 policies on ``Speech/vLLM``, a namespace that publishes nothing, whose alarms sit
-in INSUFFICIENT_DATA. Dormant, not off — ``speech-orpheus-3b`` still carries a
+in INSUFFICIENT_DATA. Dormant, not off — ``speech-other-model-a`` still carries a
 ``max_capacity=4`` target that no template describes.
 """
 
@@ -419,7 +419,7 @@ class TestFetchWindow:
         stub.add_response("get_metric_statistics", {"Datapoints": []})
         window = fetch_window(
             client,
-            endpoint="speech-kokoro-82m-cpu",
+            endpoint="speech-other-model-c",
             start=T0,
             end=T1,
             specs=(MetricSpec(ENDPOINT_NAMESPACE, "GPUUtilization"),),
@@ -972,14 +972,14 @@ class TestAuditOrphans:
         assert "deregister-scalable-target" in finding.remediation
 
     def test_target_whose_config_disables_scaling_is_an_orphan(self) -> None:
-        # The live orpheus-3b case: config pins min=max=1 so CDK synthesizes
-        # nothing, yet a max_capacity=4 target survives from an earlier deploy.
+        # config pins min=max=1 so CDK synthesizes nothing, yet a max_capacity=4
+        # target survives from an earlier deploy.
         findings = audit_scaling(
-            targets=[_target("speech-orpheus-3b", min_capacity=1, max_capacity=4)],
+            targets=[_target("speech-other-model-a", min_capacity=1, max_capacity=4)],
             policies=[],
             expected={
-                "speech-orpheus-3b": _expected(
-                    "speech-orpheus-3b", min_instances=1, max_instances=1
+                "speech-other-model-a": _expected(
+                    "speech-other-model-a", min_instances=1, max_instances=1
                 )
             },
         )
@@ -996,10 +996,10 @@ class TestAuditOrphans:
     def test_policy_without_a_synthesizing_config_is_an_orphan(self) -> None:
         findings = audit_scaling(
             targets=[],
-            policies=[_policy("speech-orpheus-3b")],
+            policies=[_policy("speech-other-model-a")],
             expected={
-                "speech-orpheus-3b": _expected(
-                    "speech-orpheus-3b", min_instances=1, max_instances=1
+                "speech-other-model-a": _expected(
+                    "speech-other-model-a", min_instances=1, max_instances=1
                 )
             },
         )
@@ -1203,8 +1203,8 @@ class TestCheckDrift:
             "describe_scalable_targets",
             {
                 "ScalableTargets": [
-                    _raw_target("speech-orpheus-3b", min_capacity=1, max_capacity=4),
-                    _raw_target("speech-kokoro-82m-cpu", min_capacity=1, max_capacity=1),
+                    _raw_target("speech-other-model-a", min_capacity=1, max_capacity=4),
+                    _raw_target("speech-other-model-c", min_capacity=1, max_capacity=1),
                 ]
             },
         )
@@ -1212,8 +1212,8 @@ class TestCheckDrift:
             "describe_scaling_policies",
             {
                 "ScalingPolicies": [
-                    _raw_policy("speech-orpheus-3b"),
-                    _raw_policy("speech-kokoro-82m-cpu"),
+                    _raw_policy("speech-other-model-a"),
+                    _raw_policy("speech-other-model-c"),
                 ]
             },
         )
@@ -1229,9 +1229,11 @@ class TestCheckDrift:
         )
 
         expected = {
-            "speech-orpheus-3b": _expected("speech-orpheus-3b", min_instances=1, max_instances=1),
-            "speech-kokoro-82m-cpu": _expected(
-                "speech-kokoro-82m-cpu", min_instances=0, max_instances=1
+            "speech-other-model-a": _expected(
+                "speech-other-model-a", min_instances=1, max_instances=1
+            ),
+            "speech-other-model-c": _expected(
+                "speech-other-model-c", min_instances=0, max_instances=1
             ),
         }
         findings = check_drift(aas, cw, expected)
@@ -1244,7 +1246,7 @@ class TestCheckDrift:
 
         # orpheus can reach 4 instances that no template describes: an error, not
         # a warning, because an unguarded benchmark would measure a fleet.
-        orpheus = [f for f in findings if f.endpoint == "speech-orpheus-3b"]
+        orpheus = [f for f in findings if f.endpoint == "speech-other-model-a"]
         assert any(f.severity is Severity.ERROR for f in orpheus)
 
         aas_stub.assert_no_pending_responses()

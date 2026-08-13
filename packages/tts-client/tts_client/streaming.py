@@ -50,9 +50,9 @@ from tts_client._bidi_transport import (
 from tts_client.errors import ServerError
 from tts_client.types import SynthesisChunk
 
-#: Matches every container's own sentence-splitting regex (e.g.
-#: chatterbox/streaming_proxy.py's ``_SENTENCE_RE``). Duplicated rather than
-#: imported: this package has no dependency on speech-infra's containers.
+#: This client's own sentence splitter for incremental streaming. Kept local
+#: rather than imported from a container: this package has no dependency on
+#: speech-infra's containers.
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 
 _CLOSE_MESSAGE = json.dumps({"type": "close"}).encode("utf-8")

@@ -22,16 +22,10 @@ from tts_inference.types import (
 
 MODEL_IDS: dict[TTSModelName, str] = {
     TTSModelName.KOKORO_82M: "hexgrad/Kokoro-82M",
-    TTSModelName.MAYA_VEENA: "maya-research/veena-tts",
-    TTSModelName.CHATTERBOX_TURBO: "ResembleAI/chatterbox-turbo",
-    TTSModelName.ORPHEUS_3B: "canopylabs/orpheus-3b-0.1-ft",
 }
 
 SUBPROCESS_PACKAGES: dict[TTSModelName, tuple[str, str]] = {
     TTSModelName.KOKORO_82M: ("tts-kokoro", "tts_kokoro"),
-    TTSModelName.MAYA_VEENA: ("tts-maya", "tts_maya"),
-    TTSModelName.CHATTERBOX_TURBO: ("tts-chatterbox", "tts_chatterbox"),
-    TTSModelName.ORPHEUS_3B: ("tts-orpheus", "tts_orpheus"),
 }
 
 

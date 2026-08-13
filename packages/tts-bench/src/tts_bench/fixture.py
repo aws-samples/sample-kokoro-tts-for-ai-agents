@@ -14,8 +14,8 @@ why a larger fleet shows up as *better latency* rather than as saturation. So
 freezing is enforced rather than advised: see ``require_frozen``, and
 ``instance_counts_observed`` on the artifact as the after-the-fact check.
 
-Two live scaling policies in this account make that reachable today
-(``speech-orpheus-3b`` has ``max_capacity=4``).
+A live scaling policy in this account makes that reachable today
+(``speech-kokoro-82m`` has ``max_capacity=9``).
 
 The same freeze covers ``T_total``. That run forces a scale-out itself, and the
 deployed policy would otherwise fire during it and add instances from a second,
@@ -74,8 +74,8 @@ class EndpointFixture:
 
     Restoring from this is what makes a freeze safe to run against a live
     endpoint. ``suspended_state=None`` means no scalable target is registered at
-    all (true for ``speech-kokoro-82m`` and ``speech-chatterbox-turbo`` today) —
-    a freeze then has nothing to suspend and must not create one, since that
+    all -- true for any endpoint deployed with ``scaling_enabled=False`` -- a
+    freeze then has nothing to suspend and must not create one, since that
     would leave configuration behind that CDK does not describe.
     """
 

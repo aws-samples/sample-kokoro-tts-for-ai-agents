@@ -54,7 +54,7 @@ MODEL_NAME = "m"
 #: The other holders of the ml.g5.xlarge quota when this guard was written. Named
 #: because the point of the check is that endpoints we are not benchmarking, and in one
 #: case do not own, consume the allowance this one scales into.
-OTHER_ENDPOINTS = ("speech-orpheus-3b", "speech-chatterbox-turbo")
+OTHER_ENDPOINTS = ("speech-other-model-a", "speech-other-model-b")
 
 
 @pytest.fixture
@@ -351,7 +351,7 @@ class TestCapture:
         sm_stub.assert_no_pending_responses()
 
     def test_no_scalable_target_is_not_an_error(self, appscaling, sagemaker) -> None:
-        # True for speech-kokoro-82m and speech-chatterbox-turbo today.
+        # True for speech-kokoro-82m and speech-other-model-b today.
         aas, aas_stub = appscaling
         sm, sm_stub = sagemaker
         _stub_capture(aas_stub, sm_stub, targets=[])
@@ -740,7 +740,7 @@ class TestRequireFrozen:
         assert state.scale_out_suspended
 
     def test_raises_when_scale_out_is_live(self, appscaling, sagemaker) -> None:
-        # The orpheus-3b case: max_capacity=4 with an active policy.
+        # max_capacity=4 with an active policy.
         aas, aas_stub = appscaling
         sm, sm_stub = sagemaker
         _stub_capture(aas_stub, sm_stub, targets=[_target(scale_out_suspended=False)])

@@ -41,10 +41,7 @@ INSTANCE_COST_PER_HOUR: dict[str, float] = {
 #: record what *is*. Keep it in step with `speech_infra.config` all the same: `cost_per_m_chars`
 #: has no endpoint to ask, so a stale row here silently misprices.
 MODEL_INSTANCE_TYPES: dict[str, str] = {
-    TTSModelName.ORPHEUS_3B: "ml.g5.xlarge",
     TTSModelName.KOKORO_82M: "ml.g5.xlarge",
-    TTSModelName.KOKORO_82M_CPU: "ml.c5.2xlarge",
-    TTSModelName.CHATTERBOX_TURBO: "ml.g5.xlarge",
 }
 
 POLLY_COST_PER_M_CHARS: dict[str, float] = {
