@@ -74,3 +74,8 @@ artifacts/*.jsonl
 
 # Result archive zips (large, transient, not tracked)
 *.zip
+
+# ASH (Automated Security Helper) scan output -- regenerable, not source
+.ash/
+ash-full-repo-scan/
+ash-scan-report.*

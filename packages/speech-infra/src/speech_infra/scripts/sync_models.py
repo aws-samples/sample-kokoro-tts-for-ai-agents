@@ -17,6 +17,15 @@ MODEL_IDS = os.environ["MODEL_IDS"].split(",")
 S3_BUCKET = os.environ["S3_BUCKET"]
 HF_TOKEN_SECRET = os.environ.get("HF_TOKEN_SECRET")
 
+#: Pin known models to a specific commit, confirmed via the HF Hub API, so a
+#: rebuild can't silently pick up a different checkpoint. Bump deliberately
+#: -- via a PR, not by dropping the pin -- if a model needs updating. Models
+#: not listed here (there are none configured today) sync unpinned, with a
+#: warning logged, rather than failing the build.
+KNOWN_REVISIONS: dict[str, str] = {
+    "hexgrad/Kokoro-82M": "f3ff3571791e39611d31c381e3a41a3af07b4987",
+}
+
 
 def log(msg: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -83,10 +92,15 @@ def sync_model(model_id: str, token: str | None) -> None:
     s3_prefix = f"s3://{S3_BUCKET}/models/{model_id}/"
     manifest_key = f"models/{model_id}/.manifest"
 
+    revision = KNOWN_REVISIONS.get(model_id)
+    if revision is None:
+        log(f"WARN: no pinned revision for {model_id} -- syncing unpinned (main)")
+
     log(f"Downloading {model_id} from HuggingFace Hub...")
     start = time.time()
     snapshot_download(
         model_id,
+        revision=revision,
         local_dir=str(local_dir),
         local_dir_use_symlinks=False,
         token=token,

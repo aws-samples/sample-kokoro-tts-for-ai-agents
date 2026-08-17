@@ -36,3 +36,14 @@ uv run pre-commit run --all-files
   [`docs/autoscaling-capacity-model.md`](docs/autoscaling-capacity-model.md)
 - Per-model technical notes (wire contracts, batching limitations) live in
   [`docs/models/`](docs/models/)
+
+## Security Disclaimer
+
+This solution is provided as a proof-of-value and is not intended as a
+production-ready implementation. You are responsible for evaluating how the AWS
+Shared Responsibility Model applies to your specific use case and for
+implementing the necessary security controls to meet your organization's
+requirements. AWS provides a broad set of security tools and configurations to
+support your security objectives, and it is your responsibility as the developer
+to ensure all aspects of your application are appropriately secured for
+production use.
