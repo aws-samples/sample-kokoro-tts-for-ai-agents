@@ -66,7 +66,9 @@ def create_app() -> cdk.App:
 
     image_uri_override = app.node.try_get_context("image_uri") or None
 
-    foundation = SpeechFoundationStack(app, "SpeechFoundation", env=env)
+    foundation = SpeechFoundationStack(
+        app, "SpeechFoundation", model_configs=list(TTS_MODEL_CONFIGS.values()), env=env
+    )
 
     hf_token_secret = app.node.try_get_context("hf_token_secret") or "hf-token-dev"
 

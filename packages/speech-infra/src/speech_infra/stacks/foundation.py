@@ -11,11 +11,20 @@ import aws_cdk.aws_iam as iam
 import aws_cdk.aws_s3 as s3
 from constructs import Construct
 
+from speech_infra.config import ModelEndpointConfig
+
 
 class SpeechFoundationStack(cdk.Stack):
     """Shared infrastructure for all speech model endpoints."""
 
-    def __init__(self, scope: Construct, construct_id: str, **kwargs: object) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        model_configs: list[ModelEndpointConfig],
+        **kwargs: object,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         self.model_bucket = s3.Bucket(
@@ -72,15 +81,19 @@ class SpeechFoundationStack(cdk.Stack):
                     "sagemaker:InvokeEndpointWithResponseStream",
                     "sagemaker:InvokeEndpointWithBidirectionalStream",
                 ],
+                # Scoped to this project's own configured endpoints, not
+                # resource_name="*" (every endpoint in the account) -- a
+                # threat-modeling finding (overbroad ClientInvocationRole).
                 resources=[
                     cdk.Arn.format(
                         cdk.ArnComponents(
                             service="sagemaker",
                             resource="endpoint",
-                            resource_name="*",
+                            resource_name=config.endpoint_name,
                         ),
                         self,
                     )
+                    for config in model_configs
                 ],
             )
         )
