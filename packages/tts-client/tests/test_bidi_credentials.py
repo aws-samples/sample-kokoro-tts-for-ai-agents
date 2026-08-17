@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Tests for Boto3CredentialsResolver.
 
 Ported from tts_bench/tests/test_bidi.py's TestBoto3CredentialsResolver,

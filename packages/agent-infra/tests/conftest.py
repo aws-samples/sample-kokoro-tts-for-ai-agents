@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Puts container/ on sys.path so tests can import its flat sibling modules directly.
 
 The container's own files (``events.py``, ``bidi_bridge.py``, ``modes.py``,

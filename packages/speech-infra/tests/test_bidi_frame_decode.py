@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Every bidi container must accept the frame type SageMaker actually sends.
 
 ``invoke_endpoint_with_bidirectional_stream`` forwards each ``RequestPayloadPart``

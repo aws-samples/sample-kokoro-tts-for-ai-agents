@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Tests for incremental text-chunk streaming over one bidi session.
 
 Fakes follow the same pattern as ``test_client.py``'s bidi tests (patch

@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Tests for app.py's module-level wiring.
 
 ``REPO_ROOT`` being off by one directory level (an actual bug caught by a

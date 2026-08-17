@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Evaluation runner - orchestrates TTS quality assessment across models.
 
 For each model x sample: synthesize -> score UTMOS -> score WER -> collect results.

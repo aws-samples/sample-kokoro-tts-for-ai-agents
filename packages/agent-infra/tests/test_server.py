@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Tests for the AgentCore entrypoint in container/server.py.
 
 Exercises ``agent_invocation()`` directly as an async generator, bypassing

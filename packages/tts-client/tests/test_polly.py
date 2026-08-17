@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Tests for PollyClient.
 
 Ported from tts_eval/tests/test_synthesize.py's TestPollyIntegration, which

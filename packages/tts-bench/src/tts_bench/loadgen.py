@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Closed-loop load generator: concurrency is set by us, and held exactly.
 
 ``N`` workers each issue their next request only when their previous one completes,

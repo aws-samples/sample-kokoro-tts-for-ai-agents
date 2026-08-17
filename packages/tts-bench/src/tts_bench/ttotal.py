@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Measure ``T_total``: the lag from forcing a scale-out to the new instance serving.
 
 ``T_total`` is one of the two measured variables in the scaling model. It sets how much

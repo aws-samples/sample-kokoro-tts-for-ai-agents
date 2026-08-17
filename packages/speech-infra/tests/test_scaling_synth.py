@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Synth assertions for the endpoint stack's scaling and observability resources.
 
 These tests read the rendered CloudFormation rather than the Python objects, which is

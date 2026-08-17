@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """bidi vs. batch TTS delivery mode implementations.
 
 ``run_bidi`` feeds the agent's own streaming text deltas straight into

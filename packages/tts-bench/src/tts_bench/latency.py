@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Latency benchmarking - measures time-to-first-audio-byte."""
 
 from __future__ import annotations

@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Request/response types for the TTS synthesis API.
 
 Standalone from the rest of the workspace on purpose: this package has no

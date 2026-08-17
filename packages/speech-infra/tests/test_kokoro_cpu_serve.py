@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Tests for the Kokoro CPU/ONNX container's startup and event-loop behavior.
 
 Two things this container has to get right for `C_max` to mean anything:

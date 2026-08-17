@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Closed-loop confirmation that a deployed autoscaling policy behaves as planned.
 
 Four checks, in order:

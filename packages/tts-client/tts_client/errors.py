@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Typed exceptions for TTS synthesis failures.
 
 Ported from ``tts_bench.invoke.classify_client_error`` and

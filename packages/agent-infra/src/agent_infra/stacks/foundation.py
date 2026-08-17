@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Foundation stack: the IAM execution role AgentCore Runtime assumes.
 
 Policy statements are the AWS-published AgentCore Runtime execution role

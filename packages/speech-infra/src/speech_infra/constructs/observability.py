@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Alarms and a dashboard for a deployed endpoint.
 
 Diagnostic only, and deliberately so. Scaling runs off AWS's own predefined metric

@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Scalability benchmarking - time-windowed concurrent load testing via streaming."""
 
 from __future__ import annotations

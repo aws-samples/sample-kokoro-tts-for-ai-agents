@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Render a scaling plan: the six variables, the findings, and a paste-ready config block.
 
 Separated from :mod:`tts_bench.planner` so the arithmetic is testable without asserting

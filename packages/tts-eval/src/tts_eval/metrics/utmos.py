@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Neural MOS scorer for TTS audio quality.
 
 Uses DNSMOS (Deep Noise Suppression MOS) from the speechmos package to predict

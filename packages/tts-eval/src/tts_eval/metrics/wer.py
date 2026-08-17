@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Round-trip WER scorer using AWS Transcribe.
 
 Pipeline: reference text -> TTS audio -> AWS Transcribe -> compare with jiwer.

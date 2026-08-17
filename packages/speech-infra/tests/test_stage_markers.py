@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Guards the startup-stage markers the container image emits.
 
 `tts-bench ttotal` attributes scaling lag by parsing these lines out of CloudWatch,

@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Container startup stage markers: the format contract between emitter and parser.
 
 `T_total` — the lag from a scaling metric crossing its threshold to a new instance

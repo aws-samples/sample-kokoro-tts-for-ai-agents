@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Low-level SageMaker bidirectional-streaming wire protocol.
 
 Shared leaf module: everything here is a primitive for one message on one

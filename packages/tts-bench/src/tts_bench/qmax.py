@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """``Q_max`` harness: the highest concurrency that still meets the first-byte SLO.
 
 ``Q_max`` is one of the two measured variables in the scaling model, and the whole

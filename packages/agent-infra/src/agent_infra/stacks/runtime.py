@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Amazon.com
+# This file is licensed under the MIT License.
+# See the LICENSE file in the project root for full license information.
+
 """Runtime stack: the container image and the AgentCore Runtime it powers.
 
 ``aws_bedrockagentcore`` in this repo's installed aws-cdk-lib (2.253.1) exposes
