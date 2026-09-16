@@ -47,3 +47,20 @@ requirements. AWS provides a broad set of security tools and configurations to
 support your security objectives, and it is your responsibility as the developer
 to ensure all aspects of your application are appropriately secured for
 production use.
+
+### Known Advisory in a Pinned Dependency (torch)
+
+The Kokoro container pins `torch==2.6.0`
+([`packages/speech-infra/containers/kokoro/Dockerfile`](packages/speech-infra/containers/kokoro/Dockerfile)).
+This version is affected by PYSEC-2026-2286, a memory-corruption vulnerability in
+torch's own `weights_only` unpickler -- the code path torch itself recommends as the
+safe way to load a checkpoint -- triggerable by a maliciously crafted checkpoint
+file. A fix is available in torch 2.10.0; this repo has not adopted it. The
+mitigating factor today is that the Kokoro-82M model revision this endpoint loads is
+pinned to an exact Hugging Face commit SHA (in
+[`download_model.py`](packages/speech-infra/containers/kokoro/download_model.py) and
+[`sync_models.py`](packages/speech-infra/src/speech_infra/scripts/sync_models.py)),
+so exploiting this would require an attacker to have already compromised that
+specific pinned upstream revision. If you fork this repo and point it at a different
+model or checkpoint, you inherit this exposure in full and should evaluate upgrading
+torch (or another mitigation) before doing so.
