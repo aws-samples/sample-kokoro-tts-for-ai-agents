@@ -6,7 +6,10 @@ requires-python = ">=3.11"
 dependencies = [
     "boto3>=1.34.0",
     "pydantic>=2.5.0",
-    "aws-sdk-sagemaker-runtime-http2>=0.7.0",
+    # <0.8.0: 0.8.0 dropped the synchronous SageMakerRuntimeHTTP2Client class
+    # _bidi_transport.py imports, in favor of an async-only client. Confirmed by
+    # installing 0.8.0/0.9.0/0.10.0 directly and inspecting the module.
+    "aws-sdk-sagemaker-runtime-http2>=0.7.0,<0.8.0",
 ]
 
 [project.optional-dependencies]
