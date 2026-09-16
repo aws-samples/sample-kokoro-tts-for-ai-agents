@@ -97,6 +97,89 @@ class TestClientInvocationRoleScoping:
         service_only = [
             statements
             for statements in trust_statements
-            if len(statements) == 1 and statements[0]["Principal"] == {"Service": "sagemaker.amazonaws.com"}
+            if len(statements) == 1
+            and statements[0]["Principal"] == {"Service": "sagemaker.amazonaws.com"}
         ]
         assert len(service_only) == 1
+
+
+EXECUTION_ROLE_NAME = "speech-sagemaker-execution"
+
+ECR_PULL_ACTIONS = {
+    "ecr:BatchCheckLayerAvailability",
+    "ecr:BatchGetImage",
+    "ecr:GetDownloadUrlForLayer",
+}
+
+LOGS_ACTIONS = {"logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"}
+
+
+def _all_statements(template: Template) -> list[dict]:
+    """Every IAM policy statement in the stack, across all roles."""
+    policies = template.find_resources("AWS::IAM::Policy")
+    statements = []
+    for resource in policies.values():
+        statements.extend(resource["Properties"]["PolicyDocument"]["Statement"])
+    return statements
+
+
+def _action_set(statement: dict) -> set[str]:
+    """Normalize Action to a set -- CDK renders a single action as a bare string,
+    not a one-element list, so plain set() on it would iterate characters instead
+    of treating it as one action name.
+    """
+    action = statement.get("Action", [])
+    return {action} if isinstance(action, str) else set(action)
+
+
+class TestExecutionRoleLeastPrivilege:
+    """Least-privilege finding: the execution role carried AmazonSageMakerFullAccess
+    (training jobs, notebooks, feature store, model registry, ...) though the
+    endpoint only ever needs to pull its container image, write CloudWatch logs, and
+    read model weights from S3. These tests pin the narrowed policy against the
+    rendered CloudFormation, the same way TestClientInvocationRoleScoping pins the
+    sibling role above -- reading the Python construct alone would not catch CDK
+    silently reattaching a managed policy or rendering a wildcard resource.
+    """
+
+    def test_no_managed_policy_attached(self) -> None:
+        template = _template([_config("kokoro-82m")])
+        roles = template.find_resources("AWS::IAM::Role")
+        (execution_role,) = (
+            r for r in roles.values() if r["Properties"].get("RoleName") == EXECUTION_ROLE_NAME
+        )
+        assert not execution_role["Properties"].get("ManagedPolicyArns")
+
+    def test_ecr_pull_actions_granted(self) -> None:
+        statements = _all_statements(_template([_config("kokoro-82m")]))
+        matches = [s for s in statements if ECR_PULL_ACTIONS <= _action_set(s)]
+        assert len(matches) == 1
+
+    def test_ecr_pull_actions_not_scoped_to_wildcard_resource(self) -> None:
+        # The three pull actions support resource-level scoping -- unlike
+        # GetAuthorizationToken below, they must not fall back to resources=["*"].
+        statements = _all_statements(_template([_config("kokoro-82m")]))
+        (statement,) = (s for s in statements if ECR_PULL_ACTIONS <= _action_set(s))
+        assert statement["Resource"] != "*"
+        assert "repository/*" in json.dumps(statement["Resource"])
+
+    def test_ecr_get_authorization_token_scoped_to_wildcard_resource(self) -> None:
+        # ecr:GetAuthorizationToken supports no resource-level permissions at all;
+        # every AWS-published ECR pull policy grants it on resources=["*"].
+        statements = _all_statements(_template([_config("kokoro-82m")]))
+        (statement,) = (s for s in statements if "ecr:GetAuthorizationToken" in _action_set(s))
+        assert statement["Resource"] == "*"
+
+    def test_logs_statement_unaffected(self) -> None:
+        # Regression guard: narrowing the managed policy away must not have
+        # touched the pre-existing CloudWatch Logs grant.
+        statements = _all_statements(_template([_config("kokoro-82m")]))
+        matches = [s for s in statements if LOGS_ACTIONS <= _action_set(s)]
+        assert len(matches) == 1
+
+    def test_s3_model_bucket_read_unaffected(self) -> None:
+        # Regression guard: narrowing the managed policy away must not have
+        # touched the pre-existing model_bucket.grant_read() statement.
+        statements = _all_statements(_template([_config("kokoro-82m")]))
+        matches = [s for s in statements if "s3:GetObject*" in _action_set(s)]
+        assert len(matches) == 1
