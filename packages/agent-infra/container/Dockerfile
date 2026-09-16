@@ -11,6 +11,18 @@
 # -- not fabricated here, since an unverified digest fails every build outright.
 FROM python:3.12-slim
 
+# perl-base 5.40.1-6 (shipped by this base image, not something this
+# Dockerfile installs) carries three CRITICAL CVEs (CVE-2026-13221,
+# CVE-2026-42496, CVE-2026-8376), fixed in 5.40.1-6+deb13u1. That fix is
+# already published in Debian's own trixie repo; the upstream python:3.12-slim
+# image just hasn't been rebuilt with it yet. Left unpinned on purpose --
+# --only-upgrade picks up whatever Debian's latest perl-base security patch
+# is on every rebuild, instead of freezing on today's exact fix version.
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade perl-base \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY packages/agent-infra/container/requirements.txt .
