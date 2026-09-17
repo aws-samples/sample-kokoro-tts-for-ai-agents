@@ -2,7 +2,7 @@ kokoro>=0.9.2
 # Pinned to match the Dockerfile's cu126 install, which runs first and is the
 # authoritative one -- a floor here would let this second pip pass silently upgrade
 # past it. See the Dockerfile for why the version is fixed at all.
-torch==2.6.0
+torch==2.13.0
 misaki[en]>=0.7.0
 numpy>=2.0.2
 soundfile>=0.12.0
