@@ -83,14 +83,18 @@ sat in `INSUFFICIENT_DATA` and could never fire.)
 
 The unit that is *not* free is the **statistic**. A client-measured mean in-flight and
 `ConcurrentRequestsPerModel` / `Maximum` over 10 s are different quantities, and their
-ratio is not a constant. Across one kokoro ladder it collapsed from about **9.8x** at the
-bottom to **1.35x** at the top: a lightly loaded endpoint's 10 s peak is many multiples of
-its average, while a saturated one's is barely above it. So every number crossing that
-boundary has to name its statistic:
+ratio is not a constant *in general*. Across an early kokoro ladder (pre-`--cloudwatch`,
+different join window) it collapsed from about **9.8x** at the bottom to **1.35x** at the
+top: a lightly loaded endpoint's 10 s peak is many multiples of its average, while a
+saturated one's is barely above it. The committed kokoro-82M artifact measured **1.0** at
+every rung — a closed-loop benchmark holds exactly `N` requests outstanding, so the 10 s
+`Maximum` equals the client mean and the divergence disappears. The conversion still has
+to be measured, because the ratio depends on the load shape, not only on the model. So
+every number crossing that boundary has to name its statistic:
 
 | Number | Measured as | Deployed against |
 |---|---|---|
-| `Q_max` | client-side, closed loop — `N` workers hold `N` outstanding by construction | `queue_max_depth`, a container admission bound (not yet enforced — see below) |
+| `Q_max` | client-side, closed loop — `N` workers hold `N` outstanding by construction | `queue_max_depth`, enforced by the container admission gate (`MAX_QUEUE_DEPTH` env var → 503 `queue_saturated`) |
 | `S`, `S_p95` | client-observed first byte at the ladder's lowest rung, RTT included | `W_max = SLO − S_p95`; nothing on the server reads it |
 | `scaling_target_value` | `C_scale_max` × the ladder's measured ratio | `ConcurrentRequestsPerModel` / **`Maximum`** / 10 s, via the high-resolution predefined metric (`constructs/scaling.py`) |
 | `scale_in_threshold` | `C_scale_min` × the same ratio | `ConcurrentRequestsPerModel` / **`Average`** / 60 s, `evaluation_periods=3`, `datapoints_to_alarm=3` |
@@ -160,35 +164,34 @@ they compose rather than fight — but only because scale-in belongs to exactly 
 `emergency_step_enabled` adds a steeper step-out at 2x/4x the target and stays off until a
 measurement justifies it.
 
-### Worked example — kokoro-82M, response-stream, `ml.g5.xlarge` (illustrative)
+### Worked example — kokoro-82M, response-stream, `ml.g5.xlarge`
 
-**No `qmax` or `ttotal` artifact exists yet.** The tools that produce them are new and no
-ladder has been run on this configuration. The arithmetic below shows the structure with
-placeholder labels; every input is marked with what it is waiting on. Do not paste any of
-it into `config.py` — `plan` prints the block that belongs there.
+Measured by `qmax` (run `b8fa8ef48043`, 2026-08-04) and `ttotal` (run `8b1b96bc`).
 
-| Input | Value used | Status |
+| Input | Value | Source |
 |---|---|---|
-| SLO | 3000 ms | chosen; deployed today as `ttfab_slo_ms` |
+| SLO | 3000 ms | chosen; deployed as `ttfab_slo_ms` |
 | surge ratio | 1.25 | chosen; the `--max-scaling-per-t-total` default |
-| `S`, `S_p95` | — | **pending `qmax`** |
-| `Q_max` | — | **pending `qmax`** |
-| `T_total` | — | **pending `ttotal`** |
-
-Once `qmax` and `ttotal` run, the structure is:
+| `S_p95` | 66.1 ms | measured at `N=1` |
+| `Q_max` | 50 | measured; bracketed from above |
+| `T_total` | 320 s | measured; force-desired trigger, 60 s policy lag bounded |
+| `cw_ratio` | 1.0 | measured; constant across all rungs (closed-loop steady state) |
 
 ```
-h            = 1.25 − 1                  =  0.25
-C_scale_max  = (1 − h)   × Q_max         → scale out
-C_scale_min  = (1 − 2h)  × Q_max         → scale in
-W_max        = SLO − S_p95               (queueing budget)
-cooldown_out = clamp(T_total/2, 10, 30)
-cooldown_in  = max(300, 3 × T_total)
+h                    = 1.25 − 1                          =  0.25
+C_scale_max          = (1 − h)   × Q_max  = 0.75 × 50   = 37.50
+C_scale_min          = (1 − 2h)  × Q_max  = 0.50 × 50   = 25.00
+W_max                = SLO − S_p95        = 3.0 − 0.066  =  2.93 s
+scaling_target_value = C_scale_max × cw_ratio = 37.50 × 1.00 = 37.50
+scale_in_threshold   = C_scale_min × cw_ratio = 25.00 × 1.00 = 25.00
+cooldown_out         = clamp(T_total/2, 10, 30)            = 30 s
+cooldown_in          = max(300, 3 × T_total)               = 960 s
 ```
 
-`scaling_target_value` and `scale_in_threshold` are **not** derivable here: they are
-`C_scale_max × cw_ratio` and `C_scale_min × cw_ratio`, and no ladder has measured
-`cw_ratio` on this configuration. That is exactly the gap `plan` refuses to paper over.
+Because `cw_ratio` is 1.0, `scaling_target_value` equals `C_scale_max` directly — the
+client-measured occupancy and the CloudWatch `Maximum` agree. This is specific to the
+closed-loop load shape; a different arrival pattern would produce a different ratio and
+`plan` would apply the per-rung conversion automatically.
 
 Two things fall straight out of the utilization line, and both are findings rather than
 footnotes.
@@ -280,12 +283,17 @@ it as `fleet_cost` and does not warn, because there is no reachable multiple at 
 "shorten `T_total` instead" becomes the cheaper advice. The old `C_max` model could reach
 4x, since there the divisor moved with `k` without a bound.
 
-## Status: `Q_max` is computed but not yet enforced
+## Status: `Q_max` is computed and enforced
 
-`queue_max_depth` is stored in `ModelEndpointConfig` and checked for drift by `plan`, but
-**no container reads it today** — the bounded admission queue that would refuse work beyond
-it is not built. Until it is, `Q_max` is a sizing statement rather than a control: the
-number says how deep a queue the SLO tolerates, and nothing stops a deeper one forming.
+`queue_max_depth` is stored in `ModelEndpointConfig`, checked for drift by `plan`, and
+enforced at the container. The Kokoro HTTP `/invocations` handler reads `MAX_QUEUE_DEPTH`
+from its environment and returns **503 `queue_saturated`** when the in-flight count reaches
+it — past that depth a request cannot meet the SLO, so it is refused immediately rather
+than served late. The CDK stack wires `queue_max_depth` from config into the container env
+(`endpoint.py`), so the bound deploys alongside the scaling thresholds it was measured with.
+
+**Known gap:** the WebSocket bidirectional path (`/invocations-bidirectional-stream`) does
+not enforce the admission gate. Only the HTTP path is gated.
 
 The measurement and the control want opposite things, and the order matters. `Q_max` has to
 be measured against an **unbounded** queue: a container that sheds stops accepting work
@@ -294,8 +302,7 @@ capacity number — and it looks entirely normal, because rejections land in the
 counts rather than in the latency percentiles the pass/fail line reads.
 `qmax --require-unbounded-queue` (on by default) machine-checks the live container env for
 `MAX_QUEUE_DEPTH` and `MAX_PENDING_REQUESTS` and refuses rather than warns. **Measure
-unbounded, then deploy the bound.** Enforcing it in the container is the deferred next
-step, and it is the point of measuring it.
+unbounded, then deploy the bound.**
 
 ## Independent bound: the 60 s platform ceiling
 
